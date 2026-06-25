@@ -37,7 +37,17 @@ from .strategies import STRATEGIES, CONFIG_BY_KEY, Ctx, Shared, categorize, deci
 # ---------------------------------------------------------------------------
 def ensure_strategies(db: Session) -> list[Top20Strategy]:
     existing = {s.key: s for s in db.scalars(select(Top20Strategy)).all()}
+    valid_keys = set(CONFIG_BY_KEY)
     changed = False
+    # Prune strategies that are no longer defined (e.g. after a strategy-set
+    # change) so the lab always shows exactly the current 20. Removes their
+    # paper trades + snapshots too.
+    for key, row in list(existing.items()):
+        if key not in valid_keys:
+            db.query(Top20Trade).filter(Top20Trade.strategy_id == row.id).delete()
+            db.query(Top20Snapshot).filter(Top20Snapshot.strategy_id == row.id).delete()
+            db.delete(row)
+            changed = True
     for d in STRATEGIES:
         row = existing.get(d.key)
         if row is None:
