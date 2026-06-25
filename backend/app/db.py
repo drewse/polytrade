@@ -55,6 +55,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "holding_minutes": "FLOAT",
         "exit_reason": "VARCHAR",
         "explanation": "JSON",
+        "source": "VARCHAR DEFAULT 'live'",
+    },
+    "top20_feature_vectors": {
+        "source": "VARCHAR DEFAULT 'live'",
     },
     "ingest_status": {"last_discovery_at": "DATETIME"},
     "paper_signals": {

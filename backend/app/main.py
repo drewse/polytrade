@@ -568,3 +568,60 @@ def top20_dataset(limit: int = 100, settled_only: bool = False,
                   db: Session = Depends(get_db)) -> dict:
     """Collected feature-vector dataset for future ML (Phase 20)."""
     return top20.feature_vectors(db, limit, settled_only)
+
+
+# --- historical replay engine (Phases 21-24) --------------------------------
+@app.get("/api/replay/status")
+def replay_status(db: Session = Depends(get_db)) -> dict:
+    return top20.replay_status(db)
+
+
+@app.post("/api/replay/backfill-markets")
+def replay_backfill_markets(pages: int = 3, db: Session = Depends(get_db)) -> dict:
+    """Backfill a chunk of historical closed markets (Phase 21). Checkpointed."""
+    return top20.replay_backfill_markets(db, pages)
+
+
+@app.post("/api/replay/backfill-wallets")
+def replay_backfill_wallets(max_wallets: int = 5, db: Session = Depends(get_db)) -> dict:
+    """Backfill more wallets' historical trades via discovery (Phase 22)."""
+    return top20.replay_backfill_wallets(db, max_wallets)
+
+
+@app.post("/api/replay/run")
+def replay_run(max_trades: int = 400, db: Session = Depends(get_db)) -> dict:
+    """Process a chunk of the chronological replay (Phase 23/24). Resumable."""
+    return top20.replay_run(db, max_trades)
+
+
+@app.post("/api/replay/reset")
+def replay_reset(db: Session = Depends(get_db)) -> dict:
+    return top20.replay_reset(db)
+
+
+# --- research analytics (Phases 26-29) --------------------------------------
+@app.get("/api/research/benchmark")
+def research_benchmark(db: Session = Depends(get_db)) -> dict:
+    """Probability-estimator benchmark vs baselines (Phase 29)."""
+    return top20.probability_benchmark(db)
+
+
+@app.get("/api/research/drift")
+def research_drift(db: Session = Depends(get_db)) -> dict:
+    """Strategy drift by month (Phase 27)."""
+    return top20.strategy_drift(db)
+
+
+@app.get("/api/research/regimes")
+def research_regimes(db: Session = Depends(get_db)) -> dict:
+    """Market regimes + per-regime strategy performance (Phase 28)."""
+    return top20.market_regimes(db)
+
+
+@app.get("/api/wallets/{address}/evolution")
+def wallet_evolution(address: str, db: Session = Depends(get_db)) -> dict:
+    """Point-in-time wallet reputation through history (Phase 26)."""
+    out = top20.wallet_evolution(db, address)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return out

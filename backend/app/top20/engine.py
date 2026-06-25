@@ -31,6 +31,7 @@ from ..models import (
 )
 from . import (
     analytics,
+    benchmark,
     ensembles,
     exits,
     leaderboard as lb,
@@ -38,6 +39,7 @@ from . import (
     montecarlo,
     optimize,
     probability,
+    replay as replay_mod,
     reputation,
     report as report_mod,
     simulate,
@@ -823,6 +825,152 @@ def forward_test(db: Session) -> dict:
                     "total_closed": n, "segments": seg_metrics})
     return {"paper_only": True, "split": "60% train / 20% validation / 20% forward (chronological)",
             "strategies": out}
+
+
+from ..models import Top20FeatureVector as _FV  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Phase 29 — probability benchmark over the labeled dataset
+# ---------------------------------------------------------------------------
+def probability_benchmark(db: Session) -> dict:
+    fvs = db.scalars(select(_FV).where(_FV.settled == True)).all()  # noqa: E712
+    samples = []
+    for fv in fvs:
+        f = fv.features or {}
+        if fv.label_realized_return is None:
+            continue
+        price = float(f.get("price", 0.5))
+        edge = float(f.get("edge", 0.0))
+        samples.append({
+            "y": 1 if fv.label_realized_return > 0 else 0,
+            "current": float(f.get("estimated_probability", price)),
+            "market": price,
+            "wallet": float(f.get("wallet_win_rate", price)),
+            "edge": max(0.01, min(0.99, price + edge)),
+        })
+    return benchmark.compute(samples)
+
+
+# ---------------------------------------------------------------------------
+# Phase 27 — strategy drift (monthly degradation)
+# ---------------------------------------------------------------------------
+def strategy_drift(db: Session) -> dict:
+    trades = db.scalars(select(Top20Trade).where(Top20Trade.status == "closed")).all()
+    months: dict[str, list] = {}
+    for t in trades:
+        if not t.closed_at:
+            continue
+        months.setdefault(t.closed_at.strftime("%Y-%m"), []).append(t)
+    series = []
+    for mo in sorted(months):
+        ts = months[mo]
+        rets = [t.realized_pnl / t.stake for t in ts if t.stake]
+        pnls = [t.realized_pnl for t in ts]
+        series.append({
+            "month": mo, "trades": len(ts),
+            "sharpe": analytics.sharpe(rets),
+            "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls), 4) if pnls else 0.0,
+            "avg_edge": round(sum(t.entry_edge for t in ts) / len(ts), 4),
+            "avg_kelly": round(sum(t.kelly_fraction for t in ts) / len(ts), 4),
+        })
+    # decay verdict: linear trend of monthly Sharpe
+    decay = "insufficient history"
+    if len(series) >= 3:
+        sh = [m["sharpe"] for m in series]
+        slope = (sh[-1] - sh[0]) / (len(sh) - 1)
+        decay = ("degrading" if slope < -0.1 else "improving" if slope > 0.1 else "stable")
+    return {"paper_only": True, "months": series, "decay": decay,
+            "note": "Per-month Sharpe/win/edge/Kelly across all paper trades (live + replay)."}
+
+
+# ---------------------------------------------------------------------------
+# Phase 28 — market regimes + per-regime strategy performance
+# ---------------------------------------------------------------------------
+def _classify_regime(markets: list) -> str:
+    if not markets:
+        return "unknown"
+    cats: dict[str, int] = {}
+    liq = 0.0
+    for m in markets:
+        cats[categorize(m.question, m.category)] = cats.get(categorize(m.question, m.category), 0) + 1
+        liq += float(m.liquidity or 0)
+    dom = max(cats, key=cats.get)
+    avg_liq = liq / len(markets)
+    liq_tag = "high-liquidity" if avg_liq >= 50_000 else "low-liquidity"
+    return f"{dom}-heavy / {liq_tag}"
+
+
+def market_regimes(db: Session) -> dict:
+    resolved = db.scalars(select(Market).where(Market.resolved == True)).all()  # noqa: E712
+    by_month: dict[str, list] = {}
+    for m in resolved:
+        if m.resolved_at:
+            by_month.setdefault(m.resolved_at.strftime("%Y-%m"), []).append(m)
+    regimes = {mo: _classify_regime(ms) for mo, ms in by_month.items()}
+    # per-regime strategy performance from closed trades
+    trades = db.scalars(select(Top20Trade).where(Top20Trade.status == "closed")).all()
+    regime_perf: dict[str, dict] = {}
+    for t in trades:
+        if not t.closed_at:
+            continue
+        reg = regimes.get(t.closed_at.strftime("%Y-%m"), "unknown")
+        rp = regime_perf.setdefault(reg, {})
+        s = db.get(Top20Strategy, t.strategy_id)
+        key = s.name if s else str(t.strategy_id)
+        rp.setdefault(key, {"pnl": 0.0, "trades": 0})
+        rp[key]["pnl"] += t.realized_pnl
+        rp[key]["trades"] += 1
+    out = []
+    for reg, strat_map in regime_perf.items():
+        best = max(strat_map.items(), key=lambda kv: kv[1]["pnl"], default=None)
+        out.append({"regime": reg, "trades": sum(v["trades"] for v in strat_map.values()),
+                    "best_strategy": best[0] if best else None,
+                    "best_pnl": round(best[1]["pnl"], 2) if best else 0.0})
+    return {"paper_only": True, "monthly_regimes": regimes, "regime_performance": out}
+
+
+# ---------------------------------------------------------------------------
+# Phase 26 — wallet reputation evolution through time (no look-ahead)
+# ---------------------------------------------------------------------------
+def wallet_evolution(db: Session, address: str) -> dict | None:
+    w = db.scalar(select(Wallet).where(Wallet.address == address))
+    if w is None:
+        return None
+    tl = replay_mod._build_wallet_timelines(db).get(w.id)
+    if not tl or not tl["times"]:
+        return {"address": address, "points": [], "paper_only": True}
+    points = []
+    for i, t in enumerate(tl["times"]):
+        n = i + 1
+        roi = tl["pnl"][i] / (tl["cost"][i] or 1)
+        win = tl["wins"][i] / n
+        points.append({"t": t.isoformat(), "n_settled": n, "roi": round(roi, 4),
+                       "win_rate": round(win, 4), "score": replay_mod._running_score(n, win, roi)})
+    return {"paper_only": True, "address": address, "points": points}
+
+
+# ---------------------------------------------------------------------------
+# Phase 21-24 — replay control wrappers
+# ---------------------------------------------------------------------------
+def replay_status(db: Session) -> dict:
+    return replay_mod.status(db)
+
+
+def replay_backfill_markets(db: Session, pages: int = 3) -> dict:
+    return replay_mod.backfill_closed_markets(db, pages=pages)
+
+
+def replay_backfill_wallets(db: Session, max_wallets: int = 5) -> dict:
+    return replay_mod.backfill_wallets(db, max_wallets=max_wallets)
+
+
+def replay_run(db: Session, max_trades: int = 400) -> dict:
+    return replay_mod.run(db, max_trades=max_trades)
+
+
+def replay_reset(db: Session) -> dict:
+    return replay_mod.reset(db)
 
 
 def reset_paper(db: Session) -> dict:

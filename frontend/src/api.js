@@ -99,6 +99,15 @@ export const api = {
   top20WalkForward: (param) => request(`/api/top-20/walk-forward/${param}`),
   top20Dataset: () => request('/api/top-20/dataset?settled_only=false&limit=50'),
   walletProfile: (address) => request(`/api/wallets/${address}/profile`),
+  // historical replay + research analytics
+  replayStatus: () => request('/api/replay/status'),
+  replayBackfillMarkets: (pages = 3) => request(`/api/replay/backfill-markets?pages=${pages}`, { method: 'POST' }),
+  replayBackfillWallets: (n = 5) => request(`/api/replay/backfill-wallets?max_wallets=${n}`, { method: 'POST' }),
+  replayRun: (maxTrades = 400) => request(`/api/replay/run?max_trades=${maxTrades}`, { method: 'POST' }),
+  replayReset: () => request('/api/replay/reset', { method: 'POST' }),
+  researchBenchmark: () => request('/api/research/benchmark'),
+  researchDrift: () => request('/api/research/drift'),
+  researchRegimes: () => request('/api/research/regimes'),
   trackCandidate: (address) => request(`/api/discovery/candidates/${address}/track`, { method: 'POST' }),
   ignoreCandidate: (address) => request(`/api/discovery/candidates/${address}/ignore`, { method: 'POST' }),
 }

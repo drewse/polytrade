@@ -300,6 +300,13 @@ class LivePolymarketClient:
         markets = parse_markets(payload)
         return markets[0] if markets else None
 
+    def get_closed_markets(self, limit: int = 100, offset: int = 0) -> list[MarketDTO]:
+        """Resolved/closed historical markets (paginated) for the replay backfill."""
+        payload = self._get_json(f"{config.gamma_api_base}/markets",
+                                 {"closed": "true", "limit": limit, "offset": offset,
+                                  "order": "volume", "ascending": "false"})
+        return parse_markets(payload)
+
     def get_markets_by_conditions(self, condition_ids, chunk: int = 40) -> list[MarketDTO]:
         """Fetch real metadata for specific markets by condition id, in batches.
 

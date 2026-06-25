@@ -338,6 +338,7 @@ class Top20Trade(Base):
     sizing_reason: Mapped[str] = mapped_column(Text, default="")
     entry_time: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     status: Mapped[str] = mapped_column(String(12), default="open", index=True)  # open|closed
+    source: Mapped[str] = mapped_column(String(8), default="live", index=True)  # live|replay
     current_price: Mapped[float] = mapped_column(Float, default=0.0)
     exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
@@ -370,6 +371,7 @@ class Top20FeatureVector(Base):
     # inputs (signal + wallet + market features, probability, sizing, decision)
     features: Mapped[dict] = mapped_column(JSON, default=dict)
     decision: Mapped[str] = mapped_column(String(8), default="take")  # take (skips not stored)
+    source: Mapped[str] = mapped_column(String(8), default="live", index=True)  # live|replay
     # labels (filled at settlement)
     label_outcome: Mapped[str | None] = mapped_column(String(80), nullable=True)
     label_realized_return: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -391,6 +393,24 @@ class Top20Snapshot(Base):
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     open_positions: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ReplayState(Base):
+    """Singleton (id=1) checkpoint for the historical replay engine — supports
+    resume / incremental replay so we never restart from scratch. PAPER ONLY."""
+
+    __tablename__ = "replay_state"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    markets_offset: Mapped[int] = mapped_column(Integer, default=0)      # Gamma pagination cursor
+    markets_backfilled: Mapped[int] = mapped_column(Integer, default=0)
+    wallets_backfilled: Mapped[int] = mapped_column(Integer, default=0)
+    last_event_id: Mapped[int] = mapped_column(Integer, default=0)       # replay cursor (Trade.id)
+    events_processed: Mapped[int] = mapped_column(Integer, default=0)
+    signals_generated: Mapped[int] = mapped_column(Integer, default=0)
+    feature_vectors: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="idle")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Backtest(Base):

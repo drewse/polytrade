@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api'
 import Overview from './pages/Overview.jsx'
 import Portfolio from './pages/Portfolio.jsx'
+import Research from './pages/Research.jsx'
 import Top20 from './pages/Top20.jsx'
 import WalletProfile from './pages/WalletProfile.jsx'
 import Wallets from './pages/Wallets.jsx'
@@ -17,6 +18,7 @@ const NAV = [
   { to: '/overview', label: 'Overview' },
   { to: '/top-20', label: 'TOP 20' },
   { to: '/portfolio', label: 'Portfolio' },
+  { to: '/research', label: 'Research' },
   { to: '/discovery', label: 'Discovery' },
   { to: '/wallets', label: 'Wallets' },
   { to: '/signals', label: 'Signals' },
@@ -99,6 +101,7 @@ export default function App() {
           <Route path="/overview" element={<Overview />} />
           <Route path="/top-20" element={<Top20 />} />
           <Route path="/portfolio" element={<Portfolio />} />
+          <Route path="/research" element={<Research />} />
           <Route path="/wallet/:address" element={<WalletProfile />} />
           <Route path="/wallets" element={<Wallets />} />
           <Route path="/signals" element={<Signals />} />
