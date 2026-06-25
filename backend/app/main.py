@@ -201,11 +201,7 @@ def create_wallet(payload: WalletCreate, db: Session = Depends(get_db)) -> Walle
 def backfill_wallet(payload: BackfillRequest, db: Session = Depends(get_db)) -> MessageOut:
     """Pull a wallet's recent LIVE trade history and (re)score it (read-only).
     Requires data_mode=live; the resulting stats are marked partial_history."""
-    try:
-        result = services.backfill_wallet(db, payload.address, limit=payload.limit)
-    except Exception as exc:  # TEMP-DEBUG: surface traceback to diagnose live 500
-        import traceback
-        raise HTTPException(status_code=500, detail=traceback.format_exc()[-1500:]) from exc
+    result = services.backfill_wallet(db, payload.address, limit=payload.limit)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "backfill failed"))
     return MessageOut(message=f"Backfilled {payload.address}", detail=result)

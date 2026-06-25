@@ -823,6 +823,10 @@ def backfill_wallet(db: Session, address: str, limit: int = 200) -> dict:
             client2.close()
     except Exception as exc:  # noqa: BLE001  (best-effort; trades still ingest)
         print(f"[backfill] market metadata fetch failed for {address[:10]}: {exc}")
+    # Persist the upserted markets before the existence check below. SessionLocal
+    # runs with autoflush=False, so without this the just-added markets are still
+    # pending and the stub loop would re-insert them -> duplicate-PK IntegrityError.
+    db.flush()
     # Any market still missing (delisted / not returned) gets a minimal stub so
     # the trade FK resolves; it simply stays unsettled.
     existing = {
