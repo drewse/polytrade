@@ -635,6 +635,81 @@ def record_equity_snapshot(db: Session) -> EquitySnapshot:
 # ===========================================================================
 # Full ingest cycle (used by worker and POST /api/ingest/run)
 # ===========================================================================
+def _poll_tracked_wallets(db: Session, settings: dict, max_wallets: int = 25,
+                          limit: int = 40) -> list[Trade]:
+    """Live signal source: pull recent trades for the copy-enabled, high-scoring
+    wallets we would actually copy, so the signal pipeline watches *them* rather
+    than only the global recent-trade stream (which rarely contains our small set
+    of tracked wallets). Returns freshly-inserted trades within the staleness
+    window, ready to feed the unchanged signal gates.
+    """
+    min_score = float(settings["min_wallet_score"])
+    cutoff_min = float(settings["max_price_staleness_min"])
+    wallets = db.scalars(
+        select(Wallet)
+        .join(WalletStat, WalletStat.wallet_id == Wallet.id)
+        .where(Wallet.copy_enabled == True, WalletStat.score >= min_score)  # noqa: E712
+        .order_by(WalletStat.score.desc())
+        .limit(max_wallets)
+    ).all()
+    if not wallets:
+        return []
+
+    from .polymarket_client import LivePolymarketClient
+
+    now = datetime.utcnow()
+    fresh_by_wallet: list[tuple[Wallet, list]] = []
+    fresh_market_ids: set[str] = set()
+    client = LivePolymarketClient()
+    try:
+        for w in wallets:
+            try:
+                dtos = client.get_wallet_trades(w.address, limit=limit)
+            except Exception as exc:  # noqa: BLE001  (skip a flaky wallet, keep going)
+                print(f"[poll] wallet trades failed for {w.address[:10]}: {exc}")
+                continue
+            fresh = []
+            for dto in dtos:
+                ts = dto.timestamp
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+                if (now - ts).total_seconds() / 60.0 <= cutoff_min:
+                    fresh.append(dto)
+                    fresh_market_ids.add(dto.market_id)
+            if fresh:
+                fresh_by_wallet.append((w, fresh))
+        # Real metadata for the (small) set of fresh markets, so the signal gates
+        # see true liquidity + resolution status.
+        if fresh_market_ids:
+            try:
+                for mdto in client.get_markets_by_conditions(list(fresh_market_ids)):
+                    upsert_market(db, mdto)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[poll] fresh-market metadata failed: {exc}")
+    finally:
+        client.close()
+    db.flush()  # persist upserts before the FK-stub check (autoflush=False)
+
+    existing = {
+        m for (m,) in db.execute(
+            select(Market.id).where(Market.id.in_(fresh_market_ids))
+        ).all()
+    }
+    for mid in fresh_market_ids - existing:
+        db.add(Market(id=mid, question=f"(market {mid[:10]}…)",
+                      outcomes=["Yes", "No"], prices=[0.5, 0.5]))
+    db.flush()
+
+    new_trades: list[Trade] = []
+    for w, fresh in fresh_by_wallet:
+        for dto in fresh:
+            t = insert_trade(db, dto, w)
+            if t is not None:
+                new_trades.append(t)
+    db.commit()
+    return new_trades
+
+
 def run_ingest_cycle(db: Session) -> dict:
     settings = ensure_settings(db)
     data_mode = settings["data_mode"]
@@ -675,6 +750,18 @@ def run_ingest_cycle(db: Session) -> dict:
         status["trades_ok"] = False
         status["errors"].append(f"trades: {exc}")
         print(f"[ingest] trade pull error: {exc}")
+
+    # 2b. live: also watch the wallets we'd actually copy (tracked sharp wallets'
+    #     own fresh trades), not just the global stream — this is where genuine
+    #     copy signals come from.
+    if live:
+        try:
+            tracked_new = _poll_tracked_wallets(db, settings)
+            new_trades.extend(tracked_new)
+        except Exception as exc:  # noqa: BLE001  (never let polling abort a cycle)
+            db.rollback()
+            status["errors"].append(f"tracked-poll: {exc}")
+            print(f"[ingest] tracked-wallet poll error: {exc}")
 
     # 3. update stats for wallets that traded. In live mode these are derived
     #    from a recent window only, so mark them partial.
