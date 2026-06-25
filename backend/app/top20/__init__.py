@@ -22,22 +22,45 @@ from __future__ import annotations
 
 from sqlalchemy import func  # re-exported for tests/back-compat
 
-from . import analytics, exits, leaderboard, probability, sizing, strategies
+from . import (
+    analytics,
+    ensembles,
+    exits,
+    leaderboard,
+    market_intel,
+    montecarlo,
+    optimize,
+    probability,
+    reputation,
+    report,
+    simulate,
+    sizing,
+    strategies,
+)
 from .engine import (
+    ensemble_view,
     ensure_strategies,
     evaluate_signals,
     explain_signal,
+    feature_vectors,
     forward_test,
     leaderboard as leaderboard_view,
     list_strategies,
     list_trades,
+    market_intelligence,
+    monte_carlo,
+    optimize_param,
     portfolio,
+    recommend_retirements,
+    research_report,
     reset_paper,
     run_cycle,
+    set_status,
     settle_and_mark,
     snapshot,
     strategy_detail,
     wallet_profile,
+    walk_forward_param,
 )
 from .probability import ProbFeatures
 from .probability import estimate as estimate_probability
@@ -46,11 +69,14 @@ from .sizing import size as size_position
 from .strategies import STRATEGIES, CONFIG_BY_KEY
 
 __all__ = [
-    "analytics", "exits", "leaderboard", "probability", "sizing", "strategies",
+    "analytics", "ensembles", "exits", "leaderboard", "market_intel", "montecarlo",
+    "optimize", "probability", "reputation", "report", "simulate", "sizing", "strategies",
     "ensure_strategies", "evaluate_signals", "settle_and_mark", "snapshot",
     "run_cycle", "list_strategies", "strategy_detail", "list_trades",
     "leaderboard_view", "portfolio", "wallet_profile", "explain_signal",
     "forward_test", "reset_paper", "estimate_probability", "ProbFeatures",
     "SizingPolicy", "SizingResult", "size_position", "STRATEGIES", "CONFIG_BY_KEY",
-    "func",
+    "ensemble_view", "feature_vectors", "market_intelligence", "monte_carlo",
+    "optimize_param", "recommend_retirements", "research_report", "set_status",
+    "walk_forward_param", "func",
 ]

@@ -22,9 +22,9 @@ const COLS = [
 
 const METRIC_GRID = [
   ['Total return', (m) => pct(m.total_return)],
-  ['Annualized', (m) => pct(m.annualized_return)],
-  ['Sharpe', (m) => num(m.sharpe)],
-  ['Sortino', (m) => num(m.sortino)],
+  ['Annualized (CAGR)', (m) => m.annualized_valid ? pct(m.annualized_return) : `n/a (${num(m.elapsed_days, 1)}d)`],
+  ['Sharpe', (m) => `${num(m.sharpe)} [${num((m.sharpe_ci || [])[0])}, ${num((m.sharpe_ci || [])[1])}]`],
+  ['Sortino', (m) => `${num(m.sortino)} [${num((m.sortino_ci || [])[0])}, ${num((m.sortino_ci || [])[1])}]`],
   ['Profit factor', (m) => num(m.profit_factor)],
   ['Expectancy', (m) => fmt.usd2(m.expectancy)],
   ['Win rate', (m) => pct(m.win_rate)],
@@ -54,7 +54,8 @@ function StrategyDetail({ id }) {
   return (
     <tr className="top20-detail">
       <td colSpan="13">
-        <p className="muted">{data.description} · <b>exit:</b> {data.exit_policy} · <b>philosophy:</b> {data.philosophy}</p>
+        <p className="muted">{data.description} · <b>exit:</b> {data.exit_policy} · <b>philosophy:</b> {data.philosophy} · <b>status:</b> {data.status} · <b>v</b>{data.version}</p>
+        {m.insufficient_history && <p className="lowdata small">⚠ Based on insufficient closed trades ({m.closed_positions}) — point estimates are unreliable; see confidence intervals.</p>}
         <div className="metric-grid">
           {METRIC_GRID.map(([label, fn]) => (
             <div key={label} className="metric-cell"><span>{label}</span><b>{fn(m)}</b></div>
@@ -123,7 +124,12 @@ function StrategiesTab({ strategies }) {
             <Fragment key={s.id}>
               <tr className="top20-row" onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
                 <td>{i + 1}</td>
-                <td><div className="top20-name">{s.name}</div><div className="muted small">{s.philosophy}</div></td>
+                <td>
+                  <div className="top20-name">{s.name}
+                    {s.insufficient_history && <span className="lowdata" title="Insufficient closed trades — stats unreliable"> ⚠ low data</span>}
+                  </div>
+                  <div className="muted small">{s.philosophy} · {s.status}</div>
+                </td>
                 {COLS.filter((c) => c.key !== 'score').map((c) => (
                   <td key={c.key} className="right">{c.render(s)}</td>
                 ))}
@@ -161,6 +167,63 @@ function LeaderboardTab() {
         ))}
       </div>
       {ranked.length === 0 && <p className="muted">No closed trades yet — ranking needs settled results. Let positions resolve, then recompute.</p>}
+    </div>
+  )
+}
+
+function ResearchTab() {
+  const report = useData(api.top20Report)
+  const ens = useData(api.top20Ensembles)
+  const mi = useData(api.top20MarketIntel)
+  const ret = useData(api.top20Retirement)
+  const wf = useData(() => api.top20WalkForward('confidence'), [])
+  if (report.loading || ens.loading || mi.loading) return <Loading />
+  return (
+    <div>
+      <div className="grid-2">
+        <div className="panel">
+          <h2>Ensemble strategies</h2>
+          <div className="table-wrap"><table className="mini">
+            <thead><tr><th>Method</th><th className="right"># strat</th><th className="right">Sharpe</th><th className="right">Sortino</th><th className="right">Weighted P/L</th></tr></thead>
+            <tbody>{(ens.data?.ensembles || []).map((e) => (
+              <tr key={e.method}><td>{e.method}</td><td className="right">{e.n_strategies}</td>
+                <td className="right">{num(e.sharpe)}</td><td className="right">{num(e.sortino)}</td>
+                <td className="right"><PnL value={e.weighted_pnl} fmtFn={fmt.usd2} /></td></tr>
+            ))}</tbody></table></div>
+        </div>
+        <div className="panel">
+          <h2>Market intelligence — what's easiest to beat?</h2>
+          {mi.data?.insufficient_data && <p className="muted small">Insufficient settled history yet.</p>}
+          <div className="table-wrap"><table className="mini">
+            <thead><tr><th>Category</th><th className="right">Win%</th><th className="right">Avg edge</th><th className="right">Efficiency</th><th className="right">Avg return</th></tr></thead>
+            <tbody>{(mi.data?.categories || []).map((c) => (
+              <tr key={c.category}><td>{c.category}</td><td className="right">{pct(c.win_rate)}</td>
+                <td className="right">{pct(c.avg_edge)}</td><td className="right">{num(c.market_efficiency)}</td>
+                <td className="right"><PnL value={c.avg_realized_return * 100} fmtFn={(n) => fmt.pct(n)} /></td></tr>
+            ))}</tbody></table></div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <h2>Walk-forward: confidence threshold {wf.data?.verdict ? <Badge kind={wf.data.overfit_rejected ? 'bad' : 'yes'}>{wf.data.verdict}</Badge> : null}</h2>
+        {wf.data?.insufficient_data ? <p className="muted small">Insufficient labeled history for walk-forward yet.</p> : (
+          <p className="small muted">Avg forward Sharpe {num(wf.data?.avg_forward_sharpe)} · variance {num(wf.data?.forward_sharpe_variance)} · parameter stability {pct(wf.data?.parameter_stability)} · modal value {wf.data?.modal_value}</p>
+        )}
+      </div>
+
+      {ret.data?.recommendations?.length > 0 && (
+        <div className="panel hilite">
+          <h2>Retirement recommendations</h2>
+          {ret.data.recommendations.map((r) => (
+            <div key={r.key} className="small"><b className="down">Retire {r.name}</b> — {r.reason}</div>
+          ))}
+        </div>
+      )}
+
+      <div className="panel">
+        <h2>Daily research report</h2>
+        <pre className="report-md">{report.data?.markdown || 'No report yet.'}</pre>
+      </div>
     </div>
   )
 }
@@ -212,12 +275,13 @@ export default function Top20() {
       </PageHead>
       <div className="paper-banner">📝 PAPER TRADING ONLY — fractional-Kelly sizing, statistical probability model, no real orders, no wallets, no keys</div>
       <div className="top20-tabs">
-        {[['strategies', 'Strategies'], ['leaderboard', 'Best Strategy'], ['forward', 'Forward Test']].map(([k, l]) => (
+        {[['strategies', 'Strategies'], ['leaderboard', 'Best Strategy'], ['research', 'Research'], ['forward', 'Forward Test']].map(([k, l]) => (
           <button key={k} className={`tab ${tab === k ? 'active' : ''}`} onClick={() => setTab(k)}>{l}</button>
         ))}
       </div>
       {tab === 'strategies' && <StrategiesTab strategies={strategies} />}
       {tab === 'leaderboard' && <LeaderboardTab />}
+      {tab === 'research' && <ResearchTab />}
       {tab === 'forward' && <ForwardTab />}
     </div>
   )

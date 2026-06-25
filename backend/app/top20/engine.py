@@ -8,6 +8,8 @@ probability estimator without touching anything here). STRICTLY PAPER ONLY.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import statistics
 from datetime import datetime, timedelta
 
@@ -18,6 +20,7 @@ from .. import positions as positions_mod
 from ..models import (
     Market,
     PaperSignal,
+    Top20FeatureVector,
     Top20Snapshot,
     Top20Strategy,
     Top20Trade,
@@ -26,7 +29,19 @@ from ..models import (
     WalletCandidate,
     WalletStat,
 )
-from . import analytics, exits, leaderboard as lb, probability
+from . import (
+    analytics,
+    ensembles,
+    exits,
+    leaderboard as lb,
+    market_intel,
+    montecarlo,
+    optimize,
+    probability,
+    reputation,
+    report as report_mod,
+    simulate,
+)
 from .explain import build_entry
 from .sizing import size as size_position
 from .strategies import STRATEGIES, CONFIG_BY_KEY, Ctx, Shared, categorize, decide
@@ -35,6 +50,12 @@ from .strategies import STRATEGIES, CONFIG_BY_KEY, Ctx, Shared, categorize, deci
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+def _param_hash(params: dict) -> str:
+    """Stable hash of a strategy's parameters — reproducibility id (Phase 11).
+    Identical params => identical hash => identical decisions (decide() is pure)."""
+    return hashlib.md5(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
 def ensure_strategies(db: Session) -> list[Top20Strategy]:
     existing = {s.key: s for s in db.scalars(select(Top20Strategy)).all()}
     valid_keys = set(CONFIG_BY_KEY)
@@ -49,19 +70,22 @@ def ensure_strategies(db: Session) -> list[Top20Strategy]:
             db.delete(row)
             changed = True
     for d in STRATEGIES:
+        params = d.to_params()
         row = existing.get(d.key)
         if row is None:
             db.add(Top20Strategy(
                 key=d.key, name=d.name, description=d.description, philosophy=d.philosophy,
                 exit_policy=d.exit_policy, starting_bankroll=10_000.0,
-                fractional_kelly=d.sizing.kelly_multiplier, params=d.to_params(),
+                fractional_kelly=d.sizing.kelly_multiplier, params=params,
+                param_hash=_param_hash(params), status="production",
             ))
             changed = True
         else:
             row.name, row.description, row.philosophy = d.name, d.description, d.philosophy
             row.exit_policy = d.exit_policy
             row.fractional_kelly = d.sizing.kelly_multiplier
-            row.params = d.to_params()
+            row.params = params
+            row.param_hash = _param_hash(params)
     if changed:
         db.commit()
     return list(db.scalars(select(Top20Strategy).order_by(Top20Strategy.id)).all())
@@ -211,7 +235,7 @@ def evaluate_signals(db: Session, settings: dict | None = None) -> dict:
             if res.stake is None:
                 continue
             rank = shared.rank_copyability.get(ctx.wallet_id)
-            db.add(Top20Trade(
+            trade = Top20Trade(
                 strategy_id=strat.id, signal_id=s.id, wallet_address=wallets[s.wallet_id].address,
                 market_id=ctx.market_id, market_question=markets[ctx.market_id].question or "",
                 outcome=ctx.outcome, side=s.side or "buy", entry_price=round(ctx.price, 4),
@@ -221,7 +245,23 @@ def evaluate_signals(db: Session, settings: dict | None = None) -> dict:
                 current_price=round(ctx.price, 4), entry_confidence=ctx.confidence,
                 entry_edge=ctx.edge, wallet_rank=rank,
                 explanation=build_entry(ctx, res, p, d.exit_policy, rank),
-            ))
+            )
+            db.add(trade)
+            db.flush()  # assign trade.id for the feature vector link
+            # Phase 20: persist a labeled feature vector (label filled at settle).
+            db.add(Top20FeatureVector(
+                strategy_id=strat.id, strategy_key=strat.key, signal_id=s.id, trade_id=trade.id,
+                decision="take",
+                features={
+                    "confidence": ctx.confidence, "edge": ctx.edge, "price": ctx.price,
+                    "wallet_win_rate": ctx.win_rate, "wallet_sharpe": ctx.sharpe,
+                    "wallet_roi": ctx.roi, "copyability": ctx.copyability,
+                    "specialization": ctx.specialization, "recency": ctx.recency,
+                    "num_settled": ctx.num_settled, "wallet_rank": rank,
+                    "liquidity": ctx.liquidity, "category": ctx.category, "age_min": round(ctx.age_min, 1),
+                    "estimated_probability": round(p, 4), "kelly_fraction": res.kelly_fraction,
+                    "target_fraction": res.target_fraction, "position_size": res.stake,
+                }))
             exposure[ctx.market_id] = exposure.get(ctx.market_id, 0.0) + res.stake
             seen.add(s.id)
             strat.trades_entered += 1
@@ -259,6 +299,7 @@ def settle_and_mark(db: Session) -> dict:
         if market.resolved and market.resolved_outcome is not None:
             won = market.resolved_outcome == t.outcome
             _close(t, 1.0 if won else 0.0, "resolved", now)
+            _label_fv(db, t, market.resolved_outcome)
             closed += 1
             continue
         price = market.price_for(t.outcome)
@@ -274,10 +315,23 @@ def settle_and_mark(db: Session) -> dict:
                            holding_minutes=holding_min, wallet_exited=wallet_exited)
         if dec.close and t.current_price is not None:
             _close(t, t.current_price, dec.reason or policy, now)
+            _label_fv(db, t, t.outcome if t.exit_price and t.exit_price >= 0.5 else None)
             closed += 1
             exited += 1
     db.commit()
     return {"closed": closed, "marked": marked, "early_exits": exited}
+
+
+def _label_fv(db: Session, trade: Top20Trade, outcome: str | None) -> None:
+    """Phase 20: write the realized label onto the trade's feature vector."""
+    fv = db.scalar(select(Top20FeatureVector).where(Top20FeatureVector.trade_id == trade.id))
+    if fv is None:
+        return
+    fv.label_outcome = outcome
+    fv.label_realized_pnl = trade.realized_pnl
+    fv.label_realized_return = round(trade.realized_pnl / trade.stake, 4) if trade.stake else 0.0
+    fv.label_exit_reason = trade.exit_reason
+    fv.settled = True
 
 
 def _close(t: Top20Trade, exit_price: float, reason: str, now: datetime) -> None:
@@ -318,6 +372,10 @@ def _metrics_for(db: Session, strat: Top20Strategy) -> dict:
 
 
 def snapshot(db: Session) -> int:
+    # One shared timestamp per cycle so the portfolio can sum across strategies
+    # at each point (distinct per-row timestamps caused a jagged, false-drawdown
+    # combined curve).
+    now = datetime.utcnow()
     n = 0
     for strat in db.scalars(select(Top20Strategy)).all():
         trades = db.scalars(select(Top20Trade).where(Top20Trade.strategy_id == strat.id)).all()
@@ -326,7 +384,7 @@ def snapshot(db: Session) -> int:
         realized = round(sum(t.realized_pnl for t in closed), 2)
         unreal = round(sum(t.unrealized_pnl for t in open_), 2)
         bankroll = strat.starting_bankroll + realized
-        db.add(Top20Snapshot(strategy_id=strat.id, bankroll=round(bankroll, 2),
+        db.add(Top20Snapshot(strategy_id=strat.id, timestamp=now, bankroll=round(bankroll, 2),
                              equity=round(bankroll + unreal, 2), realized_pnl=realized,
                              unrealized_pnl=unreal, open_positions=len(open_)))
         n += 1
@@ -357,6 +415,8 @@ def _summary(db: Session, strat: Top20Strategy) -> dict:
         "id": strat.id, "key": strat.key, "name": strat.name,
         "description": strat.description, "philosophy": strat.philosophy,
         "exit_policy": strat.exit_policy, "active": strat.active,
+        "status": strat.status, "version": strat.version, "param_hash": strat.param_hash,
+        "parent_key": strat.parent_key, "notes": strat.notes,
         "starting_bankroll": strat.starting_bankroll,
         "fractional_kelly": strat.fractional_kelly, "params": strat.params,
         "signals_evaluated": strat.signals_evaluated, "trades_entered": strat.trades_entered,
@@ -503,11 +563,18 @@ def portfolio(db: Session) -> dict:
         cat = categorize(t.market_question, m.category if m else None)
         cat_exp[cat] = round(cat_exp.get(cat, 0.0) + t.stake, 2)
 
-    # combined equity curve (sum snapshots by timestamp)
-    curve_rows = db.execute(select(Top20Snapshot.timestamp, func.sum(Top20Snapshot.equity))
-                            .group_by(Top20Snapshot.timestamp)
-                            .order_by(Top20Snapshot.timestamp)).all()
-    curve = [{"t": ts.isoformat(), "equity": round(float(e), 2)} for ts, e in curve_rows]
+    # combined equity curve — forward-fill each strategy's last equity onto a
+    # shared timeline, starting every strategy at its bankroll. This avoids the
+    # jagged sum-by-exact-timestamp curve that produced false ~75% drawdowns.
+    from itertools import groupby
+    last_eq = {s.id: s.starting_bankroll for s in strategies}
+    rows = db.execute(select(Top20Snapshot.timestamp, Top20Snapshot.strategy_id,
+                             Top20Snapshot.equity).order_by(Top20Snapshot.timestamp)).all()
+    curve = []
+    for ts, group in groupby(rows, key=lambda r: r[0]):
+        for _, sid, eq in group:
+            last_eq[sid] = eq
+        curve.append({"t": ts.isoformat(), "equity": round(sum(last_eq.values()), 2)})
     equities = [c["equity"] for c in curve]
     rets = [equities[i] / equities[i-1] - 1 for i in range(1, len(equities)) if equities[i-1]]
     rolling = rets[-30:]
@@ -585,8 +652,148 @@ def wallet_profile(db: Session, address: str) -> dict | None:
         "equity_curve": curve,
         "recent_7d": _window(7), "recent_30d": _window(30),
         "lifetime": {"settled": len(settled), "pnl": round(sum(pnls), 2)},
+        "reputation": reputation.compute(settled),   # Phase 15 (decay-weighted)
         "paper_only": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 12/13 — labeled dataset + optimization + walk-forward
+# ---------------------------------------------------------------------------
+def _build_samples(db: Session) -> list:
+    """Signals whose market has RESOLVED, joined with wallet/market features —
+    the labeled dataset (outcome known) used for optimization. No future info:
+    the outcome only labels the sample; it never enters a decision."""
+    wm = _wallet_metrics(db)
+    sigs = db.scalars(select(PaperSignal)).all()
+    mids = {s.market_id for s in sigs}
+    markets = {m.id: m for m in db.scalars(select(Market).where(Market.id.in_(mids))).all()}
+    out = []
+    for s in sigs:
+        m = markets.get(s.market_id)
+        if not m or not m.resolved or m.resolved_outcome is None:
+            continue
+        mt = wm.get(s.wallet_id, {})
+        out.append(simulate.Sample(
+            created_at=s.created_at, market_id=s.market_id, outcome=s.outcome,
+            resolved_outcome=m.resolved_outcome, price=float(s.observed_price or 0.5),
+            confidence=float(s.confidence or 0), edge=float(s.edge_estimate or 0),
+            liquidity=float(m.liquidity or 0), category=categorize(m.question, m.category),
+            win_rate=mt.get("win_rate", 0), sharpe=mt.get("sharpe", 0), roi=mt.get("roi", 0),
+            copyability=mt.get("copyability", 0), classification=mt.get("classification"),
+            specialization=mt.get("specialization", 0), recency=mt.get("recency", 0),
+            num_settled=mt.get("num_settled", 0), wallet_id=s.wallet_id))
+    return out
+
+
+def optimize_param(db: Session, param: str) -> dict:
+    return optimize.optimize(_build_samples(db), param)
+
+
+def walk_forward_param(db: Session, param: str, windows: int = 4) -> dict:
+    return optimize.walk_forward(_build_samples(db), param, windows=windows)
+
+
+# ---------------------------------------------------------------------------
+# Phase 14 — Monte Carlo risk
+# ---------------------------------------------------------------------------
+def monte_carlo(db: Session, strategy_id: int, sims: int = 2000, seed: int = 42) -> dict:
+    strat = db.get(Top20Strategy, strategy_id)
+    if strat is None:
+        return {"error": "strategy not found"}
+    pnls = [t.realized_pnl for t in db.scalars(select(Top20Trade).where(
+        Top20Trade.strategy_id == strategy_id, Top20Trade.status == "closed")).all()]
+    res = montecarlo.simulate(pnls, strat.starting_bankroll, sims=sims, seed=seed)
+    return {"strategy": strat.name, "key": strat.key, **res}
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — market intelligence
+# ---------------------------------------------------------------------------
+def market_intelligence(db: Session) -> dict:
+    sigs = db.scalars(select(PaperSignal)).all()
+    mids = {s.market_id for s in sigs}
+    markets = {m.id: m for m in db.scalars(select(Market).where(Market.id.in_(mids))).all()}
+    records = []
+    for s in sigs:
+        m = markets.get(s.market_id)
+        if not m or not m.resolved or m.resolved_outcome is None:
+            continue
+        won = 1.0 if m.resolved_outcome == s.outcome else 0.0
+        price = float(s.observed_price or 0.5)
+        ttr = None
+        if m.resolved_at and s.created_at:
+            ttr = max(0.0, (m.resolved_at - s.created_at).total_seconds() / 3600.0)
+        records.append({"category": categorize(m.question, m.category),
+                        "edge": float(s.edge_estimate or 0), "won": won, "price": price,
+                        "realized_return": round((won - price) / max(0.01, price), 4),
+                        "ttr_hours": ttr})
+    return market_intel.compute(records)
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — ensembles
+# ---------------------------------------------------------------------------
+def ensemble_view(db: Session) -> dict:
+    rows = []
+    for strat in db.scalars(select(Top20Strategy).order_by(Top20Strategy.id)).all():
+        closed = db.scalars(select(Top20Trade).where(
+            Top20Trade.strategy_id == strat.id, Top20Trade.status == "closed")
+            .order_by(Top20Trade.closed_at)).all()
+        rets = [t.realized_pnl / t.stake for t in closed if t.stake]
+        m = _metrics_for(db, strat)
+        rows.append({"key": strat.key, "name": strat.name, "returns": rets, "metrics": m})
+    return ensembles.compute(rows)
+
+
+# ---------------------------------------------------------------------------
+# Phase 19 — daily research report (Markdown)
+# ---------------------------------------------------------------------------
+def research_report(db: Session, date: str = "") -> dict:
+    lbd = leaderboard(db)
+    ranked = [r for r in lbd["ranking"] if r["has_trades"]]
+    best = ranked[0] if ranked else {}
+    summaries = list_strategies(db)
+    by_pnl = sorted(summaries, key=lambda s: s["total_pnl"], reverse=True)
+    imp = ({"name": by_pnl[0]["name"], "delta": by_pnl[0]["total_pnl"]}
+           if by_pnl and by_pnl[0]["total_pnl"] > 0 else None)
+    reg = ({"name": by_pnl[-1]["name"], "delta": by_pnl[-1]["total_pnl"]}
+           if by_pnl and by_pnl[-1]["total_pnl"] < 0 else None)
+    dd = max(summaries, key=lambda s: s["max_drawdown"], default=None)
+    closed = db.scalars(select(Top20Trade).where(Top20Trade.status == "closed")).all()
+    mp = max(closed, key=lambda t: t.realized_pnl, default=None)
+    ws = min(closed, key=lambda t: t.realized_pnl, default=None)
+    exits_recent = db.scalars(select(Top20Trade).where(Top20Trade.status == "closed")
+                              .order_by(Top20Trade.closed_at.desc()).limit(5)).all()
+    cands = db.scalars(select(WalletCandidate).where(
+        WalletCandidate.classification != "insufficient_data")
+        .order_by(WalletCandidate.copyability_score.desc()).limit(5)).all()
+    new_wallets = [{"address": db.get(Wallet, c.wallet_id).address,
+                    "copyability": c.copyability_score, "classification": c.classification}
+                   for c in cands if db.get(Wallet, c.wallet_id)]
+    mi = market_intelligence(db)
+    rec = recommend_retirements(db)
+    port = portfolio(db)
+    best_metrics = dict(best.get("metrics", {})) if best else {}
+    best_metrics.update({"name": best.get("name", "—"), "score": best.get("score", 0),
+                         "sharpe": best.get("metrics", {}).get("sharpe", 0)} if best else {})
+    ctx = {
+        "date": date, "best_strategy": best_metrics, "best_reason": best.get("reason", "") if best else "",
+        "biggest_improvement": imp, "largest_regression": reg,
+        "largest_drawdown": {"name": dd["name"], "dd": dd["max_drawdown"]} if dd else None,
+        "new_top_wallets": new_wallets,
+        "category_performance": mi.get("categories", [])[:4],
+        "most_profitable_signal": {"market": mp.market_question, "pnl": mp.realized_pnl} if mp else None,
+        "worst_signal": {"market": ws.market_question, "pnl": ws.realized_pnl} if ws else None,
+        "recent_exits": [{"market": e.market_question, "reason": e.exit_reason or "resolved",
+                          "pnl": e.realized_pnl} for e in exits_recent],
+        "parameter_changes": [f"Retire recommended: {r['name']} ({r['reason']})"
+                              for r in rec["recommendations"]] or ["No lifecycle changes."],
+        "open_risk": {"open_exposure": port["open_exposure"],
+                      "capital_utilization": port["capital_utilization"],
+                      "open_positions": port["open_positions"]},
+    }
+    return {"paper_only": True, "markdown": report_mod.generate(ctx)}
 
 
 def forward_test(db: Session) -> dict:
@@ -621,10 +828,75 @@ def forward_test(db: Session) -> dict:
 def reset_paper(db: Session) -> dict:
     n_trades = db.query(Top20Trade).delete()
     n_snaps = db.query(Top20Snapshot).delete()
+    n_fv = db.query(Top20FeatureVector).delete()
     for strat in db.scalars(select(Top20Strategy)).all():
         strat.signals_evaluated = 0
         strat.trades_entered = 0
         strat.last_signal_id = 0
         strat.metrics = {}
     db.commit()
-    return {"trades_deleted": int(n_trades or 0), "snapshots_deleted": int(n_snaps or 0)}
+    return {"trades_deleted": int(n_trades or 0), "snapshots_deleted": int(n_snaps or 0),
+            "feature_vectors_deleted": int(n_fv or 0)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 18 — strategy lifecycle / retirement (status only; never delete history)
+# ---------------------------------------------------------------------------
+MIN_SAMPLE_FOR_LIFECYCLE = 20   # statistically meaningful sample before judging
+
+
+def recommend_retirements(db: Session) -> dict:
+    """Recommend retiring strategies that consistently underperform after a
+    meaningful sample. Returns recommendations + a suggested promotion path.
+    Does not mutate anything — recommendations only."""
+    rows = [(s, _metrics_for(db, s)) for s in db.scalars(select(Top20Strategy)).all()]
+    scored = [(s, m) for s, m in rows if (m.get("closed_positions") or 0) >= MIN_SAMPLE_FOR_LIFECYCLE]
+    recs = []
+    if scored:
+        median_exp = statistics.median([m["expectancy"] for _, m in scored])
+        for s, m in scored:
+            neg = m["expectancy"] < 0 and m["sharpe"] < 0 and m["profit_factor"] < 1.0
+            if neg and s.status != "retired":
+                recs.append({"key": s.key, "name": s.name, "action": "retire",
+                             "reason": f"expectancy {m['expectancy']:+.2f}, Sharpe {m['sharpe']:.2f}, "
+                                       f"PF {m['profit_factor']:.2f} over {m['closed_positions']} closed",
+                             "median_expectancy": round(median_exp, 2)})
+    return {"paper_only": True, "min_sample": MIN_SAMPLE_FOR_LIFECYCLE,
+            "evaluated": len(scored), "recommendations": recs}
+
+
+def set_status(db: Session, key: str, status: str) -> dict | None:
+    if status not in ("experimental", "candidate", "production", "retired"):
+        return None
+    s = db.scalar(select(Top20Strategy).where(Top20Strategy.key == key))
+    if s is None:
+        return None
+    s.status = status
+    if status == "retired":
+        s.active = False
+    db.commit()
+    return {"key": key, "status": status, "active": s.active}
+
+
+# ---------------------------------------------------------------------------
+# Phase 20 — feature-vector dataset read access
+# ---------------------------------------------------------------------------
+def feature_vectors(db: Session, limit: int = 200, settled_only: bool = False) -> dict:
+    q = select(Top20FeatureVector).order_by(Top20FeatureVector.created_at.desc()).limit(limit)
+    if settled_only:
+        q = q.where(Top20FeatureVector.settled == True)  # noqa: E712
+    rows = db.scalars(q).all()
+    total = db.scalar(select(func.count()).select_from(Top20FeatureVector))
+    labeled = db.scalar(select(func.count()).select_from(Top20FeatureVector).where(
+        Top20FeatureVector.settled == True))  # noqa: E712
+    return {
+        "paper_only": True, "total": int(total or 0), "labeled": int(labeled or 0),
+        "note": "Supervised dataset for a future probability model — no ML trained yet.",
+        "rows": [{
+            "id": r.id, "created_at": r.created_at.isoformat() if r.created_at else None,
+            "strategy_key": r.strategy_key, "signal_id": r.signal_id, "decision": r.decision,
+            "features": r.features, "settled": r.settled, "label_outcome": r.label_outcome,
+            "label_realized_return": r.label_realized_return, "label_realized_pnl": r.label_realized_pnl,
+            "label_exit_reason": r.label_exit_reason,
+        } for r in rows],
+    }

@@ -23,6 +23,11 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 
+# Below this many closed trades, point estimates (Sharpe etc.) are unreliable.
+MIN_RELIABLE_TRADES = 10
+MIN_DAYS_FOR_CAGR = 3.0
+
+
 def sharpe(returns: list[float], rf: float = 0.0) -> float:
     """Mean/stdev of returns. 0 if <2 samples or zero variance."""
     if len(returns) < 2:
@@ -32,6 +37,26 @@ def sharpe(returns: list[float], rf: float = 0.0) -> float:
     if sd == 0:
         return 0.0
     return round(_mean(excess) / sd, 4)
+
+
+def sharpe_ci(returns: list[float]) -> list[float]:
+    """95% confidence interval for the Sharpe ratio (Lo's standard error:
+    SE ≈ sqrt((1 + 0.5·SR²)/n)). Wide for small n — that's the point."""
+    n = len(returns)
+    if n < 2:
+        return [0.0, 0.0]
+    sr = sharpe(returns)
+    se = math.sqrt((1 + 0.5 * sr * sr) / n)
+    return [round(sr - 1.96 * se, 4), round(sr + 1.96 * se, 4)]
+
+
+def sortino_ci(returns: list[float]) -> list[float]:
+    n = len(returns)
+    if n < 2:
+        return [0.0, 0.0]
+    so = sortino(returns)
+    se = math.sqrt((1 + 0.5 * so * so) / n)
+    return [round(so - 1.96 * se, 4), round(so + 1.96 * se, 4)]
 
 
 def sortino(returns: list[float], rf: float = 0.0) -> float:
@@ -147,16 +172,23 @@ def compute_metrics(closed: list, open_: list, equity_curve: list[float],
     avg_size = round(_mean([t.stake for t in (closed + open_)]), 2)
 
     total_return = round((equity - starting_bankroll) / starting_bankroll, 4)
-    # Annualized (CAGR) if we have a real time span (>= ~1 day).
+    # Annualized (CAGR) only over a real elapsed span — never extrapolate a few
+    # hours of trading into a yearly figure. Flag when we can't.
     annualized = 0.0
+    annualized_valid = False
+    days = 0.0
     if first_ts and last_ts:
         days = max((last_ts - first_ts).total_seconds() / 86400.0, 0.0)
-        if days >= 1.0 and equity > 0 and starting_bankroll > 0:
+        if days >= MIN_DAYS_FOR_CAGR and equity > 0 and starting_bankroll > 0:
             annualized = round((equity / starting_bankroll) ** (365.0 / days) - 1.0, 4)
+            annualized_valid = True
 
     return {
         "total_return": total_return,
         "annualized_return": annualized,
+        "annualized_valid": annualized_valid,
+        "elapsed_days": round(days, 2),
+        "insufficient_history": len(closed) < MIN_RELIABLE_TRADES,
         "realized_pnl": realized,
         "unrealized_pnl": unrealized,
         "total_pnl": round(realized + unrealized, 2),
@@ -168,7 +200,9 @@ def compute_metrics(closed: list, open_: list, equity_curve: list[float],
         "profit_factor": profit_factor(pnls),
         "expectancy": expectancy(pnls),
         "sharpe": sharpe(returns),
+        "sharpe_ci": sharpe_ci(returns),
         "sortino": sortino(returns),
+        "sortino_ci": sortino_ci(returns),
         "max_drawdown": max_drawdown(equity_curve),
         "avg_holding_min": round(_mean(holds), 1),
         "median_holding_min": round(statistics.median(holds), 1) if holds else 0.0,

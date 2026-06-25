@@ -507,3 +507,64 @@ def wallet_profile(address: str, db: Session = Depends(get_db)) -> dict:
     if out is None:
         raise HTTPException(status_code=404, detail="Wallet not found")
     return out
+
+
+# --- research platform (Phases 12-20) ---------------------------------------
+@app.get("/api/top-20/optimize/{param}")
+def top20_optimize(param: str, db: Session = Depends(get_db)) -> dict:
+    """Parameter sweep over historical labeled data (Phase 12)."""
+    return top20.optimize_param(db, param)
+
+
+@app.get("/api/top-20/walk-forward/{param}")
+def top20_walk_forward(param: str, windows: int = 4, db: Session = Depends(get_db)) -> dict:
+    """Walk-forward stability analysis for a parameter (Phase 13)."""
+    return top20.walk_forward_param(db, param, windows)
+
+
+@app.get("/api/top-20/montecarlo/{strategy_id}")
+def top20_montecarlo(strategy_id: int, sims: int = 2000, seed: int = 42,
+                     db: Session = Depends(get_db)) -> dict:
+    """Monte Carlo risk analysis for a strategy (Phase 14)."""
+    return top20.monte_carlo(db, strategy_id, sims, seed)
+
+
+@app.get("/api/top-20/market-intel")
+def top20_market_intel(db: Session = Depends(get_db)) -> dict:
+    """What kinds of markets are easiest to beat? (Phase 16)."""
+    return top20.market_intelligence(db)
+
+
+@app.get("/api/top-20/ensembles")
+def top20_ensembles(db: Session = Depends(get_db)) -> dict:
+    """Ensemble strategy performance (Phase 17)."""
+    return top20.ensemble_view(db)
+
+
+@app.get("/api/top-20/retirement")
+def top20_retirement(db: Session = Depends(get_db)) -> dict:
+    """Strategies recommended for retirement after meaningful samples (Phase 18)."""
+    return top20.recommend_retirements(db)
+
+
+@app.post("/api/top-20/strategies/{key}/status")
+def top20_set_status(key: str, status: str, db: Session = Depends(get_db)) -> dict:
+    """Move a strategy through its lifecycle (Phase 18). Paper-only metadata."""
+    out = top20.set_status(db, key, status)
+    if out is None:
+        raise HTTPException(status_code=400, detail="Unknown strategy or invalid status")
+    return out
+
+
+@app.get("/api/top-20/report")
+def top20_report(db: Session = Depends(get_db)) -> dict:
+    """Daily research report as Markdown (Phase 19)."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    return top20.research_report(db, today)
+
+
+@app.get("/api/top-20/dataset")
+def top20_dataset(limit: int = 100, settled_only: bool = False,
+                  db: Session = Depends(get_db)) -> dict:
+    """Collected feature-vector dataset for future ML (Phase 20)."""
+    return top20.feature_vectors(db, limit, settled_only)

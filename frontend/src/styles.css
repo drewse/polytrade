@@ -212,3 +212,7 @@ th.sorted { color: var(--accent); }
 .expo-fill { background: var(--accent); height: 100%; }
 .expo-val { width: 130px; text-align: right; }
 .nav-link.inline { display: inline; padding: 4px 8px; }
+
+/* ---- research tab ---- */
+.report-md { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; line-height: 1.5; max-height: 520px; overflow: auto; }
+.lowdata { color: var(--yellow); font-size: 11px; }

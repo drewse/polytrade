@@ -42,6 +42,11 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "exit_policy": "VARCHAR DEFAULT 'hold'",
         "philosophy": "VARCHAR DEFAULT 'mixed'",
         "metrics": "JSON",
+        "version": "INTEGER DEFAULT 1",
+        "parent_key": "VARCHAR",
+        "status": "VARCHAR DEFAULT 'production'",
+        "notes": "TEXT DEFAULT ''",
+        "param_hash": "VARCHAR DEFAULT ''",
     },
     "top20_trades": {
         "entry_confidence": "FLOAT DEFAULT 0",

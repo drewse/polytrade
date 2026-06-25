@@ -293,6 +293,12 @@ class Top20Strategy(Base):
     fractional_kelly: Mapped[float] = mapped_column(Float, default=0.25)
     exit_policy: Mapped[str] = mapped_column(String(40), default="hold")  # see top20/exits.py
     philosophy: Mapped[str] = mapped_column(String(24), default="mixed")  # wallet|signal|market|sizing
+    # experiment metadata (Phase 11) + lifecycle (Phase 18)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    parent_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="production")  # experimental|candidate|production|retired
+    notes: Mapped[str] = mapped_column(Text, default="")
+    param_hash: Mapped[str] = mapped_column(String(32), default="")  # reproducibility id
     params: Mapped[dict] = mapped_column(JSON, default=dict)  # filter/sizing knobs (transparency)
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # persisted Phase-1 analytics
     signals_evaluated: Mapped[int] = mapped_column(Integer, default=0)
@@ -346,6 +352,30 @@ class Top20Trade(Base):
     explanation: Mapped[dict] = mapped_column(JSON, default=dict)  # structured why-entered
 
     strategy: Mapped[Top20Strategy] = relationship(back_populates="trades")
+
+
+class Top20FeatureVector(Base):
+    """Phase 20 — a labeled feature vector per paper trade, captured at entry and
+    labeled at settlement. This is the supervised-learning dataset for a future
+    probability model (no ML trained yet — collection only). PAPER ONLY."""
+
+    __tablename__ = "top20_feature_vectors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    strategy_id: Mapped[int] = mapped_column(Integer, index=True)
+    strategy_key: Mapped[str] = mapped_column(String(40), index=True)
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # inputs (signal + wallet + market features, probability, sizing, decision)
+    features: Mapped[dict] = mapped_column(JSON, default=dict)
+    decision: Mapped[str] = mapped_column(String(8), default="take")  # take (skips not stored)
+    # labels (filled at settlement)
+    label_outcome: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    label_realized_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    label_realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    label_exit_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    settled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class Top20Snapshot(Base):
