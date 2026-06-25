@@ -291,7 +291,10 @@ class Top20Strategy(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     starting_bankroll: Mapped[float] = mapped_column(Float, default=10_000.0)
     fractional_kelly: Mapped[float] = mapped_column(Float, default=0.25)
+    exit_policy: Mapped[str] = mapped_column(String(40), default="hold")  # see top20/exits.py
+    philosophy: Mapped[str] = mapped_column(String(24), default="mixed")  # wallet|signal|market|sizing
     params: Mapped[dict] = mapped_column(JSON, default=dict)  # filter/sizing knobs (transparency)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # persisted Phase-1 analytics
     signals_evaluated: Mapped[int] = mapped_column(Integer, default=0)
     trades_entered: Mapped[int] = mapped_column(Integer, default=0)
     last_signal_id: Mapped[int] = mapped_column(Integer, default=0)  # evaluation watermark
@@ -334,6 +337,13 @@ class Top20Trade(Base):
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # explainability + analytics (Phases 1/8)
+    entry_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_edge: Mapped[float] = mapped_column(Float, default=0.0)
+    wallet_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    holding_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    explanation: Mapped[dict] = mapped_column(JSON, default=dict)  # structured why-entered
 
     strategy: Mapped[Top20Strategy] = relationship(back_populates="trades")
 

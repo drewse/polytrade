@@ -86,6 +86,11 @@ export const api = {
     request(`/api/top-20/trades?${strategyId ? `strategy_id=${strategyId}&` : ''}limit=${limit}`),
   top20Recompute: () => request('/api/top-20/recompute', { method: 'POST' }),
   top20Reset: () => request('/api/top-20/reset-paper', { method: 'POST' }),
+  top20Leaderboard: () => request('/api/top-20/leaderboard'),
+  top20Portfolio: () => request('/api/top-20/portfolio'),
+  top20Explain: (signalId) => request(`/api/top-20/explain/${signalId}`),
+  top20ForwardTest: () => request('/api/top-20/forward-test'),
+  walletProfile: (address) => request(`/api/wallets/${address}/profile`),
   trackCandidate: (address) => request(`/api/discovery/candidates/${address}/track`, { method: 'POST' }),
   ignoreCandidate: (address) => request(`/api/discovery/candidates/${address}/ignore`, { method: 'POST' }),
 }

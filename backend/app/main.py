@@ -471,3 +471,39 @@ def top20_reset(db: Session = Depends(get_db)) -> MessageOut:
     """Wipe TOP 20 paper trades + snapshots (paper-only dev action)."""
     result = top20.reset_paper(db)
     return MessageOut(message="TOP 20 paper state reset", detail=result)
+
+
+@app.get("/api/top-20/leaderboard")
+def top20_leaderboard(db: Session = Depends(get_db)) -> dict:
+    """Risk-adjusted weighted ranking + why #1 beats #2 (Phase 7)."""
+    return top20.leaderboard_view(db)
+
+
+@app.get("/api/top-20/portfolio")
+def top20_portfolio(db: Session = Depends(get_db)) -> dict:
+    """Aggregate paper portfolio analytics across all 20 strategies (Phase 6)."""
+    return top20.portfolio(db)
+
+
+@app.get("/api/top-20/explain/{signal_id}")
+def top20_explain(signal_id: int, db: Session = Depends(get_db)) -> dict:
+    """How each of the 20 strategies decided on one signal (Phase 8)."""
+    out = top20.explain_signal(db, signal_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    return out
+
+
+@app.get("/api/top-20/forward-test")
+def top20_forward_test(db: Session = Depends(get_db)) -> dict:
+    """Train / validation / forward split metrics per strategy (Phase 9)."""
+    return top20.forward_test(db)
+
+
+@app.get("/api/wallets/{address}/profile")
+def wallet_profile(address: str, db: Session = Depends(get_db)) -> dict:
+    """Quant profile for one wallet: ROI, Sharpe, categories, equity curve (Phase 3)."""
+    out = top20.wallet_profile(db, address)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return out

@@ -186,3 +186,29 @@ input, select {
 table.mini { width: 100%; border-collapse: collapse; font-size: 12px; }
 table.mini th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 table.mini td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+
+/* ---- TOP 20 quant platform ---- */
+.top20-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.top20-tabs .tab { background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 8px 16px; cursor: pointer; }
+.top20-tabs .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+th.sorted { color: var(--accent); }
+.explain { color: var(--muted); font-size: 11px; max-width: 260px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
+.metric-cell { display: flex; justify-content: space-between; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px; }
+.metric-cell span { color: var(--muted); }
+.panel.hilite { border-color: var(--accent); background: rgba(91,140,255,0.08); }
+.up { color: var(--green); }
+.down { color: var(--red); }
+.lb-grid { display: flex; flex-direction: column; gap: 10px; }
+.lb-card { display: flex; gap: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.lb-rank { font-size: 26px; font-weight: 800; color: var(--accent); min-width: 48px; }
+.lb-body { flex: 1; }
+.lb-name { font-weight: 700; font-size: 15px; }
+.lb-score { color: var(--accent); font-weight: 700; margin-left: 8px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.expo-row { display: flex; align-items: center; gap: 10px; margin: 5px 0; font-size: 12px; }
+.expo-label { width: 200px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.expo-bar { flex: 1; background: var(--panel-2); border-radius: 4px; height: 12px; overflow: hidden; }
+.expo-fill { background: var(--accent); height: 100%; }
+.expo-val { width: 130px; text-align: right; }
+.nav-link.inline { display: inline; padding: 4px 8px; }

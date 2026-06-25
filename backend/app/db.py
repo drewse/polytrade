@@ -38,6 +38,19 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "partial_history": "BOOLEAN DEFAULT 0",
         "num_settled": "INTEGER DEFAULT 0",
     },
+    "top20_strategies": {
+        "exit_policy": "VARCHAR DEFAULT 'hold'",
+        "philosophy": "VARCHAR DEFAULT 'mixed'",
+        "metrics": "JSON",
+    },
+    "top20_trades": {
+        "entry_confidence": "FLOAT DEFAULT 0",
+        "entry_edge": "FLOAT DEFAULT 0",
+        "wallet_rank": "INTEGER",
+        "holding_minutes": "FLOAT",
+        "exit_reason": "VARCHAR",
+        "explanation": "JSON",
+    },
     "ingest_status": {"last_discovery_at": "DATETIME"},
     "paper_signals": {
         "edge_estimate": "FLOAT DEFAULT 0.0",
