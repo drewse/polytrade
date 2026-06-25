@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, discovery, services, top20
+from . import attribution, auto_worker, discovery, services, top20
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -68,6 +68,9 @@ def _startup() -> None:
         top20.ensure_strategies(db)
     finally:
         db.close()
+    # Start the in-process auto-ingest worker so live data refreshes itself
+    # (guarded: one loop only; paper-trading only).
+    auto_worker.start()
 
 
 @app.get("/api/health")
@@ -317,7 +320,8 @@ def patch_settings(payload: SettingsUpdate, db: Session = Depends(get_db)) -> Se
 # ===========================================================================
 @app.post("/api/ingest/run", response_model=MessageOut)
 def ingest_run(db: Session = Depends(get_db)) -> MessageOut:
-    result = services.run_ingest_cycle(db)
+    # Shares the worker's lock so a manual run can never overlap an auto cycle.
+    result = auto_worker.run_one_cycle(wait=False)
     return MessageOut(message="Ingest cycle complete", detail=result)
 
 

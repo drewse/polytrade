@@ -214,6 +214,12 @@ class StatusOut(BaseModel):
     age_seconds: float | None = None
     stale: bool = False
     partial_wallets: int = 0
+    # auto-ingest worker visibility
+    auto_ingest_enabled: bool = False
+    auto_ingest_interval_seconds: int = 0
+    worker_running: bool = False
+    last_worker_error: str | None = None
+    last_worker_cycle_at: datetime | None = None
 
 
 class BackfillRequest(BaseModel):

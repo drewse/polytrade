@@ -21,6 +21,20 @@ engine = create_engine(
     future=True,
 )
 
+
+# With a continuous background ingest worker writing while API requests read,
+# use WAL + a busy timeout so readers don't hit "database is locked". SQLite-only.
+if config.database_url.startswith("sqlite"):
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover (driver-level)
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
 

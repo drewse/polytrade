@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from . import auto_worker
 from . import backtest as bt
 from . import discovery
 from . import paper_trading as pt
@@ -873,6 +874,7 @@ def get_ingest_status(db: Session) -> dict:
         "age_seconds": age_seconds,
         "stale": stale,
         "partial_wallets": int(partial_wallets or 0),
+        **auto_worker.status(),
     }
 
 
