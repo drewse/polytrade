@@ -72,7 +72,7 @@ def test_replay_produces_labeled_feature_vectors(in_memory_db):
     # candidate trade at day 10 on a market resolving day 30
     base = datetime(2026, 1, 1)
     db.add(Market(id="cand", question="Will the Lakers win?", outcomes=["Yes", "No"],
-                  prices=[1.0, 0.0], liquidity=8000, resolved=True, resolved_outcome="Yes",
+                  prices=[1.0, 0.0], liquidity=8000, volume=50000, resolved=True, resolved_outcome="Yes",
                   resolved_at=base + timedelta(days=30)))
     db.flush()
     db.add(Trade(wallet_id=w.id, market_id="cand", outcome="Yes", side="buy", price=0.5,
@@ -97,7 +97,7 @@ def test_replay_checkpoint_resume(in_memory_db):
         _seed_resolved(db, w.id, f"c{i}", res_day=i)
     base = datetime(2026, 1, 1)
     db.add(Market(id="cand2", question="Sports match winner?", outcomes=["Yes", "No"],
-                  prices=[1.0, 0.0], liquidity=8000, resolved=True, resolved_outcome="Yes",
+                  prices=[1.0, 0.0], liquidity=8000, volume=50000, resolved=True, resolved_outcome="Yes",
                   resolved_at=base + timedelta(days=30)))
     db.flush()
     db.add(Trade(wallet_id=w.id, market_id="cand2", outcome="Yes", side="buy", price=0.5,
@@ -119,7 +119,7 @@ def test_drift_and_regimes_and_benchmark(in_memory_db):
         _seed_resolved(db, w.id, f"d{i}", res_day=i)
     base = datetime(2026, 1, 1)
     db.add(Market(id="dcand", question="Bitcoin above 100k?", outcomes=["Yes", "No"],
-                  prices=[1.0, 0.0], liquidity=8000, resolved=True, resolved_outcome="Yes",
+                  prices=[1.0, 0.0], liquidity=8000, volume=50000, resolved=True, resolved_outcome="Yes",
                   resolved_at=base + timedelta(days=40)))
     db.flush()
     db.add(Trade(wallet_id=w.id, market_id="dcand", outcome="Yes", side="buy", price=0.5,

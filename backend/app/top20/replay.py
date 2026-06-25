@@ -38,9 +38,12 @@ from .strategies import CONFIG_BY_KEY, STRATEGIES, Ctx, Shared, categorize, deci
 
 # Replay gates (slightly looser than live to maximize the dataset; the per-
 # strategy filters still apply). Documented for transparency.
+# NOTE: resolved/closed markets report ~0 live liquidity (no active book), so we
+# gate historical markets on VOLUME (which persists) and use volume as the
+# liquidity proxy fed to the strategies.
 MIN_PRIOR_SETTLED = 5     # wallet needs this many resolved positions before it can signal
 MIN_SCORE = 55.0          # running (point-in-time) wallet score to emit a signal
-MIN_LIQUIDITY = 300.0
+MIN_VOLUME = 1000.0       # market must have traded at least this much (USD)
 MIN_SIZE = 15.0
 
 
@@ -185,7 +188,7 @@ def run(db: Session, max_trades: int = 400) -> dict:
     rows = db.execute(
         select(Trade, Market).join(Market, Trade.market_id == Market.id)
         .where(Trade.id > st.last_event_id, Market.resolved == True,  # noqa: E712
-               Market.resolved_outcome.is_not(None), Market.liquidity >= MIN_LIQUIDITY,
+               Market.resolved_outcome.is_not(None), Market.volume >= MIN_VOLUME,
                Trade.size >= MIN_SIZE)
         .order_by(Trade.id).limit(max_trades)
     ).all()
@@ -210,8 +213,10 @@ def run(db: Session, max_trades: int = 400) -> dict:
         price = float(trade.price or 0.5)
         edge = round(rep["win_rate"] - price, 4)
         category = categorize(market.question, market.category)
+        # closed markets carry ~0 live liquidity; use traded volume as the proxy
+        liq_proxy = float(market.volume or 0) or float(market.liquidity or 0)
         ctx = Ctx(wallet_id=trade.wallet_id, classification=_class(rep["score"]),
-                  confidence=rep["score"], edge=edge, liquidity=float(market.liquidity or 0),
+                  confidence=rep["score"], edge=edge, liquidity=liq_proxy,
                   age_min=0.0, price=price, outcome=trade.outcome, market_id=market.id,
                   category=category, win_rate=rep["win_rate"], sharpe=rep["roi"] / 0.3,
                   roi=rep["roi"], copyability=rep["score"], specialization=0.0,
