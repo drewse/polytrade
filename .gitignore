@@ -46,3 +46,4 @@ credentials.json
 .DS_Store
 Thumbs.db
 *.log
+.playwright-mcp/

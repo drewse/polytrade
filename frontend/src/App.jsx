@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Component, useEffect, useState } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api'
 import Overview from './pages/Overview.jsx'
@@ -53,6 +53,24 @@ function StatusBadges() {
   )
 }
 
+// Keeps a render error in one page from unmounting the whole app (black screen).
+class ErrorBoundary extends Component {
+  state = { error: null }
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="empty">
+          Something went wrong rendering this page: {this.state.error.message || 'unknown error'}
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export default function App() {
   return (
     <div className="app">
@@ -70,6 +88,7 @@ export default function App() {
         <div className="paper-badge">📝 PAPER TRADING ONLY — no real orders, no keys, read-only</div>
       </aside>
       <main className="main">
+        <ErrorBoundary>
         <Routes>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           <Route path="/overview" element={<Overview />} />
@@ -81,6 +100,7 @@ export default function App() {
           <Route path="/backtests" element={<Backtests />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
+        </ErrorBoundary>
       </main>
     </div>
   )

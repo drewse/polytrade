@@ -1,5 +1,13 @@
-// Thin API client. Uses same-origin /api (proxied to the backend in dev).
-const BASE = import.meta.env.VITE_API_BASE || ''
+// Thin API client.
+//
+// Base URL resolution:
+//   - Production (Vercel): set VITE_API_BASE_URL to the deployed backend origin
+//     (e.g. https://polytrade-api.onrender.com). Requests become absolute and
+//     hit that backend directly (CORS must allow the Vercel domain).
+//   - Local dev: leave VITE_API_BASE_URL unset. BASE falls back to '' so requests
+//     stay same-origin (relative /api/...) and Vite's dev proxy forwards them to
+//     the FastAPI backend on http://127.0.0.1:8000 (see vite.config.js).
+const BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -11,9 +19,13 @@ async function request(path, options = {}) {
     try {
       detail = (await res.json()).detail
     } catch {
-      detail = res.statusText
+      // HTTP/2 responses carry no reason phrase, so res.statusText is often ''.
+      detail = res.statusText || null
     }
-    throw new Error(typeof detail === 'string' ? detail : `Request failed (${res.status})`)
+    // Always throw a non-empty message — an empty string is falsy and would
+    // slip past `if (error)` guards downstream, crashing on null data.
+    const msg = typeof detail === 'string' && detail ? detail : `Request failed (${res.status})`
+    throw new Error(msg)
   }
   if (res.status === 204) return null
   return res.json()

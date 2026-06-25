@@ -338,3 +338,42 @@ No API keys. No private keys. No paid plans. Nothing is ever traded for real.
 ## Resetting
 
 Delete `backend/polymarket_copy_lab.db` (or POST `/api/mock/seed`) to start over.
+
+## Deployment
+
+The frontend and backend deploy **separately** — Vercel hosts the static SPA, and
+a long-running host serves the FastAPI backend.
+
+### Frontend → Vercel
+
+The React/Vite app in [`frontend/`](frontend/) deploys to Vercel as a static SPA.
+Set the project **Root Directory** to `frontend` and add the
+`VITE_API_BASE_URL` environment variable pointing at the deployed backend origin.
+Full steps and the SPA routing config are in the
+[frontend README](frontend/README.md).
+
+### Backend → Render / Railway / Fly / VPS
+
+Vercel cannot run the FastAPI backend (it needs a persistent process and a real
+database), so host it separately on **Render, Railway, Fly.io, or a VPS**. Run it
+with a production ASGI server, e.g.:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Set `PCL_CORS_ORIGINS` to include your Vercel domain so the browser can call the
+API, e.g. `PCL_CORS_ORIGINS=https://your-app.vercel.app,http://localhost:5173`.
+
+### Database — SQLite is dev only
+
+The default SQLite database (`backend/polymarket_copy_lab.db`) is for **local /
+development use only**. Most platform filesystems are ephemeral, so the file is
+lost on every redeploy or restart. For production, use **Postgres** and point the
+backend at it via `PCL_DATABASE_URL`, e.g.:
+
+```bash
+PCL_DATABASE_URL=postgresql://user:pass@host:5432/polytrade
+```
+
+(Install a Postgres driver such as `psycopg[binary]` in the backend environment.)
