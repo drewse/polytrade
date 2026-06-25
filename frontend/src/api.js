@@ -79,6 +79,13 @@ export const api = {
     return request(`/api/discovery/candidates${qs ? `?${qs}` : ''}`)
   },
   candidate: (address) => request(`/api/discovery/candidates/${address}`),
+  // TOP 20 paper-strategy lab
+  top20Strategies: () => request('/api/top-20/strategies'),
+  top20Strategy: (id) => request(`/api/top-20/strategies/${id}`),
+  top20Trades: (strategyId, limit = 100) =>
+    request(`/api/top-20/trades?${strategyId ? `strategy_id=${strategyId}&` : ''}limit=${limit}`),
+  top20Recompute: () => request('/api/top-20/recompute', { method: 'POST' }),
+  top20Reset: () => request('/api/top-20/reset-paper', { method: 'POST' }),
   trackCandidate: (address) => request(`/api/discovery/candidates/${address}/track`, { method: 'POST' }),
   ignoreCandidate: (address) => request(`/api/discovery/candidates/${address}/ignore`, { method: 'POST' }),
 }

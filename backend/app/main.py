@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, discovery, services
+from . import attribution, discovery, services, top20
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -65,6 +65,7 @@ def _startup() -> None:
     db = next(get_db())
     try:
         services.ensure_settings(db)
+        top20.ensure_strategies(db)
     finally:
         db.close()
 
@@ -433,3 +434,40 @@ def signals_quality(limit: int = 200, db: Session = Depends(get_db)) -> list[Sig
             )
         )
     return out
+
+
+# ===========================================================================
+# TOP 20 — paper strategy lab (PAPER ONLY; never places real orders)
+# ===========================================================================
+@app.get("/api/top-20/strategies")
+def top20_strategies(db: Session = Depends(get_db)) -> dict:
+    return {"paper_only": True, "strategies": top20.list_strategies(db)}
+
+
+@app.get("/api/top-20/strategies/{strategy_id}")
+def top20_strategy_detail(strategy_id: int, db: Session = Depends(get_db)) -> dict:
+    detail = top20.strategy_detail(db, strategy_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return detail
+
+
+@app.get("/api/top-20/trades")
+def top20_trades(strategy_id: int | None = None, limit: int = 100,
+                 db: Session = Depends(get_db)) -> dict:
+    return {"paper_only": True, "trades": top20.list_trades(db, strategy_id, limit)}
+
+
+@app.post("/api/top-20/recompute", response_model=MessageOut)
+def top20_recompute(db: Session = Depends(get_db)) -> MessageOut:
+    """Evaluate outstanding signals across all 20 strategies, settle/mark, snapshot."""
+    settings = services.get_settings(db)
+    result = top20.run_cycle(db, settings)
+    return MessageOut(message="TOP 20 recomputed", detail=result)
+
+
+@app.post("/api/top-20/reset-paper", response_model=MessageOut)
+def top20_reset(db: Session = Depends(get_db)) -> MessageOut:
+    """Wipe TOP 20 paper trades + snapshots (paper-only dev action)."""
+    result = top20.reset_paper(db)
+    return MessageOut(message="TOP 20 paper state reset", detail=result)

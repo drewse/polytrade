@@ -274,6 +274,85 @@ class MarketPriceSnapshot(Base):
     price: Mapped[float] = mapped_column(Float)
 
 
+class Top20Strategy(Base):
+    """One of the 20 paper copy-trading strategy variants (the TOP 20 lab).
+
+    Each strategy consumes the SAME live signal stream but applies different
+    entry/sizing/filter rules. Independent from the main paper engine
+    (PaperStrategy/PaperPosition) so the dashboard is untouched. PAPER ONLY —
+    no real orders are ever placed."""
+
+    __tablename__ = "top20_strategies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    starting_bankroll: Mapped[float] = mapped_column(Float, default=10_000.0)
+    fractional_kelly: Mapped[float] = mapped_column(Float, default=0.25)
+    params: Mapped[dict] = mapped_column(JSON, default=dict)  # filter/sizing knobs (transparency)
+    signals_evaluated: Mapped[int] = mapped_column(Integer, default=0)
+    trades_entered: Mapped[int] = mapped_column(Integer, default=0)
+    last_signal_id: Mapped[int] = mapped_column(Integer, default=0)  # evaluation watermark
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    trades: Mapped[list["Top20Trade"]] = relationship(
+        back_populates="strategy", cascade="all, delete-orphan"
+    )
+
+
+class Top20Trade(Base):
+    """A single paper trade/position entered by a TOP 20 strategy. Combines the
+    'trade' and 'position' concepts (1:1 here). No hard FK to signals/markets so
+    rows survive signal/market churn (mock reseeds). PAPER ONLY."""
+
+    __tablename__ = "top20_trades"
+    __table_args__ = (
+        UniqueConstraint("strategy_id", "signal_id", name="uq_top20_strategy_signal"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(ForeignKey("top20_strategies.id"), index=True)
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    wallet_address: Mapped[str] = mapped_column(String(64))
+    market_id: Mapped[str] = mapped_column(String(80), index=True)
+    market_question: Mapped[str] = mapped_column(Text, default="")
+    outcome: Mapped[str] = mapped_column(String(80))
+    side: Mapped[str] = mapped_column(String(8), default="buy")
+    entry_price: Mapped[float] = mapped_column(Float)       # 0..1
+    size_shares: Mapped[float] = mapped_column(Float)       # stake / entry_price
+    stake: Mapped[float] = mapped_column(Float)             # USD risked
+    estimated_probability: Mapped[float] = mapped_column(Float)  # clamped 0.01..0.99
+    kelly_fraction: Mapped[float] = mapped_column(Float)         # raw Kelly (pre-fraction)
+    fractional_kelly_used: Mapped[float] = mapped_column(Float)  # e.g. 0.25
+    sizing_reason: Mapped[str] = mapped_column(Text, default="")
+    entry_time: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    status: Mapped[str] = mapped_column(String(12), default="open", index=True)  # open|closed
+    current_price: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    strategy: Mapped[Top20Strategy] = relationship(back_populates="trades")
+
+
+class Top20Snapshot(Base):
+    """Per-strategy equity snapshot over time, used for the drawdown / curve."""
+
+    __tablename__ = "top20_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(ForeignKey("top20_strategies.id"), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    bankroll: Mapped[float] = mapped_column(Float)
+    equity: Mapped[float] = mapped_column(Float)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    open_positions: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class Backtest(Base):
     """A single backtest run comparing several strategies over a data window."""
 

@@ -17,6 +17,7 @@ from . import paper_trading as pt
 from . import positions as positions_mod
 from . import scoring
 from . import signal_quality
+from . import top20
 from .models import (
     Backtest,
     BacktestResult,
@@ -787,6 +788,16 @@ def run_ingest_cycle(db: Session) -> dict:
     refresh = refresh_positions(db)
     record_equity_snapshot(db)
 
+    # 6b. TOP 20 paper-strategy lab: evaluate the same signals across 20 variants,
+    #     settle/mark, snapshot. Guarded so it can never break the main cycle.
+    top20_summary = None
+    try:
+        top20_summary = top20.run_cycle(db, settings)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        status["errors"].append(f"top20: {exc}")
+        print(f"[ingest] top20 error: {exc}")
+
     # close live client if any
     close = getattr(provider, "close", None)
     if callable(close):
@@ -808,6 +819,7 @@ def run_ingest_cycle(db: Session) -> dict:
         "auto_closed": refresh["auto_closed"],
         "signals_quality_updated": n_quality,
         "discovery": discovery_summary["by_classification"] if discovery_summary else None,
+        "top20": top20_summary,
         "data_mode": data_mode,
         "ok": not status["errors"],
         "errors": status["errors"],
