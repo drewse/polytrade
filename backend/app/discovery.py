@@ -118,12 +118,20 @@ def run_discovery(db: Session, settings: dict, backfill_fn=None) -> dict:
     n_backfilled = 0
     candidate_wallet_ids: list[int] = []
 
+    scan_error: str | None = None
     if data_mode == "live":
         from .polymarket_client import LivePolymarketClient
 
+        # Scan recent live trades for fresh wallets to backfill. A failure here
+        # (e.g. the public data-api rate-limiting us) must not abort discovery —
+        # we degrade to re-evaluating the wallets we already hold history for.
         client = LivePolymarketClient()
         try:
             trades = client.get_recent_trades(limit=200)
+        except Exception as exc:  # noqa: BLE001
+            trades = []
+            scan_error = str(exc)
+            print(f"[discovery] recent-trades scan failed: {exc}")
         finally:
             client.close()
         seeds = extract_candidates(trades)
@@ -136,6 +144,12 @@ def run_discovery(db: Session, settings: dict, backfill_fn=None) -> dict:
             wallet = db.scalar(select(Wallet).where(Wallet.address == seed.address))
             if wallet:
                 candidate_wallet_ids.append(wallet.id)
+        # Always also (re)evaluate every wallet we already have history for, so
+        # previously-backfilled cohorts get scored even when the scan is empty.
+        existing = [wid for (wid,) in db.execute(
+            select(Trade.wallet_id).group_by(Trade.wallet_id)
+        ).all()]
+        candidate_wallet_ids = list(dict.fromkeys(candidate_wallet_ids + existing))
     else:
         # mock: evaluate every wallet that has any trade history
         rows = db.execute(
@@ -168,6 +182,7 @@ def run_discovery(db: Session, settings: dict, backfill_fn=None) -> dict:
         "evaluated": len(candidate_wallet_ids),
         "backfilled": n_backfilled,
         "by_classification": summary,
+        "scan_error": scan_error,
     }
 
 
