@@ -7,7 +7,15 @@
 //   - Local dev: leave VITE_API_BASE_URL unset. BASE falls back to '' so requests
 //     stay same-origin (relative /api/...) and Vite's dev proxy forwards them to
 //     the FastAPI backend on http://127.0.0.1:8000 (see vite.config.js).
-const BASE = import.meta.env.VITE_API_BASE_URL || ''
+function normalizeBase(raw) {
+  if (!raw) return ''
+  // A value without a scheme (e.g. "api.example.com") would be treated as a
+  // relative path and glued onto the current origin, so requests would hit the
+  // frontend instead of the backend. Default missing schemes to https://.
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+  return withScheme.replace(/\/+$/, '') // drop trailing slash(es)
+}
+const BASE = normalizeBase(import.meta.env.VITE_API_BASE_URL)
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
