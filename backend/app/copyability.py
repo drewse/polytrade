@@ -63,8 +63,14 @@ def score_copyability(stat, trades, min_trade_count: int = 15) -> CopyabilityRes
     recency_score, consistency, category_performance. `trades` is the wallet's
     trade list (objects with .market_id and .realized_pnl)."""
     n = int(getattr(stat, "num_trades", 0) or 0)
-    settled = [t for t in trades if getattr(t, "realized_pnl", 0.0)]
-    n_settled = len(settled)
+    # Settled count: live mode reconstructs resolved positions upstream and stores
+    # the count on the stat (fills carry no per-trade P&L); mock/legacy fills carry
+    # realized P&L directly. Take the max so whichever source has it wins — and a
+    # stale/zero-default stat can't mask trades that clearly settled.
+    n_settled = max(
+        int(getattr(stat, "num_settled", 0) or 0),
+        len([t for t in trades if getattr(t, "realized_pnl", 0.0)]),
+    )
     distinct_markets = len({t.market_id for t in trades})
     avg_size = float(getattr(stat, "avg_trade_size", 0.0) or 0.0)
     win_rate = float(getattr(stat, "win_rate", 0.0) or 0.0)

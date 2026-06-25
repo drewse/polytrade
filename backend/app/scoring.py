@@ -50,6 +50,7 @@ class ScoreResult:
     category_performance: dict
     score: float
     classification: str
+    num_settled: int = 0
 
 
 def _clip01(x: float) -> float:
@@ -89,13 +90,23 @@ def _recency_score(last_ts: datetime | None) -> float:
     return _clip01(math.exp(-days / 20.0))
 
 
-def score_wallet(trades: list[Trade]) -> ScoreResult:
+def score_wallet(trades: list[Trade], settled=None) -> ScoreResult:
+    """Score a wallet from its trades.
+
+    `settled` lets a caller supply the resolved-position units explicitly (live
+    mode reconstructs them from fills via `positions.settled_positions`, since
+    raw live fills carry no per-trade P&L). Each settled unit must expose
+    `.realized_pnl`, `.size`, `.timestamp` and `.market`. When omitted (mock
+    mode, where fills already carry realized P&L), settled units are derived from
+    the trades themselves — preserving the original behaviour.
+    """
     n = len(trades)
     if n == 0:
         return ScoreResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, "insufficient_data")
 
     # Only *resolved* trades (those with a realized result) drive ROI/win-rate.
-    settled = [t for t in trades if t.realized_pnl != 0.0]
+    if settled is None:
+        settled = [t for t in trades if t.realized_pnl != 0.0]
     total_size = sum(t.size for t in trades)
     avg_size = total_size / n
 
@@ -167,6 +178,7 @@ def score_wallet(trades: list[Trade]) -> ScoreResult:
         category_performance=category_performance,
         score=score,
         classification=classification,
+        num_settled=len(settled),
     )
 
 

@@ -34,7 +34,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "best_bid": "FLOAT",
         "best_ask": "FLOAT",
     },
-    "wallet_stats": {"partial_history": "BOOLEAN DEFAULT 0"},
+    "wallet_stats": {
+        "partial_history": "BOOLEAN DEFAULT 0",
+        "num_settled": "INTEGER DEFAULT 0",
+    },
     "ingest_status": {"last_discovery_at": "DATETIME"},
     "paper_signals": {
         "edge_estimate": "FLOAT DEFAULT 0.0",

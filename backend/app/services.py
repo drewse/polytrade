@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from . import backtest as bt
 from . import discovery
 from . import paper_trading as pt
+from . import positions as positions_mod
 from . import scoring
 from . import signal_quality
 from .models import (
@@ -158,6 +159,77 @@ def insert_trade(db: Session, dto: TradeDTO, wallet: Wallet) -> Trade | None:
 # ===========================================================================
 # Mock seeding
 # ===========================================================================
+# Mock entities have deterministic, synthetic ids (see mock_provider): markets
+# are "0xmkt0001"… and wallet addresses are 0x + many leading zeros. Real
+# Polymarket condition ids / addresses never collide with these patterns.
+_MOCK_MARKET_PREFIX = "0xmkt"
+_MOCK_WALLET_PREFIX = "0x0000000000"  # 10 leading zero nibbles
+
+
+def purge_mock_data(db: Session) -> dict:
+    """Remove mock-seeded entities so live mode shows only live-derived data.
+
+    Identifies mock rows by their synthetic id patterns and deletes them plus
+    everything that references them. A no-op when no mock data is present, so it
+    is safe to call on every live cycle. Mock *support* is untouched — re-seeding
+    recreates the world.
+    """
+    mock_wallet_ids = [
+        wid for (wid,) in db.execute(
+            select(Wallet.id).where(Wallet.address.like(_MOCK_WALLET_PREFIX + "%"))
+        ).all()
+    ]
+    mock_market_ids = [
+        mid for (mid,) in db.execute(
+            select(Market.id).where(Market.id.like(_MOCK_MARKET_PREFIX + "%"))
+        ).all()
+    ]
+    if not mock_wallet_ids and not mock_market_ids:
+        return {"wallets": 0, "markets": 0}
+
+    w = set(mock_wallet_ids)
+    m = set(mock_market_ids)
+
+    def _touches_mock(row) -> bool:
+        return getattr(row, "wallet_id", None) in w or getattr(row, "market_id", None) in m
+
+    # Delete dependents first (FK order). PaperFill cascades from PaperPosition.
+    for pos in db.scalars(select(PaperPosition)).all():
+        if _touches_mock(pos):
+            db.delete(pos)
+    for sig in db.scalars(select(PaperSignal)).all():
+        if _touches_mock(sig):
+            db.delete(sig)
+    db.flush()
+    for tr in db.scalars(select(Trade)).all():
+        if _touches_mock(tr):
+            db.delete(tr)
+    for snap in db.scalars(select(MarketPriceSnapshot)).all():
+        if snap.market_id in m:
+            db.delete(snap)
+    for wid in mock_wallet_ids:
+        st = db.get(WalletStat, wid)
+        if st:
+            db.delete(st)
+        cand = db.get(WalletCandidate, wid)
+        if cand:
+            db.delete(cand)
+    db.flush()
+    for wid in mock_wallet_ids:
+        wallet = db.get(Wallet, wid)
+        if wallet:
+            db.delete(wallet)
+    for mid in mock_market_ids:
+        market = db.get(Market, mid)
+        if market:
+            db.delete(market)
+    # Equity snapshots are global mock/live-mixed history; clear so the curve
+    # reflects only live going forward (it is rebuilt each cycle).
+    db.query(EquitySnapshot).delete()
+    db.commit()
+    return {"wallets": len(mock_wallet_ids), "markets": len(mock_market_ids)}
+
+
 def seed_mock_data(db: Session) -> dict:
     """Wipe paper/trade state and load the full deterministic mock world."""
     from .mock_provider import MockProvider
@@ -245,23 +317,41 @@ def seed_mock_data(db: Session) -> dict:
 # ===========================================================================
 # Wallet stats / scoring
 # ===========================================================================
-def recompute_all_wallet_stats(db: Session, partial: bool = False) -> int:
+def recompute_all_wallet_stats(db: Session, partial: bool = False, reconstruct: bool = False) -> int:
     wallets = db.scalars(select(Wallet)).all()
     for wallet in wallets:
-        recompute_wallet_stats(db, wallet, partial=partial)
+        recompute_wallet_stats(db, wallet, partial=partial, reconstruct=reconstruct)
     db.commit()
     return len(wallets)
 
 
-def recompute_wallet_stats(db: Session, wallet: Wallet, partial: bool = False) -> WalletStat:
-    trades = db.scalars(select(Trade).where(Trade.wallet_id == wallet.id)).all()
-    result = scoring.score_wallet(list(trades))
+def recompute_wallet_stats(
+    db: Session, wallet: Wallet, partial: bool = False, reconstruct: bool = False
+) -> WalletStat:
+    """Recompute a wallet's stats from its trades.
+
+    In live mode (`reconstruct=True`) raw fills carry no P&L, so resolved
+    positions are reconstructed from the fills + real market resolutions and fed
+    to the scorer as the settled units. In mock mode the fills already carry
+    realized P&L, so the scorer derives settled units itself.
+    """
+    trades = list(db.scalars(select(Trade).where(Trade.wallet_id == wallet.id)).all())
+    settled = None
+    if reconstruct:
+        market_ids = {t.market_id for t in trades}
+        markets_by_id = {
+            m.id: m
+            for m in db.scalars(select(Market).where(Market.id.in_(market_ids))).all()
+        }
+        settled = positions_mod.settled_positions(trades, markets_by_id)
+    result = scoring.score_wallet(trades, settled=settled)
     stat = db.get(WalletStat, wallet.id)
     if stat is None:
         stat = WalletStat(wallet_id=wallet.id)
         db.add(stat)
     stat.partial_history = partial
     stat.num_trades = result.num_trades
+    stat.num_settled = result.num_settled
     stat.realized_pnl = result.realized_pnl
     stat.realized_roi = result.realized_roi
     stat.win_rate = result.win_rate
@@ -552,6 +642,11 @@ def run_ingest_cycle(db: Session) -> dict:
     provider = get_provider(data_mode)
     status = {"markets_ok": True, "trades_ok": True, "prices_ok": True, "errors": []}
 
+    # In live mode, drop any leftover mock entities so the dashboard shows only
+    # live-derived data (no-op once the DB is clean).
+    if live:
+        purge_mock_data(db)
+
     # 1. refresh markets / prices
     n_markets = 0
     try:
@@ -587,7 +682,7 @@ def run_ingest_cycle(db: Session) -> dict:
     for wid in touched_wallet_ids:
         wallet = db.get(Wallet, wid)
         if wallet:
-            recompute_wallet_stats(db, wallet, partial=live)
+            recompute_wallet_stats(db, wallet, partial=live, reconstruct=live)
     db.commit()
 
     # 4. signals + positions (only from observed trades)
@@ -703,27 +798,59 @@ def backfill_wallet(db: Session, address: str, limit: int = 200) -> dict:
         client.close()
 
     wallet = get_or_create_wallet(db, address)
-    # ensure referenced markets exist (best-effort) so trades have a FK target.
-    # Dedupe first: many trades share a market and the new rows aren't flushed
-    # between iterations, so a naive db.get() check would add duplicates.
+
+    # Fetch REAL metadata + resolution for every market the wallet touched. This
+    # is what makes P&L reconstruction possible: a placeholder market (resolved
+    # =false, prices [0.5,0.5]) can never settle, so the wallet would stay
+    # forever "insufficient_data". We only fetch markets we don't already know to
+    # be resolved (re-runs stay cheap; upsert_market never un-resolves).
     needed = {dto.market_id for dto in dtos}
+    known_resolved = {
+        m for (m,) in db.execute(
+            select(Market.id).where(Market.id.in_(needed), Market.resolved == True)  # noqa: E712
+        ).all()
+    }
+    to_fetch = list(needed - known_resolved)
+    n_resolved_fetched = 0
+    try:
+        client2 = LivePolymarketClient()
+        try:
+            for mdto in client2.get_markets_by_conditions(to_fetch):
+                upsert_market(db, mdto)
+                if mdto.resolved:
+                    n_resolved_fetched += 1
+        finally:
+            client2.close()
+    except Exception as exc:  # noqa: BLE001  (best-effort; trades still ingest)
+        print(f"[backfill] market metadata fetch failed for {address[:10]}: {exc}")
+    # Any market still missing (delisted / not returned) gets a minimal stub so
+    # the trade FK resolves; it simply stays unsettled.
     existing = {
         m for (m,) in db.execute(select(Market.id).where(Market.id.in_(needed))).all()
     }
     for mid in needed - existing:
         db.add(Market(id=mid, question=f"(market {mid[:10]}…)",
                       outcomes=["Yes", "No"], prices=[0.5, 0.5]))
-    db.flush()
+    db.commit()
+
     inserted = 0
     for dto in dtos:
         if insert_trade(db, dto, wallet) is not None:
             inserted += 1
     db.commit()
-    recompute_wallet_stats(db, wallet, partial=True)
+    recompute_wallet_stats(db, wallet, partial=True, reconstruct=True)
     db.commit()
     stat = db.get(WalletStat, wallet.id)
+    n_resolved = db.scalar(
+        select(func.count()).select_from(Market).where(
+            Market.id.in_(needed), Market.resolved == True  # noqa: E712
+        )
+    )
     return {
         "ok": True, "address": address, "trades_fetched": len(dtos), "trades_inserted": inserted,
+        "markets": len(needed),
+        "resolved_markets": int(n_resolved or 0),
+        "num_settled": stat.num_settled if stat else 0,
         "score": stat.score if stat else 0.0,
         "classification": stat.classification if stat else "insufficient_data",
         "partial_history": True,
@@ -737,6 +864,8 @@ def run_discovery(db: Session, max_backfill: int | None = None) -> dict:
     """Discover + rank copy candidates (mock evaluates all wallets; live scans
     recent trades and backfills the top movers)."""
     settings = get_settings(db)
+    if settings["data_mode"] == "live":
+        purge_mock_data(db)
     if max_backfill is not None:
         settings = {**settings, "max_wallets_to_backfill_per_cycle": max_backfill}
     return discovery.run_discovery(db, settings, backfill_fn=backfill_wallet)
@@ -807,10 +936,19 @@ def candidate_detail(db: Session, address: str) -> dict | None:
     best_categories = [{"category": c, "roi": r} for c, r in ranked[:3] if r > 0]
     worst_categories = [{"category": c, "roi": r} for c, r in ranked[-3:] if r < 0]
 
-    # profit curve = cumulative realized pnl over settled trades, oldest first
-    settled = sorted(
-        [t for t in trades if t.realized_pnl], key=lambda t: t.timestamp
+    # profit curve = cumulative realized pnl over settled units, oldest first.
+    # Live wallets carry no per-fill P&L, so reconstruct resolved positions;
+    # mock wallets already carry realized P&L on the fills themselves.
+    recon = positions_mod.settled_positions(
+        trades,
+        {m.id: m for m in db.scalars(
+            select(Market).where(Market.id.in_({t.market_id for t in trades}))
+        ).all()},
     )
+    if recon:
+        settled = sorted(recon, key=lambda p: p.timestamp)
+    else:
+        settled = sorted([t for t in trades if t.realized_pnl], key=lambda t: t.timestamp)
     cum = 0.0
     profit_curve = []
     for t in settled:

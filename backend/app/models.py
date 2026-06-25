@@ -91,6 +91,9 @@ class WalletStat(Base):
 
     wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), primary_key=True)
     num_trades: Mapped[int] = mapped_column(Integer, default=0)
+    # Count of *resolved* positions backing the stats (live: reconstructed from
+    # fills; mock: trades carrying realized P&L). Drives the copyability sample gate.
+    num_settled: Mapped[int] = mapped_column(Integer, default=0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     realized_roi: Mapped[float] = mapped_column(Float, default=0.0)   # fraction, e.g. 0.25 = 25%
     win_rate: Mapped[float] = mapped_column(Float, default=0.0)        # 0..1

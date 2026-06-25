@@ -300,6 +300,33 @@ class LivePolymarketClient:
         markets = parse_markets(payload)
         return markets[0] if markets else None
 
+    def get_markets_by_conditions(self, condition_ids, chunk: int = 20) -> list[MarketDTO]:
+        """Fetch real metadata for specific markets by condition id, in batches.
+
+        Unlike `get_markets`, this does NOT pass `closed=false`, so it returns
+        *resolved* markets too — essential for reconstructing wallet P&L (a
+        wallet's edge only shows up on markets that have actually settled)."""
+        ids = [c for c in dict.fromkeys(condition_ids) if c]  # dedupe, keep order
+        out: list[MarketDTO] = []
+        for i in range(0, len(ids), chunk):
+            batch = ids[i : i + chunk]
+            try:
+                payload = self._get_json(
+                    f"{config.gamma_api_base}/markets", {"condition_ids": batch}
+                )
+            except httpx.HTTPError as exc:
+                print(f"[live] market metadata batch failed ({len(batch)} ids): {exc}")
+                continue
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                try:  # one malformed market shouldn't drop the rest of the batch
+                    out.append(parse_market(row))
+                except LiveParseError as exc:
+                    print(f"[live] skipped unparseable market: {exc}")
+        return out
+
     # -- trades --------------------------------------------------------------
     def get_recent_trades(self, limit: int = 50) -> list[TradeDTO]:
         url = f"{config.data_api_base}/trades"
