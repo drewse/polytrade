@@ -356,15 +356,28 @@ def _equity_curve(db: Session, strategy_id: int) -> list[float]:
         Top20Snapshot.strategy_id == strategy_id).order_by(Top20Snapshot.timestamp)).all())
 
 
+def _trade_path_curve(closed: list, open_: list, starting_bankroll: float) -> list[float]:
+    """Equity curve built from the CHRONOLOGICAL sequence of closed trades
+    (cumulative realized P&L), so drawdown reflects the actual trade path — not
+    sparse wall-clock snapshots that miss the replay sequence entirely."""
+    ordered = sorted(closed, key=lambda t: (t.closed_at or t.entry_time or datetime.min))
+    curve = [starting_bankroll]
+    cum = starting_bankroll
+    for t in ordered:
+        cum += t.realized_pnl
+        curve.append(round(cum, 2))
+    if open_:
+        curve.append(round(cum + sum(t.unrealized_pnl for t in open_), 2))
+    return curve
+
+
 def _metrics_for(db: Session, strat: Top20Strategy) -> dict:
     trades = db.scalars(select(Top20Trade).where(Top20Trade.strategy_id == strat.id)).all()
     closed = [t for t in trades if t.status == "closed"]
     open_ = [t for t in trades if t.status == "open"]
-    curve = _equity_curve(db, strat.id)
-    if not curve:  # synthesize a 2-point curve so drawdown/consistency are defined
-        realized = sum(t.realized_pnl for t in closed)
-        unreal = sum(t.unrealized_pnl for t in open_)
-        curve = [strat.starting_bankroll, strat.starting_bankroll + realized + unreal]
+    # Drawdown/consistency from the true trade path (cumulative realized P&L),
+    # NOT from wall-clock snapshots which don't include the replay sequence.
+    curve = _trade_path_curve(closed, open_, strat.starting_bankroll)
     times = [t.entry_time for t in trades if t.entry_time]
     m = analytics.compute_metrics(
         closed, open_, curve, strat.starting_bankroll,
