@@ -803,6 +803,16 @@ def run_ingest_cycle(db: Session) -> dict:
         status["errors"].append(f"top20: {exc}")
         print(f"[ingest] top20 error: {exc}")
 
+    # 6c. Live execution layer: settle/monitor live positions always; place new
+    #     orders only when LIVE_TRADING_ENABLED (default false). Fully guarded.
+    try:
+        from . import live
+        live.process_new_signals(db)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        status["errors"].append(f"live: {exc}")
+        print(f"[ingest] live error: {exc}")
+
     # close live client if any
     close = getattr(provider, "close", None)
     if callable(close):

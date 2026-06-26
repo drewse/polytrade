@@ -401,6 +401,61 @@ class Top20Snapshot(Base):
     open_positions: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class LiveExecution(Base):
+    """One real (or dry-run) live order, with full execution forensics so every
+    trade can be reconstructed and reconciled against Polymarket. Live trading is
+    OFF by default and gated behind LIVE_TRADING_ENABLED + a completed executor."""
+
+    __tablename__ = "live_executions"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_live_idempotency"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), index=True)  # (strategy,signal) dedupe
+    executor: Mapped[str] = mapped_column(String(16), default="dry_run")   # dry_run|polymarket
+    strategy_key: Mapped[str] = mapped_column(String(40), index=True)
+    wallet_address: Mapped[str] = mapped_column(String(64))
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    market_id: Mapped[str] = mapped_column(String(80), index=True)
+    market_question: Mapped[str] = mapped_column(Text, default="")
+    outcome: Mapped[str] = mapped_column(String(80))
+    side: Mapped[str] = mapped_column(String(8), default="buy")
+    # sizing + fills
+    expected_price: Mapped[float] = mapped_column(Float)
+    fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # fill - expected
+    fees: Mapped[float] = mapped_column(Float, default=0.0)
+    size_usd: Mapped[float] = mapped_column(Float)        # stake (USD risked)
+    shares: Mapped[float] = mapped_column(Float, default=0.0)
+    # latency forensics
+    order_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confirm_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # lifecycle + accounting
+    status: Mapped[str] = mapped_column(String(12), default="open", index=True)  # open|closed|rejected
+    entry_reason: Mapped[str] = mapped_column(Text, default="")
+    exit_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    bankroll_before: Mapped[float] = mapped_column(Float, default=0.0)
+    bankroll_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class LiveState(Base):
+    """Singleton (id=1) live-account state: bankroll + the trading halt latch
+    (a tripped limit stops new orders until manual intervention)."""
+
+    __tablename__ = "live_state"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    starting_bankroll: Mapped[float] = mapped_column(Float, default=100.0)
+    bankroll: Mapped[float] = mapped_column(Float, default=100.0)  # starting + realized
+    halted: Mapped[bool] = mapped_column(Boolean, default=False)
+    halt_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    halted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class ReplayState(Base):
     """Singleton (id=1) checkpoint for the historical replay engine — supports
     resume / incremental replay so we never restart from scratch. PAPER ONLY."""

@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, discovery, services, top20
+from . import attribution, auto_worker, discovery, live, services, top20
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -323,6 +323,36 @@ def ingest_run(db: Session = Depends(get_db)) -> MessageOut:
     # Shares the worker's lock so a manual run can never overlap an auto cycle.
     result = auto_worker.run_one_cycle(wait=False)
     return MessageOut(message="Ingest cycle complete", detail=result)
+
+
+# ===========================================================================
+# Live execution validation (PAPER/DRY-RUN by default; gated by LIVE_TRADING_ENABLED)
+# ===========================================================================
+@app.get("/api/live/status")
+def live_status(db: Session = Depends(get_db)) -> dict:
+    return live.status(db)
+
+
+@app.get("/api/live/executions")
+def live_executions(limit: int = 100, db: Session = Depends(get_db)) -> dict:
+    return {"executions": live.list_executions(db, limit)}
+
+
+@app.post("/api/live/reconcile", response_model=MessageOut)
+def live_reconcile(balance: float, db: Session = Depends(get_db)) -> MessageOut:
+    """Reconcile computed bankroll against the venue-reported balance."""
+    return MessageOut(message="reconciliation", detail=live.reconcile(db, balance))
+
+
+@app.post("/api/live/resume", response_model=MessageOut)
+def live_resume(db: Session = Depends(get_db)) -> MessageOut:
+    """Manual intervention to clear a tripped halt and resume new orders."""
+    return MessageOut(message="resumed", detail=live.resume(db))
+
+
+@app.post("/api/live/halt", response_model=MessageOut)
+def live_halt(reason: str = "manual", db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="halted", detail=live.halt(db, reason))
 
 
 @app.post("/api/admin/rescore-wallets", response_model=MessageOut)
