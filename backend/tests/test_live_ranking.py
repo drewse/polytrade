@@ -47,11 +47,11 @@ def test_filters(in_memory_db):
     ns = db.scalar(select(WalletStat).where(WalletStat.wallet_id == neg.id))
     ok, why = live_ranking.passes_filters(ns, neg, now, cfg)
     assert not ok and "ROI" in why
-    # PF <= 1.20 fails
-    lowpf = _wallet(db, "0xpf", roi=0.2, pf=1.1, settled=50); db.commit()
+    # PF at/below the min_pf threshold fails (use a value clearly below it)
+    lowpf = _wallet(db, "0xpf", roi=0.2, pf=1.0, settled=50); db.commit()
     ps = db.scalar(select(WalletStat).where(WalletStat.wallet_id == lowpf.id))
     assert not live_ranking.passes_filters(ps, lowpf, now, cfg)[0]
-    # too few settled fails
+    # too few settled fails (below min_settled)
     few = _wallet(db, "0xfew", roi=0.2, pf=1.8, settled=5); db.commit()
     fs = db.scalar(select(WalletStat).where(WalletStat.wallet_id == few.id))
     assert not live_ranking.passes_filters(fs, few, now, cfg)[0]

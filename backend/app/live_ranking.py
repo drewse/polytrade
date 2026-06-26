@@ -33,9 +33,12 @@ WEIGHTS = {"reputation": 0.40, "profit_factor": 0.30, "roi": 0.20, "recency": 0.
 
 
 def _cfg() -> dict:
+    # NOTE: thresholds LOOSENED for live validation (Railway was not applying the
+    # env overrides). These are the active defaults until reverted to production
+    # values (PF 1.20 / settled 20). Env vars still override when present.
     return {
-        "min_settled": int(os.getenv("LIVE_MIN_SETTLED", "20")),
-        "min_pf": float(os.getenv("LIVE_MIN_PF", "1.20")),
+        "min_settled": int(os.getenv("LIVE_MIN_SETTLED", "10")),
+        "min_pf": float(os.getenv("LIVE_MIN_PF", "1.05")),
         "min_roi": float(os.getenv("LIVE_MIN_ROI", "0.0")),
         "active_days": int(os.getenv("LIVE_ACTIVE_DAYS", "60")),
         "require_full_history": str(os.getenv("LIVE_REQUIRE_FULL_HISTORY", "false")).lower()
