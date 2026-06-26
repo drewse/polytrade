@@ -344,6 +344,12 @@ def live_reconcile(balance: float, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="reconciliation", detail=live.reconcile(db, balance))
 
 
+@app.post("/api/live/set-bankroll", response_model=MessageOut)
+def live_set_bankroll(amount: float, db: Session = Depends(get_db)) -> MessageOut:
+    """Set tracked bankroll to the ACTUAL funded balance (clean slate only)."""
+    return MessageOut(message="bankroll set", detail=live.set_bankroll(db, amount))
+
+
 @app.post("/api/live/resume", response_model=MessageOut)
 def live_resume(db: Session = Depends(get_db)) -> MessageOut:
     """Manual intervention to clear a tripped halt and resume new orders."""

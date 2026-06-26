@@ -166,6 +166,18 @@ def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str)
     return True, "ok"
 
 
+def set_bankroll(db: Session, amount: float) -> dict:
+    """Align the tracked starting/current bankroll with the ACTUAL funded balance.
+    Only allowed with no executions yet (clean slate) so it can't rewrite history."""
+    if db.scalar(select(func.count()).select_from(LiveExecution)):
+        return {"ok": False, "error": "executions exist; cannot reset bankroll"}
+    st = get_state(db)
+    st.starting_bankroll = round(amount, 2)
+    st.bankroll = round(amount, 2)
+    db.commit()
+    return {"ok": True, "starting_bankroll": st.starting_bankroll, "bankroll": st.bankroll}
+
+
 def resume(db: Session) -> dict:
     st = get_state(db)
     st.halted = False
