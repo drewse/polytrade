@@ -79,6 +79,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "top20_feature_vectors": {
         "source": "VARCHAR DEFAULT 'live'",
     },
+    "live_executions": {
+        "limit_price": "FLOAT",
+        "order_id": "VARCHAR",
+    },
     "ingest_status": {"last_discovery_at": "DATETIME"},
     "paper_signals": {
         "edge_estimate": "FLOAT DEFAULT 0.0",

@@ -355,6 +355,13 @@ def live_halt(reason: str = "manual", db: Session = Depends(get_db)) -> MessageO
     return MessageOut(message="halted", detail=live.halt(db, reason))
 
 
+@app.post("/api/live/run-once", response_model=MessageOut)
+def live_run_once(db: Session = Depends(get_db)) -> MessageOut:
+    """Controlled trigger: settle existing positions and attempt to place new
+    orders now (honors LIVE_MAX_ORDERS — set it to 1 for a single-order test)."""
+    return MessageOut(message="live run-once", detail=live.process_new_signals(db))
+
+
 @app.post("/api/admin/rescore-wallets", response_model=MessageOut)
 def admin_rescore_wallets(db: Session = Depends(get_db)) -> MessageOut:
     """Recompute all wallet stats (incl. PF/expectancy/Sharpe/drawdown) and

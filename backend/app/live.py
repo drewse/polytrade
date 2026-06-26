@@ -1,24 +1,26 @@
 """
-Live-money execution validation layer.
+Live-money execution test layer.
 
-PURPOSE: validate infrastructure (auth, order placement, fills, slippage,
-settlement, bookkeeping, DB sync, P&L accounting) with the SMALLEST possible
-capital — NOT to chase returns. Our probability estimator is not yet proven
-better than market-implied probability (audit: Brier 0.245 vs market 0.212), so
-sizing makes NO probabilistic claim: it is FIXED FRACTIONAL (2% of bankroll),
-not Kelly.
+Goal: validate REAL Polymarket execution (auth, order placement, fills, slippage,
+settlement, bookkeeping, reconciliation) with the smallest possible capital —
+NOT to chase returns. Sizing is tiny FIXED DOLLAR (not Kelly): the audit showed
+our probability model is worse than market price, so we make no probabilistic
+sizing claim.
 
-SAFETY MODEL (defense in depth):
-  1. LIVE_TRADING_ENABLED=false by default — nothing live happens otherwise.
-  2. Even when enabled, the default executor is DRY-RUN (simulated fills) — it
-     exercises the entire pipeline (sizing, limits, logging, reconciliation,
-     P&L) WITHOUT touching the chain. Real submission requires LIVE_EXECUTOR=
-     polymarket AND a completed, key-handling adapter (left as a documented seam
-     — see PolymarketExecutor — because a bug there loses real money).
-  3. Hard limits + a halt latch that requires manual /api/live/resume.
+DEFENSE IN DEPTH (a single misconfig must not place a bad/large trade):
+  1. LIVE_TRADING_ENABLED=false by default.
+  2. LIVE_EXECUTOR=dry_run by default (simulated fills, full bookkeeping, zero
+     capital). Real orders require LIVE_EXECUTOR=polymarket AND a private key.
+  3. Hard ABSOLUTE-DOLLAR caps: $2/position, $40 total risk, $4/market, $8/wallet,
+     $10 daily-loss stop, $40 total-loss stop, max 10 open.
+  4. LIVE_MAX_ORDERS=1 -> place exactly one order, then auto-halt for manual review.
+  5. Pre-trade slippage gate (skip if the book moved > LIVE_MAX_SLIPPAGE_PCT).
+  6. Idempotency: one order per (strategy, signal).
+  7. FAIL CLOSED: any error in the real executor -> reject the order, never retry-
+     place. The first $1-$2 order IS the live verification.
 
-This module never stores or logs a private key. Credentials, if ever used, come
-from the environment at runtime and belong to the operator.
+This module never stores or logs the private key. It is read from the environment
+at order time only.
 """
 from __future__ import annotations
 
@@ -32,9 +34,10 @@ from sqlalchemy.orm import Session
 from .models import LiveExecution, LiveState, Market
 
 
-# ---------------------------------------------------------------------------
-# Config (env). Safe production defaults; the switch is OFF.
-# ---------------------------------------------------------------------------
+class ExecutionRejected(Exception):
+    """A pre-trade/venue check refused this order (logged as 'rejected')."""
+
+
 def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
@@ -43,57 +46,67 @@ def _truthy(v: str) -> bool:
 class LiveConfig:
     enabled: bool
     executor: str            # dry_run | polymarket
-    sizing: str              # fixed_fractional (only conservative method for now)
-    position_pct: float      # fraction of bankroll per position (2%)
-    min_stake: float         # exchange minimum / dust floor
-    max_positions: int       # max simultaneous open positions
-    max_wallet_pct: float    # max exposure to one copied wallet
-    max_market_pct: float    # max exposure to one market
-    max_daily_loss_pct: float
-    max_weekly_loss_pct: float
+    strategy: str            # which paper strategy's signals to copy
+    position_usd: float      # fixed $ per position
+    min_stake: float         # venue minimum / dust floor
+    max_total_risk: float    # cap on total open exposure
+    max_positions: int
+    max_per_market: float
+    max_per_wallet: float
+    daily_loss_stop: float   # absolute $
+    total_loss_stop: float   # absolute $
+    max_orders: int          # 0 = unlimited; 1 = one-order test then auto-halt
+    max_slippage_pct: float
+    min_edge: float          # only copy signals with at least this edge
+    min_confidence: float
 
 
 def get_config() -> LiveConfig:
     return LiveConfig(
         enabled=_truthy(os.getenv("LIVE_TRADING_ENABLED", "false")),
         executor=os.getenv("LIVE_EXECUTOR", "dry_run").strip().lower(),
-        sizing=os.getenv("LIVE_SIZING", "fixed_fractional").strip().lower(),
-        position_pct=float(os.getenv("LIVE_POSITION_PCT", "0.02")),
+        strategy=os.getenv("LIVE_STRATEGY", "highest_edge"),   # 'Top-Decile Edge'
+        position_usd=float(os.getenv("LIVE_POSITION_USD", "2.0")),
         min_stake=float(os.getenv("LIVE_MIN_STAKE", "1.0")),
-        max_positions=int(os.getenv("LIVE_MAX_POSITIONS", "5")),
-        max_wallet_pct=float(os.getenv("LIVE_MAX_WALLET_PCT", "0.10")),
-        max_market_pct=float(os.getenv("LIVE_MAX_MARKET_PCT", "0.05")),
-        max_daily_loss_pct=float(os.getenv("LIVE_MAX_DAILY_LOSS_PCT", "0.10")),
-        max_weekly_loss_pct=float(os.getenv("LIVE_MAX_WEEKLY_LOSS_PCT", "0.20")),
+        max_total_risk=float(os.getenv("LIVE_MAX_TOTAL_RISK", "40.0")),
+        max_positions=int(os.getenv("LIVE_MAX_POSITIONS", "10")),
+        max_per_market=float(os.getenv("LIVE_MAX_PER_MARKET", "4.0")),
+        max_per_wallet=float(os.getenv("LIVE_MAX_PER_WALLET", "8.0")),
+        daily_loss_stop=float(os.getenv("LIVE_DAILY_LOSS_STOP", "10.0")),
+        total_loss_stop=float(os.getenv("LIVE_TOTAL_LOSS_STOP", "40.0")),
+        max_orders=int(os.getenv("LIVE_MAX_ORDERS", "1")),
+        max_slippage_pct=float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03")),
+        min_edge=float(os.getenv("LIVE_MIN_EDGE", "0.05")),
+        min_confidence=float(os.getenv("LIVE_MIN_CONFIDENCE", "65")),
     )
 
 
 # ---------------------------------------------------------------------------
-# Conservative sizing — fixed fractional, exposure-capped. PURE + tested.
+# Conservative sizing — tiny FIXED DOLLAR, absolute-cap clamped. PURE + tested.
 # ---------------------------------------------------------------------------
-def conservative_stake(bankroll: float, cfg: LiveConfig,
-                       wallet_exposure: float = 0.0, market_exposure: float = 0.0) -> float | None:
-    """2% of CURRENT bankroll, clamped by per-wallet (10%) and per-market (5%)
-    caps. Returns None if no room for the minimum stake. No Kelly, no probability
-    dependence: this can't be wrong about an edge it never claims."""
-    if bankroll <= 0:
-        return None
-    target = cfg.position_pct * bankroll
-    wallet_room = cfg.max_wallet_pct * bankroll - wallet_exposure
-    market_room = cfg.max_market_pct * bankroll - market_exposure
-    stake = min(target, wallet_room, market_room)
+def conservative_stake(cfg: LiveConfig, *, available_cash: float, total_open: float,
+                       wallet_exposure: float, market_exposure: float) -> float | None:
+    """Fixed $position_usd, clamped by total-risk, per-market, per-wallet caps and
+    available cash. No leverage, no compounding, no Kelly. None if no room."""
+    stake = min(
+        cfg.position_usd,
+        cfg.max_total_risk - total_open,
+        cfg.max_per_market - market_exposure,
+        cfg.max_per_wallet - wallet_exposure,
+        available_cash,
+    )
     if stake < cfg.min_stake:
         return None
     return round(stake, 2)
 
 
 # ---------------------------------------------------------------------------
-# Live state + risk gate
+# State + risk gate
 # ---------------------------------------------------------------------------
 def get_state(db: Session) -> LiveState:
     st = db.get(LiveState, 1)
     if st is None:
-        start = float(os.getenv("LIVE_STARTING_BANKROLL", "100.0"))
+        start = float(os.getenv("LIVE_STARTING_BANKROLL", "40.0"))
         st = LiveState(id=1, starting_bankroll=start, bankroll=start)
         db.add(st)
         db.commit()
@@ -110,35 +123,16 @@ def _realized_since(db: Session, since: datetime) -> float:
     return float(val or 0.0)
 
 
-def _wallet_exposure(open_: list, addr: str) -> float:
-    return sum(e.size_usd for e in open_ if e.wallet_address == addr)
+def _realized_total(db: Session) -> float:
+    val = db.scalar(select(func.coalesce(func.sum(LiveExecution.realized_pnl), 0.0)).where(
+        LiveExecution.status == "closed"))
+    return float(val or 0.0)
 
 
-def _market_exposure(open_: list, mid: str) -> float:
-    return sum(e.size_usd for e in open_ if e.market_id == mid)
-
-
-def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str) -> tuple[bool, str]:
-    """All hard pre-trade gates. Returns (allowed, reason)."""
-    st = get_state(db)
-    if not cfg.enabled:
-        return False, "LIVE_TRADING_ENABLED is false"
-    if st.halted:
-        return False, f"trading halted: {st.halt_reason}"
-    open_ = _open(db)
-    if len(open_) >= cfg.max_positions:
-        return False, f"max simultaneous positions ({cfg.max_positions}) reached"
-    # daily / weekly loss limits trip the halt latch
-    now = datetime.utcnow()
-    day_pnl = _realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
-    week_pnl = _realized_since(db, now - timedelta(days=7))
-    if day_pnl <= -cfg.max_daily_loss_pct * st.starting_bankroll:
-        _trip_halt(db, st, f"daily loss limit ({cfg.max_daily_loss_pct*100:.0f}%) hit")
-        return False, "daily loss limit hit — halted"
-    if week_pnl <= -cfg.max_weekly_loss_pct * st.starting_bankroll:
-        _trip_halt(db, st, f"weekly loss limit ({cfg.max_weekly_loss_pct*100:.0f}%) hit")
-        return False, "weekly loss limit hit — halted"
-    return True, "ok"
+def _order_count(db: Session, executor: str) -> int:
+    """Count of non-rejected orders placed by the given executor (for LIVE_MAX_ORDERS)."""
+    return int(db.scalar(select(func.count()).select_from(LiveExecution).where(
+        LiveExecution.executor == executor, LiveExecution.status != "rejected")) or 0)
 
 
 def _trip_halt(db: Session, st: LiveState, reason: str) -> None:
@@ -148,8 +142,31 @@ def _trip_halt(db: Session, st: LiveState, reason: str) -> None:
     db.commit()
 
 
+def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str) -> tuple[bool, str]:
+    """All hard pre-trade gates (absolute-dollar)."""
+    st = get_state(db)
+    if not cfg.enabled:
+        return False, "LIVE_TRADING_ENABLED is false"
+    if st.halted:
+        return False, f"trading halted: {st.halt_reason}"
+    open_ = _open(db)
+    if len(open_) >= cfg.max_positions:
+        return False, f"max open positions ({cfg.max_positions}) reached"
+    if cfg.max_orders > 0 and _order_count(db, cfg.executor) >= cfg.max_orders:
+        _trip_halt(db, st, f"max orders ({cfg.max_orders}) reached")
+        return False, "max orders reached — halted"
+    now = datetime.utcnow()
+    day_pnl = _realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
+    if day_pnl <= -cfg.daily_loss_stop:
+        _trip_halt(db, st, f"daily loss stop (${cfg.daily_loss_stop:.0f}) hit")
+        return False, "daily loss stop hit — halted"
+    if _realized_total(db) <= -cfg.total_loss_stop:
+        _trip_halt(db, st, f"total loss stop (${cfg.total_loss_stop:.0f}) hit")
+        return False, "total loss stop hit — halted"
+    return True, "ok"
+
+
 def resume(db: Session) -> dict:
-    """Manual intervention required after a tripped limit before resuming."""
     st = get_state(db)
     st.halted = False
     st.halt_reason = None
@@ -169,109 +186,197 @@ def halt(db: Session, reason: str = "manual") -> dict:
 @dataclass
 class Fill:
     fill_price: float
+    limit_price: float
     fees: float
+    order_id: str | None
     order_latency_ms: float
     confirm_latency_ms: float
 
 
 class DryRunExecutor:
-    """Simulates a fill at the expected price (zero modeled slippage/fees) and
-    runs the FULL bookkeeping pipeline — validates everything except the on-chain
-    submission. This is the default even when LIVE_TRADING_ENABLED=true."""
-
+    """Simulated fill at the expected price — full bookkeeping, zero capital."""
     name = "dry_run"
 
-    def place(self, *, market_id: str, outcome: str, side: str, price: float,
-              size_usd: float) -> Fill:
-        return Fill(fill_price=price, fees=0.0, order_latency_ms=0.0, confirm_latency_ms=0.0)
+    def place(self, *, db, market, outcome, price, size_usd, cfg) -> Fill:
+        return Fill(fill_price=price, limit_price=price, fees=0.0, order_id="dryrun",
+                    order_latency_ms=0.0, confirm_latency_ms=0.0)
 
 
 class PolymarketExecutor:
-    """REAL order submission — DELIBERATELY NOT IMPLEMENTED HERE.
+    """REAL order submission via the official py-clob-client. Fail-closed.
 
-    Completing this is the operator's responsibility because it requires handling
-    a funded wallet's private key and signing real orders; a mistake loses money.
-    To finish it safely:
-      1. `pip install py-clob-client`; load the API/private key from the
-         environment ONLY (never commit it).
-      2. In `place()`: resolve the CLOB token id for (market_id, outcome), respect
-         the market's tick size + min order size, post a marketable limit order
-         (FOK/IOC), and return the actual fill price, fees, and latencies.
-      3. Add an idempotent client order id so a retry never double-submits.
-      4. Verify on Polymarket's TESTNET / with $1 first, then reconcile.
-    Until then it refuses to run so it can never silently place a bad order.
+    Required env (read at order time, never stored/logged):
+      POLYMARKET_PRIVATE_KEY   funded wallet key (operator's)
+      POLYMARKET_CLOB_HOST     default https://clob.polymarket.com
+      POLYMARKET_CHAIN_ID      default 137 (Polygon)
+      POLYMARKET_SIGNATURE_TYPE 0=EOA (default), 1=email/magic, 2=proxy  [OPERATOR VERIFY for your wallet type]
+      POLYMARKET_FUNDER        proxy/funder address (only if signature_type != 0)
     """
-
     name = "polymarket"
 
-    def __init__(self) -> None:
-        # credentials are read at runtime by the operator's adapter, never stored here
-        self._key_present = bool(os.getenv("POLYMARKET_PRIVATE_KEY"))
+    def place(self, *, db, market: Market, outcome: str, price: float, size_usd: float,
+              cfg: LiveConfig) -> Fill:
+        key = os.getenv("POLYMARKET_PRIVATE_KEY")
+        if not key:
+            raise ExecutionRejected("POLYMARKET_PRIVATE_KEY not set")
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutionRejected(f"py-clob-client not installed: {exc}")
 
-    def place(self, **_kw) -> Fill:
-        raise NotImplementedError(
-            "PolymarketExecutor.place is intentionally unimplemented. Complete the "
-            "CLOB adapter (see docstring) and verify on testnet before enabling.")
+        # resolve CLOB token id from OUR stored market metadata (no API guessing)
+        token_id = _token_id_for(market, outcome)
+        if not token_id:
+            raise ExecutionRejected(f"no token_id for outcome '{outcome}'")
+
+        host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
+        chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
+        sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+        funder = os.getenv("POLYMARKET_FUNDER") or None
+        try:
+            client = ClobClient(host, key=key, chain_id=chain_id,
+                                signature_type=sig_type, funder=funder)
+            client.set_api_creds(client.create_or_derive_api_creds())
+        except Exception as exc:  # noqa: BLE001  (auth failure -> reject)
+            raise ExecutionRejected(f"auth/init failed: {exc}")
+
+        # tick size + current book (best ask for a buy)
+        try:
+            tick = float(client.get_tick_size(token_id))
+        except Exception:  # noqa: BLE001
+            tick = 0.01
+        try:
+            book = client.get_order_book(token_id)
+            asks = getattr(book, "asks", None) or []
+            best_ask = min((float(a.price) for a in asks), default=None)
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutionRejected(f"order book fetch failed: {exc}")
+        if best_ask is None or best_ask <= 0:
+            raise ExecutionRejected("no asks / empty book")
+
+        # SLIPPAGE GATE — refuse if the market moved away from the signal price
+        slip = (best_ask - price) / price if price > 0 else 1.0
+        if slip > cfg.max_slippage_pct:
+            raise ExecutionRejected(f"slippage {slip*100:.1f}% > {cfg.max_slippage_pct*100:.0f}%")
+
+        # marketable limit at the ask, rounded UP to tick so it crosses
+        import math
+        limit_price = min(0.99, math.ceil(best_ask / tick) * tick)
+        shares = round(size_usd / limit_price, 2)
+        if shares * limit_price < cfg.min_stake or shares <= 0:
+            raise ExecutionRejected(f"below min order size (${shares*limit_price:.2f})")
+
+        t0 = datetime.utcnow()
+        try:
+            order = client.create_order(OrderArgs(price=round(limit_price, 4), size=shares,
+                                                  side=BUY, token_id=token_id))
+            # FOK = fill-or-kill: fully fills marketably or is killed (no resting risk)
+            resp = client.post_order(order, OrderType.FOK)
+        except Exception as exc:  # noqa: BLE001  (signing/submit failure -> reject, no retry)
+            raise ExecutionRejected(f"submit failed: {exc}")
+        latency = (datetime.utcnow() - t0).total_seconds() * 1000.0
+
+        ok = bool(resp.get("success", True)) if isinstance(resp, dict) else True
+        status_txt = (resp.get("status") if isinstance(resp, dict) else "") or ""
+        if not ok or status_txt.lower() in ("unmatched", "cancelled", "canceled"):
+            raise ExecutionRejected(f"order not filled (status={status_txt or 'unknown'})")
+        order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")) if isinstance(resp, dict) else None
+        # marketable FOK fills at/within the limit; record the limit as the fill
+        # price (operator should confirm exact avg fill via reconcile + venue UI).
+        return Fill(fill_price=limit_price, limit_price=limit_price, fees=0.0,
+                    order_id=str(order_id) if order_id else None,
+                    order_latency_ms=round(latency, 1), confirm_latency_ms=round(latency, 1))
+
+
+def _token_id_for(market: Market, outcome: str) -> str | None:
+    try:
+        outs = list(market.outcomes or [])
+        toks = list(market.token_ids or [])
+        if outcome in outs and len(toks) == len(outs):
+            return str(toks[outs.index(outcome)])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def get_executor(cfg: LiveConfig):
-    if cfg.executor == "polymarket":
-        return PolymarketExecutor()
-    return DryRunExecutor()
+    return PolymarketExecutor() if cfg.executor == "polymarket" else DryRunExecutor()
 
 
 # ---------------------------------------------------------------------------
-# Order pipeline (gated) + settlement + reconciliation
+# Order pipeline (gated)
 # ---------------------------------------------------------------------------
+def _wallet_exposure(open_, addr):
+    return sum(e.size_usd for e in open_ if e.wallet_address == addr)
+
+
+def _market_exposure(open_, mid):
+    return sum(e.size_usd for e in open_ if e.market_id == mid)
+
+
 def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: int | None,
-                   market_id: str, market_question: str, outcome: str, price: float,
-                   entry_reason: str) -> LiveExecution | None:
-    """Size + gate + (dry-run/live) place + log one live order. Idempotent per
-    (strategy, signal). Returns the LiveExecution, or None if skipped/blocked."""
+                   market: Market, outcome: str, price: float, entry_reason: str) -> LiveExecution | None:
     cfg = get_config()
     idem = f"{strategy_key}:{signal_id}"
-    # duplicate-order prevention
     if db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == idem)):
-        return None
-    ok, reason = check_can_open(db, cfg, wallet=wallet, market_id=market_id)
+        return None  # duplicate-order prevention
     st = get_state(db)
-    if not ok:
-        db.add(LiveExecution(
-            idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
-            wallet_address=wallet, signal_id=signal_id, market_id=market_id,
-            market_question=market_question, outcome=outcome, side="buy",
-            expected_price=round(price, 4), size_usd=0.0, status="rejected",
-            entry_reason=entry_reason, exit_reason=reason, bankroll_before=st.bankroll))
+
+    def _reject(reason, size=0.0):
+        db.add(LiveExecution(idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
+                             wallet_address=wallet, signal_id=signal_id, market_id=market.id,
+                             market_question=market.question or "", outcome=outcome, side="buy",
+                             expected_price=round(price, 4), size_usd=size, status="rejected",
+                             entry_reason=entry_reason, exit_reason=reason[:40],
+                             bankroll_before=st.bankroll))
         db.commit()
+
+    ok, reason = check_can_open(db, cfg, wallet=wallet, market_id=market.id)
+    if not ok:
+        _reject(reason)
         return None
     open_ = _open(db)
-    stake = conservative_stake(st.bankroll, cfg,
+    available_cash = round(st.bankroll - sum(e.size_usd for e in open_), 2)
+    stake = conservative_stake(cfg, available_cash=available_cash,
+                               total_open=sum(e.size_usd for e in open_),
                                wallet_exposure=_wallet_exposure(open_, wallet),
-                               market_exposure=_market_exposure(open_, market_id))
+                               market_exposure=_market_exposure(open_, market.id))
     if stake is None:
-        return None  # exposure caps leave no room
-    t0 = datetime.utcnow()
-    fill = get_executor(cfg).place(market_id=market_id, outcome=outcome, side="buy",
-                                   price=price, size_usd=stake)
+        _reject("no capital room within caps")
+        return None
+    try:
+        fill = get_executor(cfg).place(db=db, market=market, outcome=outcome, price=price,
+                                       size_usd=stake, cfg=cfg)
+    except ExecutionRejected as exc:
+        _reject(f"exec: {exc}", size=stake)
+        return None
+    except Exception as exc:  # noqa: BLE001  (unexpected -> reject + halt, fail closed)
+        _reject(f"error: {exc}", size=stake)
+        _trip_halt(db, st, f"executor error: {str(exc)[:60]}")
+        return None
+
     pc = max(0.01, min(0.99, fill.fill_price))
     ex = LiveExecution(
         idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
-        wallet_address=wallet, signal_id=signal_id, market_id=market_id,
-        market_question=market_question, outcome=outcome, side="buy",
-        expected_price=round(price, 4), fill_price=round(fill.fill_price, 4),
-        slippage=round(fill.fill_price - price, 4), fees=round(fill.fees, 4),
-        size_usd=stake, shares=round(stake / pc, 4),
-        order_latency_ms=fill.order_latency_ms, confirm_latency_ms=fill.confirm_latency_ms,
-        status="open", entry_reason=entry_reason, bankroll_before=st.bankroll)
+        wallet_address=wallet, signal_id=signal_id, market_id=market.id,
+        market_question=market.question or "", outcome=outcome, side="buy",
+        expected_price=round(price, 4), limit_price=round(fill.limit_price, 4),
+        fill_price=round(fill.fill_price, 4), slippage=round((fill.fill_price - price) / price, 4) if price else 0.0,
+        fees=round(fill.fees, 4), size_usd=stake, shares=round(stake / pc, 4),
+        order_id=fill.order_id, order_latency_ms=fill.order_latency_ms,
+        confirm_latency_ms=fill.confirm_latency_ms, status="open",
+        entry_reason=entry_reason, bankroll_before=st.bankroll)
     db.add(ex)
     db.commit()
+    # one-order test: auto-halt after the configured number of orders
+    if cfg.max_orders > 0 and _order_count(db, cfg.executor) >= cfg.max_orders:
+        _trip_halt(db, st, f"one-order test complete ({cfg.max_orders}) — manual resume required")
     return ex
 
 
 def settle_live(db: Session) -> dict:
-    """Close open live orders whose market has resolved; update realized P&L and
-    the live bankroll (paper-only accounting mirrors what the chain settlement
-    would produce)."""
     st = get_state(db)
     closed = 0
     now = datetime.utcnow()
@@ -294,9 +399,8 @@ def settle_live(db: Session) -> dict:
 
 
 def process_new_signals(db: Session, limit: int = 20) -> dict:
-    """Worker hook. ALWAYS settles existing live positions (monitoring continues
-    even when disabled). Only PLACES new orders when LIVE_TRADING_ENABLED — and
-    even then via the dry-run executor unless a real adapter is wired in."""
+    """Worker hook. ALWAYS settles existing live positions. Places new orders only
+    when enabled, copying the chosen strategy's signals (edge/confidence filtered)."""
     settle_live(db)
     cfg = get_config()
     if not cfg.enabled:
@@ -306,42 +410,37 @@ def process_new_signals(db: Session, limit: int = 20) -> dict:
         PaperSignal.created_at >= datetime.utcnow() - timedelta(hours=2))
         .order_by(PaperSignal.created_at.desc()).limit(limit)).all()
     done = set(db.scalars(select(LiveExecution.signal_id)).all())
-    strategy_key = os.getenv("LIVE_STRATEGY", "top_decile_edge")
     placed = 0
     for s in recent:
         if s.id in done:
+            continue
+        # copy only Top-Decile-Edge-like signals: strong edge + confidence
+        if float(s.edge_estimate or 0) < cfg.min_edge or float(s.confidence or 0) < cfg.min_confidence:
             continue
         w = db.get(Wallet, s.wallet_id)
         m = db.get(Market, s.market_id)
         if not (w and m) or m.resolved:
             continue
-        ex = process_signal(
-            db, strategy_key=strategy_key, wallet=w.address, signal_id=s.id,
-            market_id=s.market_id, market_question=m.question or "", outcome=s.outcome,
-            price=float(s.observed_price or 0.5),
-            entry_reason=f"copy {w.address[:10]} conf={s.confidence:.0f} edge={s.edge_estimate}")
+        ex = process_signal(db, strategy_key=cfg.strategy, wallet=w.address, signal_id=s.id,
+                            market=m, outcome=s.outcome, price=float(s.observed_price or 0.5),
+                            entry_reason=f"copy {w.address[:10]} conf={s.confidence:.0f} edge={s.edge_estimate}")
         if ex:
             placed += 1
+        if get_state(db).halted:    # one-order test halts mid-loop
+            break
     return {"enabled": True, "placed": placed}
 
 
 def reconcile(db: Session, reported_balance: float, tolerance: float = 0.50) -> dict:
-    """Compare our computed bankroll against the venue-reported balance. Any drift
-    beyond tolerance means our bookkeeping diverged from reality — investigate
-    before trading more."""
     st = get_state(db)
-    realized = _realized_since(db, datetime.min)
-    computed = round(st.starting_bankroll + realized, 2)
+    computed = round(st.starting_bankroll + _realized_total(db), 2)
     open_exposure = round(sum(e.size_usd for e in _open(db)), 2)
-    # reported should ~= computed_cash; cash = computed - open_exposure
     expected_cash = round(computed - open_exposure, 2)
     drift = round(reported_balance - expected_cash, 2)
-    return {
-        "starting_bankroll": st.starting_bankroll, "computed_equity": computed,
-        "open_exposure": open_exposure, "expected_cash": expected_cash,
-        "reported_balance": round(reported_balance, 2), "drift": drift,
-        "reconciled": abs(drift) <= tolerance,
-    }
+    return {"starting_bankroll": st.starting_bankroll, "computed_equity": computed,
+            "open_exposure": open_exposure, "expected_cash": expected_cash,
+            "reported_balance": round(reported_balance, 2), "drift": drift,
+            "reconciled": abs(drift) <= tolerance}
 
 
 def status(db: Session) -> dict:
@@ -349,26 +448,26 @@ def status(db: Session) -> dict:
     st = get_state(db)
     open_ = _open(db)
     now = datetime.utcnow()
-    day_pnl = _realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
-    week_pnl = _realized_since(db, now - timedelta(days=7))
-    total_closed = db.scalar(select(func.count()).select_from(LiveExecution).where(
-        LiveExecution.status == "closed"))
     return {
         "paper_trading_default": True,
         "live_trading_enabled": cfg.enabled,
         "executor": cfg.executor,
-        "real_submission_implemented": False,   # PolymarketExecutor is a guarded stub
-        "sizing": {"method": cfg.sizing, "position_pct": cfg.position_pct,
-                   "min_stake": cfg.min_stake},
-        "limits": {"max_positions": cfg.max_positions, "max_wallet_pct": cfg.max_wallet_pct,
-                   "max_market_pct": cfg.max_market_pct,
-                   "max_daily_loss_pct": cfg.max_daily_loss_pct,
-                   "max_weekly_loss_pct": cfg.max_weekly_loss_pct},
+        "real_orders_placed": _order_count(db, "polymarket"),
+        "orders_this_executor": _order_count(db, cfg.executor),
+        "strategy_copied": cfg.strategy,
+        "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
+                   "min_stake": cfg.min_stake, "no_compounding": True, "no_leverage": True},
+        "limits_usd": {"max_position": cfg.position_usd, "max_total_risk": cfg.max_total_risk,
+                       "max_positions": cfg.max_positions, "max_per_market": cfg.max_per_market,
+                       "max_per_wallet": cfg.max_per_wallet, "daily_loss_stop": cfg.daily_loss_stop,
+                       "total_loss_stop": cfg.total_loss_stop},
+        "max_orders": cfg.max_orders, "max_slippage_pct": cfg.max_slippage_pct,
         "state": {"starting_bankroll": st.starting_bankroll, "bankroll": st.bankroll,
                   "halted": st.halted, "halt_reason": st.halt_reason},
         "open_positions": len(open_), "open_exposure": round(sum(e.size_usd for e in open_), 2),
-        "day_pnl": round(day_pnl, 2), "week_pnl": round(week_pnl, 2),
-        "closed_trades": int(total_closed or 0),
+        "day_pnl": round(_realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0)), 2),
+        "total_realized": round(_realized_total(db), 2),
+        "max_possible_loss": cfg.total_loss_stop,
     }
 
 
@@ -379,10 +478,10 @@ def list_executions(db: Session, limit: int = 100) -> list[dict]:
         "executor": e.executor, "strategy": e.strategy_key, "wallet": e.wallet_address,
         "signal_id": e.signal_id, "market_id": e.market_id, "market_question": e.market_question,
         "outcome": e.outcome, "side": e.side, "expected_price": e.expected_price,
-        "fill_price": e.fill_price, "slippage": e.slippage, "fees": e.fees, "size_usd": e.size_usd,
-        "shares": e.shares, "order_latency_ms": e.order_latency_ms,
-        "confirm_latency_ms": e.confirm_latency_ms, "status": e.status,
-        "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
+        "limit_price": e.limit_price, "fill_price": e.fill_price, "slippage": e.slippage,
+        "fees": e.fees, "size_usd": e.size_usd, "shares": e.shares, "order_id": e.order_id,
+        "order_latency_ms": e.order_latency_ms, "confirm_latency_ms": e.confirm_latency_ms,
+        "status": e.status, "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
         "realized_pnl": e.realized_pnl, "bankroll_before": e.bankroll_before,
         "bankroll_after": e.bankroll_after,
     } for e in rows]

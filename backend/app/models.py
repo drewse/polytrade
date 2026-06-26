@@ -422,9 +422,11 @@ class LiveExecution(Base):
     side: Mapped[str] = mapped_column(String(8), default="buy")
     # sizing + fills
     expected_price: Mapped[float] = mapped_column(Float)
+    limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # submitted marketable limit
     fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # fill - expected
+    slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # fill - expected (fraction)
     fees: Mapped[float] = mapped_column(Float, default=0.0)
+    order_id: Mapped[str | None] = mapped_column(String(120), nullable=True)  # venue order id
     size_usd: Mapped[float] = mapped_column(Float)        # stake (USD risked)
     shares: Mapped[float] = mapped_column(Float, default=0.0)
     # latency forensics
