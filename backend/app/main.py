@@ -68,6 +68,30 @@ def _startup() -> None:
         top20.ensure_strategies(db)
     finally:
         db.close()
+    # CLOB SDK / execution-mode banner (so the deployed build's executor stack is
+    # visible in logs). Guarded — never blocks startup.
+    try:
+        info = live.sdk_info()
+        print(f"[startup] CLOB execution SDK: {info['sdk_package']}=={info['sdk_version']} "
+              f"mode={info['clob_api_mode']} collateral={info['collateral']} "
+              f"v2_installed={info['v2_sdk_installed']} archived_v1_present={info['archived_v1_present']}")
+        cfg = live.get_config()
+        real_trading = cfg.enabled and cfg.executor == "polymarket"
+        if info["archived_v1_present"]:
+            print("[startup] WARNING: archived py-clob-client (v1) is installed — real "
+                  "trading fails closed until it is removed.")
+            if real_trading:
+                # HARD startup failure: refuse to boot a real-trading config on the
+                # archived/non-functional v1 client.
+                raise RuntimeError(
+                    "archived py-clob-client (v1) is installed while LIVE_TRADING_ENABLED + "
+                    "executor=polymarket — remove it and use py-clob-client-v2 only.")
+        if real_trading and not info["v2_sdk_installed"]:
+            raise RuntimeError("real trading configured but CLOB v2 SDK (py-clob-client-v2) is not installed")
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] SDK banner error: {exc}")
     # Start the in-process auto-ingest worker so live data refreshes itself
     # (guarded: one loop only; paper-trading only).
     auto_worker.start()

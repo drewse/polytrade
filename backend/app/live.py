@@ -47,10 +47,54 @@ class ExecutionRejected(Exception):
         self.venue_error = venue_error
 
 
+# CLOB v2 SDK (py-clob-client-v2). The v1 py-clob-client was ARCHIVED (May 2026)
+# and is non-functional against the live CLOB ('invalid order version'); v2 signs
+# orders against the current exchange contracts.
+_V2_PKG = "py_clob_client_v2"
+_V1_ARCHIVED_PKG = "py_clob_client"
+
+
 def py_clob_installed() -> bool:
-    """Whether the real-execution dependency is present in THIS environment."""
+    """Whether the CLOB v2 execution SDK is present in THIS environment."""
     import importlib.util
-    return importlib.util.find_spec("py_clob_client") is not None
+    return importlib.util.find_spec(_V2_PKG) is not None
+
+
+def archived_v1_present() -> bool:
+    """The archived, non-functional v1 client must NOT be installed for real trading."""
+    import importlib.util
+    return importlib.util.find_spec(_V1_ARCHIVED_PKG) is not None
+
+
+def sdk_info() -> dict:
+    """SDK package/version + CLOB API mode, for the startup log and status."""
+    import importlib.util
+    ver = None
+    if py_clob_installed():
+        try:
+            import importlib.metadata as md
+            ver = md.version("py-clob-client-v2")
+        except Exception:  # noqa: BLE001
+            ver = "unknown"
+    return {
+        "sdk_package": "py-clob-client-v2",
+        "sdk_version": ver,
+        "clob_api_mode": "v2",
+        "collateral": "USDC",                 # v2 uses USDC (not pUSD); verified in config
+        "v2_sdk_installed": py_clob_installed(),
+        "archived_v1_present": archived_v1_present(),
+    }
+
+
+def _assert_real_sdk() -> None:
+    """HARD pre-trade guard for REAL order submission: the v2 SDK must be present
+    AND the archived v1 client must be absent. Fail closed otherwise."""
+    if not py_clob_installed():
+        raise ExecutionRejected("CLOB v2 SDK (py-clob-client-v2) not installed", outcome="sdk_missing")
+    if archived_v1_present():
+        raise ExecutionRejected(
+            "archived py-clob-client (v1) is installed — it is non-functional and must be "
+            "removed before real trading (use py-clob-client-v2 only)", outcome="archived_sdk")
 
 
 def wallet_check() -> dict:
@@ -364,9 +408,25 @@ def _matched_shares(obj, requested: float, fallback: float = 0.0) -> float:
 
 def _extract_order_id(resp) -> str | None:
     if isinstance(resp, dict):
-        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        oid = (resp.get("orderID") or resp.get("orderId") or resp.get("orderHash")
+               or resp.get("hash") or resp.get("id"))
         return str(oid) if oid else None
     return None
+
+
+def _ask_price(a) -> float:
+    """Best-ask price from a book level (v2 dict {price,size} OR a v1-style object)."""
+    return float(a["price"] if isinstance(a, dict) else a.price)
+
+
+def _classify_venue(err: str) -> str:
+    """Classify a venue error string into a precise outcome for the audit trail."""
+    e = (err or "").lower()
+    if "invalid order version" in e or "latest clob" in e or "order version" in e:
+        return "stale_client_schema"     # client order schema behind the CLOB
+    if "restricted in your region" in e or "geoblock" in e or "region" in e:
+        return "geoblocked"
+    return "submit_error"
 
 
 class DryRunExecutor:
@@ -413,13 +473,16 @@ class PolymarketExecutor:
     name = "polymarket"
 
     def _build_client(self, key: str):
-        """Create + L2-authenticate the CLOB client (auth failure -> reject, never
-        place). Split out so it can be mocked in tests."""
+        """Create + L2-authenticate the CLOB v2 client (auth failure -> reject,
+        never place). Split out so it can be mocked in tests.
+
+        v2 vs v1: ClobClient(host, chain_id, key=...); creds are obtained via
+        derive_api_key() (existing) / create_api_key() (first time) — there is no
+        create_or_derive_api_creds. Sig types are unchanged (0=EOA,1=PROXY,2=SAFE)."""
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client_v2 import ClobClient, ApiCreds
         except Exception as exc:  # noqa: BLE001
-            raise ExecutionRejected(f"py-clob-client not installed: {exc}")
+            raise ExecutionRejected(f"py-clob-client-v2 not installed: {exc}", outcome="sdk_missing")
         host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
         chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
@@ -431,11 +494,16 @@ class PolymarketExecutor:
                           os.getenv("POLYMARKET_API_PASSPHRASE"))
         manual = ApiCreds(api_key=ak, api_secret=asec, api_passphrase=apas) if (ak and asec and apas) else None
         try:
-            client = ClobClient(host, key=key, chain_id=chain_id, creds=manual,
+            client = ClobClient(host, chain_id=chain_id, key=key, creds=manual,
                                 signature_type=sig_type, funder=funder)
             if manual is None:
-                # derive {apiKey, secret, passphrase} from the private key (L1-signed)
-                client.set_api_creds(client.create_or_derive_api_creds())
+                # L2 creds derived from the private key (L1-signed): try existing,
+                # else create. py-clob-client-v2 has no create_or_derive helper.
+                try:
+                    creds = client.derive_api_key()
+                except Exception:  # noqa: BLE001  (no creds yet -> create them)
+                    creds = client.create_api_key()
+                client.set_api_creds(creds)
             client.assert_level_2_auth()               # fail now if L2 auth is incomplete
         except ExecutionRejected:
             raise
@@ -453,11 +521,11 @@ class PolymarketExecutor:
         key = os.getenv("POLYMARKET_PRIVATE_KEY")
         if not key:
             raise ExecutionRejected("POLYMARKET_PRIVATE_KEY not set")
+        _assert_real_sdk()                              # HARD guard: v2 present, v1 absent
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client_v2 import OrderArgsV2, OrderType, Side
         except Exception as exc:  # noqa: BLE001
-            raise ExecutionRejected(f"py-clob-client not installed: {exc}")
+            raise ExecutionRejected(f"py-clob-client-v2 not installed: {exc}", outcome="sdk_missing")
 
         # resolve CLOB token id from OUR stored market metadata (no API guessing)
         token_id = _token_id_for(market, outcome)
@@ -466,14 +534,16 @@ class PolymarketExecutor:
 
         client = self._build_client(key)
 
-        # current book — best ask for a buy; tick size from the book summary
+        # tick + book. v2 get_order_book returns a raw DICT (asks=[{price,size}]);
+        # tick comes from get_tick_size. Parsed defensively (dict OR object).
         try:
+            tick = float(client.get_tick_size(token_id))
             book = client.get_order_book(token_id)
-            asks = getattr(book, "asks", None) or []
-            best_ask = min((float(a.price) for a in asks), default=None)
-            tick = float(getattr(book, "tick_size", None) or 0.01)
+            asks = (book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)) or []
+            best_ask = min((_ask_price(a) for a in asks), default=None)
         except Exception as exc:  # noqa: BLE001
-            raise ExecutionRejected(f"order book fetch failed: {_full_err(exc)}", venue_error=_full_err(exc))
+            err = _full_err(exc)
+            raise ExecutionRejected(f"order book fetch failed: {err}", outcome=_classify_venue(err), venue_error=err)
         if best_ask is None or best_ask <= 0:
             raise ExecutionRejected("no asks / empty book")
 
@@ -488,15 +558,16 @@ class PolymarketExecutor:
             raise ExecutionRejected(f"below min order size (${shares*limit_price:.2f})")
 
         # SUBMIT a GTC limit at the reference; we manage TTL + cancel ourselves
-        # (no FOK/marketable order -> cannot pay slippage).
+        # (no FOK/marketable order -> cannot pay slippage). v2 create_order
+        # auto-resolves tick/neg_risk/exchange version.
         t0 = datetime.utcnow()
         try:
-            order = client.create_order(OrderArgs(price=limit_price, size=shares,
-                                                  side=BUY, token_id=token_id))
+            order = client.create_order(OrderArgsV2(price=limit_price, size=shares,
+                                                    side=Side.BUY, token_id=token_id))
             resp = client.post_order(order, OrderType.GTC)
         except Exception as exc:  # noqa: BLE001  (submit failure -> reject, full error)
             err = _full_err(exc)
-            raise ExecutionRejected(f"submit_error: {err}", outcome="submit_error", venue_error=err)
+            raise ExecutionRejected(f"submit: {err}", outcome=_classify_venue(err), venue_error=err)
         order_id = _extract_order_id(resp)
         filled = _matched_shares(resp, shares)         # immediate match (best-effort)
 
@@ -518,11 +589,12 @@ class PolymarketExecutor:
         fully = filled >= shares - 1e-9
         none_ = filled <= 1e-9
 
-        # CANCEL any unfilled remainder immediately
+        # CANCEL any unfilled remainder immediately. v2 has no single cancel() —
+        # cancel_orders([id]) takes a list of order ids/hashes.
         cancel_err = None
         if not fully and cfg.cancel_if_unfilled and order_id:
             try:
-                client.cancel(order_id)
+                client.cancel_orders([order_id])
             except Exception as exc:  # noqa: BLE001
                 cancel_err = _full_err(exc)
 
@@ -683,7 +755,7 @@ def settle_live(db: Session) -> dict:
 _FILTER_KEYS = ("already_processed", "trading_disabled", "wallet_not_eligible",
                 "low_edge", "low_confidence", "market_closed", "stale",
                 "duplicate", "risk_blocked", "no_capital", "slippage",
-                "unfilled_cancelled", "exec_error")
+                "unfilled_cancelled", "geoblocked", "stale_client_schema", "exec_error")
 
 
 def _ranking(db: Session) -> tuple[set, dict]:
@@ -699,20 +771,28 @@ def _ranking(db: Session) -> tuple[set, dict]:
 
 def _categorize_rejection(reason: str, outcome: str | None = None) -> str:
     """Map a process_signal rejection to a report category. Prefers the precise
-    execution outcome when present (limit-at-reference outcomes)."""
+    execution outcome when present (limit-at-reference / v2 outcomes)."""
     if outcome == "unfilled_cancelled":
         return "unfilled_cancelled"
-    if outcome in ("submit_error", "cancel_error", "error"):
+    if outcome == "geoblocked":
+        return "geoblocked"
+    if outcome == "stale_client_schema":
+        return "stale_client_schema"
+    if outcome in ("submit_error", "cancel_error", "error", "sdk_missing", "archived_sdk"):
         return "exec_error"
     r = (reason or "").lower()
     if "unfilled_cancelled" in r:
         return "unfilled_cancelled"
+    if "invalid order version" in r or "latest clob" in r:
+        return "stale_client_schema"
+    if "restricted in your region" in r or "geoblock" in r:
+        return "geoblocked"
     if "slippage" in r:
         return "slippage"
     if "no capital" in r or "below min" in r or "min order" in r:
         return "no_capital"
     if any(k in r for k in ("exec:", "submit", "auth", "book", "token_id",
-                            "not installed", "not filled", "error")):
+                            "not installed", "not filled", "error", "sdk")):
         return "exec_error"
     return "risk_blocked"   # halted / max orders / loss stop / config invalid / positions
 
@@ -802,8 +882,9 @@ def _decide_one(db: Session, s, cfg: LiveConfig, eligible: set, score_map: dict,
     rr = (rej.exit_reason or "") if rej else "rejected"
     category = _categorize_rejection(rr, getattr(rej, "fill_outcome", None) if rej else None)
     gates["risk_passed"] = category not in ("risk_blocked", "no_capital")
-    # we reached the venue (order posted) for unfilled/cancel outcomes
-    gates["submitted"] = category in ("slippage", "exec_error", "unfilled_cancelled")
+    # we reached the venue (order posted / venue responded) for these outcomes
+    gates["submitted"] = category in ("slippage", "exec_error", "unfilled_cancelled",
+                                      "geoblocked", "stale_client_schema")
     gates["filled"] = False
     return done("rejected", category, rr, exec_id=(rej.id if rej else None))
 
@@ -958,13 +1039,14 @@ def status(db: Session) -> dict:
         "real_orders_placed": _order_count(db, "polymarket"),
         "orders_this_executor": _order_count(db, cfg.executor),
         "auth": {  # L1 = private key (signs); L2 secret/passphrase are DERIVED from it
-            "py_clob_client_installed": py_clob_installed(),
+            "py_clob_client_installed": py_clob_installed(),   # v2 SDK present
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
             "l2_creds_source": "derived_from_private_key",  # UI never exposes secret/passphrase
             "funder": os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")
                       or "(defaults to signer EOA)",
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
+        "sdk": sdk_info(),
         "wallet_check": wallet_check(),
         "strategy_copied": cfg.strategy,
         "wallet_selection": "production_rank_score (40% reputation, 30% PF, 20% ROI, "

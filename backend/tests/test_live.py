@@ -437,32 +437,32 @@ def test_one_order_mode_stops_after_one(in_memory_db, live_env, monkeypatch):
 # ===========================================================================
 # Limit-at-reference execution (do NOT chase price/slippage)
 # ===========================================================================
-class _FakeBook:
-    def __init__(self, ask, tick=0.01):
-        self.asks = [type("A", (), {"price": ask})()]
-        self.tick_size = tick
-
-
 class _FakeClient:
-    """Mocks ONLY the network calls of py-clob-client; the executor's own logic
-    (limit pricing, TTL, fill check, cancel) runs for real against it."""
-    def __init__(self, *, ask, get_order=None, post_resp=None, post_exc=None, cancel_exc=None):
+    """Mocks ONLY the network calls of py-clob-client-v2; the executor's own logic
+    (limit pricing, TTL, fill check, cancel) runs for real against it. Mirrors the
+    v2 API: get_tick_size, dict order book, OrderArgsV2, cancel_orders([id])."""
+    def __init__(self, *, ask, tick=0.01, get_order=None, post_resp=None,
+                 post_exc=None, cancel_exc=None):
         self.ask = ask
+        self.tick = tick
         self._get_order = get_order
         self._post_resp = post_resp or {"orderID": "oid-1", "status": "live"}
         self._post_exc = post_exc
         self._cancel_exc = cancel_exc
-        self.posted = []          # OrderArgs submitted
+        self.posted = []          # OrderArgsV2 submitted
         self.cancelled = []       # order ids cancelled
 
-    def get_order_book(self, token_id):
-        return _FakeBook(self.ask)
+    def get_tick_size(self, token_id):
+        return str(self.tick)
 
-    def create_order(self, order_args):
+    def get_order_book(self, token_id):
+        return {"asks": [{"price": str(self.ask), "size": "1000"}]}   # v2: raw dict
+
+    def create_order(self, order_args, options=None):
         self.posted.append(order_args)
         return {"signed": True}
 
-    def post_order(self, order, order_type):
+    def post_order(self, order, order_type, post_only=False, defer_exec=False):
         if self._post_exc:
             raise self._post_exc
         return self._post_resp
@@ -470,11 +470,11 @@ class _FakeClient:
     def get_order(self, order_id):
         return self._get_order if self._get_order is not None else {"size_matched": 0, "status": "live"}
 
-    def cancel(self, order_id):
+    def cancel_orders(self, order_ids):     # v2: list, no single cancel()
         if self._cancel_exc:
             raise self._cancel_exc
-        self.cancelled.append(order_id)
-        return {"canceled": [order_id]}
+        self.cancelled.extend(order_ids)
+        return {"canceled": list(order_ids)}
 
 
 def _poly_cfg(monkeypatch):
@@ -539,7 +539,7 @@ def test_partial_fill_keeps_filled_cancels_remainder(in_memory_db, monkeypatch):
 
 def test_submit_error_logs_full_venue_text(in_memory_db, monkeypatch):
     # 5a. submit error -> full PolyApiException text captured (not truncated)
-    from py_clob_client.exceptions import PolyApiException
+    from py_clob_client_v2.exceptions import PolyApiException
     exc = PolyApiException(error_msg="not enough balance / allowance")
     fake = _FakeClient(ask=0.50, post_exc=exc)
     with pytest.raises(ExecutionRejected) as ei:
@@ -560,10 +560,74 @@ def test_submit_error_logs_full_venue_text(in_memory_db, monkeypatch):
 
 def test_cancel_error_logs_full_venue_text(in_memory_db, monkeypatch):
     # 5b. cancel error -> full venue text captured, outcome cancel_error
-    from py_clob_client.exceptions import PolyApiException
+    from py_clob_client_v2.exceptions import PolyApiException
     fake = _FakeClient(ask=0.50, get_order={"size_matched": 0, "status": "live"},
                        cancel_exc=PolyApiException(error_msg="order already cancelled"))
     with pytest.raises(ExecutionRejected) as ei:
         _place(monkeypatch, in_memory_db, fake)
     assert ei.value.outcome == "cancel_error"
     assert "order already cancelled" in (ei.value.venue_error or "")
+
+
+# --- v2 SDK migration: guards, schema/geoblock categorization, paper mode ----
+def test_archived_v1_sdk_rejected_for_real_trading(in_memory_db, monkeypatch):
+    # 1. archived py-clob-client (v1) present -> hard fail-closed for real trading
+    monkeypatch.setattr(live, "archived_v1_present", lambda: True)
+    with pytest.raises(ExecutionRejected) as ei:
+        live._assert_real_sdk()
+    assert ei.value.outcome == "archived_sdk"
+    # and the executor refuses to place
+    fake = _FakeClient(ask=0.50, get_order={"size_matched": 999, "status": "matched"})
+    with pytest.raises(ExecutionRejected) as ei2:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei2.value.outcome == "archived_sdk"
+
+
+def test_v2_sdk_missing_rejected(monkeypatch):
+    # the v2 SDK itself must be present for real trading
+    monkeypatch.setattr(live, "py_clob_installed", lambda: False)
+    with pytest.raises(ExecutionRejected) as ei:
+        live._assert_real_sdk()
+    assert ei.value.outcome == "sdk_missing"
+
+
+def test_invalid_order_version_is_stale_client_schema(in_memory_db, monkeypatch):
+    # 6. 400 invalid order version -> categorized stale_client_schema, full venue text
+    from py_clob_client_v2.exceptions import PolyApiException
+    exc = PolyApiException(error_msg={"error": "invalid order version, please use the latest clob-client"})
+    fake = _FakeClient(ask=0.50, post_exc=exc)
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "stale_client_schema"
+    assert "invalid order version" in (ei.value.venue_error or "")
+    assert live._categorize_rejection("", "stale_client_schema") == "stale_client_schema"
+
+
+def test_geoblock_still_handled(in_memory_db, monkeypatch):
+    # 7. 403 region restriction -> categorized geoblocked, full venue text captured
+    from py_clob_client_v2.exceptions import PolyApiException
+    exc = PolyApiException(error_msg={"error": "Trading restricted in your region, please refer to ..."})
+    fake = _FakeClient(ask=0.50, post_exc=exc)
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "geoblocked"
+    assert "restricted in your region" in (ei.value.venue_error or "").lower()
+    assert live._categorize_rejection("", "geoblocked") == "geoblocked"
+
+
+def test_paper_mode_works_without_real_submission(in_memory_db, monkeypatch):
+    # 8. dry_run / paper mode never touches the v2 SDK and still opens a position
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
+    monkeypatch.setenv("LIVE_STARTING_BANKROLL", "40")
+    monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)   # no key needed for paper
+    m = _market(in_memory_db, "mp")
+    ex = live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=88,
+                             market=m, outcome="Yes", price=0.5, entry_reason="paper")
+    assert ex.status == "open" and ex.executor == "dry_run" and ex.fill_outcome == "simulated"
+
+
+def test_sdk_info_reports_v2(monkeypatch):
+    info = live.sdk_info()
+    assert info["sdk_package"] == "py-clob-client-v2" and info["clob_api_mode"] == "v2"
+    assert info["collateral"] == "USDC" and info["v2_sdk_installed"] is True
