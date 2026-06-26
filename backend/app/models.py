@@ -436,6 +436,10 @@ class LiveExecution(Base):
     status: Mapped[str] = mapped_column(String(12), default="open", index=True)  # open|closed|rejected
     entry_reason: Mapped[str] = mapped_column(Text, default="")
     exit_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # limit-at-reference execution forensics
+    fill_outcome: Mapped[str | None] = mapped_column(String(28), nullable=True)   # filled|partially_filled_cancelled|unfilled_cancelled|submit_error|cancel_error|simulated
+    venue_error: Mapped[str | None] = mapped_column(Text, nullable=True)          # FULL untruncated venue error text
+    requested_size_usd: Mapped[float | None] = mapped_column(Float, nullable=True)  # intended stake (size_usd = filled)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     bankroll_before: Mapped[float] = mapped_column(Float, default=0.0)
     bankroll_after: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -432,3 +432,138 @@ def test_one_order_mode_stops_after_one(in_memory_db, live_env, monkeypatch):
     assert rep["placed"] == 1                      # exactly one, despite two qualifying
     assert live.get_state(db).halted is True       # auto-halt after one-order test
     assert _count(db) == 1                          # only one execution exists
+
+
+# ===========================================================================
+# Limit-at-reference execution (do NOT chase price/slippage)
+# ===========================================================================
+class _FakeBook:
+    def __init__(self, ask, tick=0.01):
+        self.asks = [type("A", (), {"price": ask})()]
+        self.tick_size = tick
+
+
+class _FakeClient:
+    """Mocks ONLY the network calls of py-clob-client; the executor's own logic
+    (limit pricing, TTL, fill check, cancel) runs for real against it."""
+    def __init__(self, *, ask, get_order=None, post_resp=None, post_exc=None, cancel_exc=None):
+        self.ask = ask
+        self._get_order = get_order
+        self._post_resp = post_resp or {"orderID": "oid-1", "status": "live"}
+        self._post_exc = post_exc
+        self._cancel_exc = cancel_exc
+        self.posted = []          # OrderArgs submitted
+        self.cancelled = []       # order ids cancelled
+
+    def get_order_book(self, token_id):
+        return _FakeBook(self.ask)
+
+    def create_order(self, order_args):
+        self.posted.append(order_args)
+        return {"signed": True}
+
+    def post_order(self, order, order_type):
+        if self._post_exc:
+            raise self._post_exc
+        return self._post_resp
+
+    def get_order(self, order_id):
+        return self._get_order if self._get_order is not None else {"size_matched": 0, "status": "live"}
+
+    def cancel(self, order_id):
+        if self._cancel_exc:
+            raise self._cancel_exc
+        self.cancelled.append(order_id)
+        return {"canceled": [order_id]}
+
+
+def _poly_cfg(monkeypatch):
+    monkeypatch.setenv("LIVE_EXECUTOR", "polymarket")
+    monkeypatch.setenv("LIVE_POSITION_USD", "1.10")
+    monkeypatch.setenv("ORDER_TTL_SECONDS", "0")          # no real sleep in tests
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)     # past the no-key guard
+    return live.get_config()
+
+
+def _place(monkeypatch, db, fake, *, price=0.50, size=1.10):
+    monkeypatch.setattr(live.PolymarketExecutor, "_build_client", lambda self, key: fake)
+    cfg = _poly_cfg(monkeypatch)
+    m = _market(db)
+    return live.PolymarketExecutor().place(db=db, market=m, outcome="Yes",
+                                           price=price, size_usd=size, cfg=cfg)
+
+
+def test_limit_filled_at_reference(in_memory_db, monkeypatch):
+    # 1. price available at reference -> order submitted at reference and filled
+    fake = _FakeClient(ask=0.48, get_order={"size_matched": 999, "status": "matched"})
+    res = _place(monkeypatch, in_memory_db, fake)
+    assert res.outcome == "filled"
+    assert fake.posted[0].price == 0.50 and res.limit_price == 0.50   # limit AT reference
+    assert res.filled_shares == round(1.10 / 0.50, 2) and not fake.cancelled
+
+
+def test_limit_not_chased_when_price_worse(in_memory_db, monkeypatch):
+    # 2. ask (0.60) worse than reference (0.50) -> limit stays at 0.50, NOT chased
+    fake = _FakeClient(ask=0.60, get_order={"size_matched": 0, "status": "live"})
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "unfilled_cancelled"
+    assert fake.posted[0].price == 0.50                  # submitted at reference, not 0.60 ask
+    assert fake.cancelled == ["oid-1"]                   # remainder cancelled
+
+
+def test_unfilled_after_ttl_is_cancelled(in_memory_db, monkeypatch):
+    # 3. unfilled after TTL -> cancel called, logged unfilled_cancelled
+    fake = _FakeClient(ask=0.50, get_order={"size_matched": 0, "status": "live"})
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "unfilled_cancelled" and fake.cancelled == ["oid-1"]
+
+
+def test_partial_fill_keeps_filled_cancels_remainder(in_memory_db, monkeypatch):
+    # 4. partial fill -> keep filled portion, cancel the remainder
+    full = round(1.10 / 0.50, 2)                          # 2.2 shares
+    fake = _FakeClient(ask=0.50, get_order={"size_matched": full / 2, "status": "live"})
+    res = _place(monkeypatch, in_memory_db, fake)
+    assert res.outcome == "partially_filled_cancelled"
+    assert res.filled_shares == round(full / 2, 2) and fake.cancelled == ["oid-1"]
+    # through process_signal the position records the FILLED amount + intended stake
+    monkeypatch.setattr(live.PolymarketExecutor, "_build_client", lambda self, key: fake)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    m = _market(in_memory_db, "m2")
+    ex = live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=55,
+                             market=m, outcome="Yes", price=0.50, entry_reason="copy")
+    assert ex.status == "open" and ex.fill_outcome == "partially_filled_cancelled"
+    assert ex.size_usd == round((full / 2) * 0.50, 2) and ex.requested_size_usd == 1.10
+
+
+def test_submit_error_logs_full_venue_text(in_memory_db, monkeypatch):
+    # 5a. submit error -> full PolyApiException text captured (not truncated)
+    from py_clob_client.exceptions import PolyApiException
+    exc = PolyApiException(error_msg="not enough balance / allowance")
+    fake = _FakeClient(ask=0.50, post_exc=exc)
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "submit_error"
+    assert "not enough balance / allowance" in (ei.value.venue_error or "")
+    # through process_signal the FULL text lands in venue_error (exit_reason is short)
+    monkeypatch.setattr(live.PolymarketExecutor, "_build_client", lambda self, key: fake)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    m = _market(in_memory_db, "m3")
+    live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=66,
+                        market=m, outcome="Yes", price=0.50, entry_reason="copy")
+    rej = in_memory_db.scalar(select(LiveExecution).where(LiveExecution.signal_id == 66))
+    assert rej.status == "rejected" and rej.fill_outcome == "submit_error"
+    assert "not enough balance / allowance" in (rej.venue_error or "")
+    assert len(rej.venue_error) > 40                      # full text, not the 40-char exit_reason
+
+
+def test_cancel_error_logs_full_venue_text(in_memory_db, monkeypatch):
+    # 5b. cancel error -> full venue text captured, outcome cancel_error
+    from py_clob_client.exceptions import PolyApiException
+    fake = _FakeClient(ask=0.50, get_order={"size_matched": 0, "status": "live"},
+                       cancel_exc=PolyApiException(error_msg="order already cancelled"))
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake)
+    assert ei.value.outcome == "cancel_error"
+    assert "order already cancelled" in (ei.value.venue_error or "")

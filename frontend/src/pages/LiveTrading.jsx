@@ -181,7 +181,9 @@ export default function LiveTrading() {
       <div className="page-head">
         <div>
           <h1>Live Trading <Pill tone={ls.tone}>{ls.emoji} {ls.label}</Pill></h1>
-          <p>{ls.detail} · executor <b>{s?.executor}</b> · strategy <b>{s?.strategy_copied}</b> · auto-refresh 10s
+          <p>{ls.detail} · executor <b>{s?.executor}</b> · strategy <b>{s?.strategy_copied}</b>
+            {s?.execution && <> · orders <b>{s.execution.order_mode}</b> (TTL {s.execution.order_ttl_seconds}s, cancel-if-unfilled)</>}
+            · auto-refresh 10s
             {error && <span className="neg"> · refresh error: {error}</span>}</p>
         </div>
         <div className="toolbar live-controls">
@@ -317,7 +319,10 @@ export default function LiveTrading() {
                     <td className="right">{e.slippage == null ? '—' : pct(e.slippage)}</td>
                     <td className="mono small" title={e.order_id || ''}>{e.order_id ? short(e.order_id) : '—'}</td>
                     <td className="mono" title={e.wallet || ''}>{short(e.wallet)}</td>
-                    <td className="small">{e.exit_reason || e.entry_reason || '—'}</td>
+                    <td className="small" title={e.venue_error || ''}>
+                      {e.fill_outcome && <b>{e.fill_outcome}</b>}{e.fill_outcome ? ' — ' : ''}
+                      {e.venue_error || e.exit_reason || e.entry_reason || '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>

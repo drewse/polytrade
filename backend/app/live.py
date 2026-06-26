@@ -35,7 +35,16 @@ from .models import LiveExecution, LiveSignalDecision, LiveState, Market
 
 
 class ExecutionRejected(Exception):
-    """A pre-trade/venue check refused this order (logged as 'rejected')."""
+    """A pre-trade/venue check refused this order (logged as 'rejected').
+
+    `outcome` records the precise execution outcome for the audit trail
+    (unfilled_cancelled | submit_error | cancel_error | ...). `venue_error`
+    carries the FULL untruncated venue/PolyApiException text when present."""
+
+    def __init__(self, message: str, *, outcome: str | None = None, venue_error: str | None = None):
+        super().__init__(message)
+        self.outcome = outcome
+        self.venue_error = venue_error
 
 
 def py_clob_installed() -> bool:
@@ -131,6 +140,11 @@ class LiveConfig:
     min_edge: float          # only copy signals with at least this edge
     min_confidence: float
     signal_ttl_min: float    # a signal older than this is EXPIRED (never acted on)
+    # limit-at-reference execution (do NOT chase price/slippage)
+    order_mode: str          # limit_at_reference (default) | marketable
+    order_ttl_seconds: float # rest a resting limit this long, then cancel
+    cancel_if_unfilled: bool
+    allow_partial_fill: bool
 
 
 def get_config() -> LiveConfig:
@@ -151,6 +165,10 @@ def get_config() -> LiveConfig:
         min_edge=float(os.getenv("LIVE_MIN_EDGE", "0.05")),
         min_confidence=float(os.getenv("LIVE_MIN_CONFIDENCE", "65")),
         signal_ttl_min=float(os.getenv("LIVE_SIGNAL_TTL_MIN", "30")),
+        order_mode=os.getenv("ORDER_MODE", "limit_at_reference").strip().lower(),
+        order_ttl_seconds=float(os.getenv("ORDER_TTL_SECONDS", "2")),
+        cancel_if_unfilled=_truthy(os.getenv("CANCEL_IF_UNFILLED", "true")),
+        allow_partial_fill=_truthy(os.getenv("ALLOW_PARTIAL_FILL", "true")),
     )
 
 
@@ -298,22 +316,68 @@ def halt(db: Session, reason: str = "manual") -> dict:
 # Executors
 # ---------------------------------------------------------------------------
 @dataclass
-class Fill:
+class OrderResult:
+    """Outcome of a (real or simulated) order. `filled_usd`/`filled_shares` are
+    the ACTUAL filled amounts (a partial fill is < requested). `outcome` is one of
+    filled | partially_filled_cancelled | simulated. (unfilled_cancelled /
+    submit_error / cancel_error never produce a position — they raise
+    ExecutionRejected carrying that outcome.)"""
+    outcome: str
     fill_price: float
     limit_price: float
+    filled_usd: float
+    filled_shares: float
     fees: float
     order_id: str | None
     order_latency_ms: float
     confirm_latency_ms: float
+    venue_error: str | None = None
+
+
+def _full_err(exc: Exception) -> str:
+    """FULL untruncated venue error text (PolyApiException stringifies to
+    'PolyApiException[status_code=..., error_message=...]')."""
+    try:
+        return str(exc) or repr(exc)
+    except Exception:  # noqa: BLE001
+        return repr(exc)
+
+
+def _matched_shares(obj, requested: float, fallback: float = 0.0) -> float:
+    """Read filled (matched) share count from a venue order/response dict,
+    defensively across field-name variants. Falls back when unknown."""
+    if isinstance(obj, dict):
+        for k in ("size_matched", "sizeMatched", "matched_size", "filled_size", "matched_amount"):
+            v = obj.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        st = str(obj.get("status", "")).lower()
+        if st in ("matched", "filled"):
+            return float(requested)
+        if st in ("live", "delayed", "unmatched", "open"):
+            return 0.0
+    return fallback
+
+
+def _extract_order_id(resp) -> str | None:
+    if isinstance(resp, dict):
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        return str(oid) if oid else None
+    return None
 
 
 class DryRunExecutor:
-    """Simulated fill at the expected price — full bookkeeping, zero capital."""
+    """Simulated full fill at the reference price — full bookkeeping, zero capital."""
     name = "dry_run"
 
-    def place(self, *, db, market, outcome, price, size_usd, cfg) -> Fill:
-        return Fill(fill_price=price, limit_price=price, fees=0.0, order_id="dryrun",
-                    order_latency_ms=0.0, confirm_latency_ms=0.0)
+    def place(self, *, db, market, outcome, price, size_usd, cfg) -> OrderResult:
+        shares = round(size_usd / max(0.01, price), 4)
+        return OrderResult(outcome="simulated", fill_price=price, limit_price=price,
+                           filled_usd=size_usd, filled_shares=shares, fees=0.0,
+                           order_id="dryrun", order_latency_ms=0.0, confirm_latency_ms=0.0)
 
 
 class PolymarketExecutor:
@@ -348,23 +412,14 @@ class PolymarketExecutor:
     """
     name = "polymarket"
 
-    def place(self, *, db, market: Market, outcome: str, price: float, size_usd: float,
-              cfg: LiveConfig) -> Fill:
-        key = os.getenv("POLYMARKET_PRIVATE_KEY")
-        if not key:
-            raise ExecutionRejected("POLYMARKET_PRIVATE_KEY not set")
+    def _build_client(self, key: str):
+        """Create + L2-authenticate the CLOB client (auth failure -> reject, never
+        place). Split out so it can be mocked in tests."""
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client.clob_types import ApiCreds
         except Exception as exc:  # noqa: BLE001
             raise ExecutionRejected(f"py-clob-client not installed: {exc}")
-
-        # resolve CLOB token id from OUR stored market metadata (no API guessing)
-        token_id = _token_id_for(market, outcome)
-        if not token_id:
-            raise ExecutionRejected(f"no token_id for outcome '{outcome}'")
-
         host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
         chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
@@ -385,51 +440,111 @@ class PolymarketExecutor:
         except ExecutionRejected:
             raise
         except Exception as exc:  # noqa: BLE001  (auth failure -> reject, never place)
-            raise ExecutionRejected(f"auth/init failed: {exc}")
+            raise ExecutionRejected(f"auth/init failed: {_full_err(exc)}", venue_error=_full_err(exc))
+        return client
 
-        # current book — best ask for a buy; tick size comes from the book summary
+    def place(self, *, db, market: Market, outcome: str, price: float, size_usd: float,
+              cfg: LiveConfig) -> OrderResult:
+        """LIMIT-AT-REFERENCE execution: we do NOT chase price. We post a GTC limit
+        BUY at the copied wallet's reference price, hold it for ORDER_TTL_SECONDS,
+        then read the fill and CANCEL any unfilled remainder. We never pay above the
+        reference price (effective slippage 0), so a moved market resolves as
+        unfilled_cancelled rather than a chased/over-paid fill."""
+        key = os.getenv("POLYMARKET_PRIVATE_KEY")
+        if not key:
+            raise ExecutionRejected("POLYMARKET_PRIVATE_KEY not set")
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutionRejected(f"py-clob-client not installed: {exc}")
+
+        # resolve CLOB token id from OUR stored market metadata (no API guessing)
+        token_id = _token_id_for(market, outcome)
+        if not token_id:
+            raise ExecutionRejected(f"no token_id for outcome '{outcome}'")
+
+        client = self._build_client(key)
+
+        # current book — best ask for a buy; tick size from the book summary
         try:
             book = client.get_order_book(token_id)
             asks = getattr(book, "asks", None) or []
             best_ask = min((float(a.price) for a in asks), default=None)
             tick = float(getattr(book, "tick_size", None) or 0.01)
         except Exception as exc:  # noqa: BLE001
-            raise ExecutionRejected(f"order book fetch failed: {exc}")
+            raise ExecutionRejected(f"order book fetch failed: {_full_err(exc)}", venue_error=_full_err(exc))
         if best_ask is None or best_ask <= 0:
             raise ExecutionRejected("no asks / empty book")
 
-        # SLIPPAGE GATE — refuse if the market moved away from the signal price
-        slip = (best_ask - price) / price if price > 0 else 1.0
-        if slip > cfg.max_slippage_pct:
-            raise ExecutionRejected(f"slippage {slip*100:.1f}% > {cfg.max_slippage_pct*100:.0f}%")
-
-        # marketable limit at the ask, rounded UP to tick so it crosses
+        # LIMIT AT REFERENCE — never chase. Floor the reference to the tick grid so
+        # the limit never EXCEEDS the reference (we accept reference or better only).
         import math
-        limit_price = min(0.99, math.ceil(best_ask / tick) * tick)
+        reference = float(price)
+        limit_price = round(min(0.99, max(tick, math.floor(reference / tick) * tick)), 4)
         shares = round(size_usd / limit_price, 2)
-        if shares * limit_price < cfg.min_stake or shares <= 0:
+        # PRESERVED min-order-size gate
+        if shares <= 0 or shares * limit_price < cfg.min_stake:
             raise ExecutionRejected(f"below min order size (${shares*limit_price:.2f})")
 
+        # SUBMIT a GTC limit at the reference; we manage TTL + cancel ourselves
+        # (no FOK/marketable order -> cannot pay slippage).
         t0 = datetime.utcnow()
         try:
-            order = client.create_order(OrderArgs(price=round(limit_price, 4), size=shares,
+            order = client.create_order(OrderArgs(price=limit_price, size=shares,
                                                   side=BUY, token_id=token_id))
-            # FOK = fill-or-kill: fully fills marketably or is killed (no resting risk)
-            resp = client.post_order(order, OrderType.FOK)
-        except Exception as exc:  # noqa: BLE001  (signing/submit failure -> reject, no retry)
-            raise ExecutionRejected(f"submit failed: {exc}")
-        latency = (datetime.utcnow() - t0).total_seconds() * 1000.0
+            resp = client.post_order(order, OrderType.GTC)
+        except Exception as exc:  # noqa: BLE001  (submit failure -> reject, full error)
+            err = _full_err(exc)
+            raise ExecutionRejected(f"submit_error: {err}", outcome="submit_error", venue_error=err)
+        order_id = _extract_order_id(resp)
+        filled = _matched_shares(resp, shares)         # immediate match (best-effort)
 
-        ok = bool(resp.get("success", True)) if isinstance(resp, dict) else True
-        status_txt = (resp.get("status") if isinstance(resp, dict) else "") or ""
-        if not ok or status_txt.lower() in ("unmatched", "cancelled", "canceled"):
-            raise ExecutionRejected(f"order not filled (status={status_txt or 'unknown'})")
-        order_id = (resp.get("orderID") or resp.get("orderId") or resp.get("id")) if isinstance(resp, dict) else None
-        # marketable FOK fills at/within the limit; record the limit as the fill
-        # price (operator should confirm exact avg fill via reconcile + venue UI).
-        return Fill(fill_price=limit_price, limit_price=limit_price, fees=0.0,
-                    order_id=str(order_id) if order_id else None,
-                    order_latency_ms=round(latency, 1), confirm_latency_ms=round(latency, 1))
+        # HOLD for the TTL, then re-read the authoritative fill state
+        ttl = max(0.0, cfg.order_ttl_seconds)
+        if ttl:
+            import time
+            time.sleep(ttl)
+        status_txt = ""
+        if order_id:
+            try:
+                od = client.get_order(order_id)
+                filled = _matched_shares(od, shares, fallback=filled)
+                status_txt = str(od.get("status", "")) if isinstance(od, dict) else ""
+            except Exception:  # noqa: BLE001  (status read failed -> use post-response estimate)
+                pass
+        latency = round((datetime.utcnow() - t0).total_seconds() * 1000.0, 1)
+
+        fully = filled >= shares - 1e-9
+        none_ = filled <= 1e-9
+
+        # CANCEL any unfilled remainder immediately
+        cancel_err = None
+        if not fully and cfg.cancel_if_unfilled and order_id:
+            try:
+                client.cancel(order_id)
+            except Exception as exc:  # noqa: BLE001
+                cancel_err = _full_err(exc)
+
+        if fully:
+            return OrderResult(outcome="filled", fill_price=limit_price, limit_price=limit_price,
+                               filled_usd=round(shares * limit_price, 2), filled_shares=shares,
+                               fees=0.0, order_id=order_id, order_latency_ms=latency,
+                               confirm_latency_ms=latency)
+        if none_:
+            if cancel_err:
+                raise ExecutionRejected(f"cancel_error: {cancel_err}", outcome="cancel_error",
+                                        venue_error=cancel_err)
+            raise ExecutionRejected(
+                f"unfilled_cancelled (limit {limit_price} vs ask {best_ask}, status={status_txt or 'n/a'})",
+                outcome="unfilled_cancelled")
+        # PARTIAL fill: keep the filled portion, remainder already cancelled above
+        filled = round(min(filled, shares), 2)
+        return OrderResult(outcome="partially_filled_cancelled", fill_price=limit_price,
+                           limit_price=limit_price, filled_usd=round(filled * limit_price, 2),
+                           filled_shares=filled, fees=0.0, order_id=order_id,
+                           order_latency_ms=latency, confirm_latency_ms=latency,
+                           venue_error=cancel_err)
 
 
 def _token_id_for(market: Market, outcome: str) -> str | None:
@@ -466,18 +581,19 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         return None  # duplicate-order prevention
     st = get_state(db)
 
-    def _reject(reason, size=0.0):
+    def _reject(reason, size=0.0, *, fill_outcome=None, venue_error=None):
         db.add(LiveExecution(idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
                              wallet_address=wallet, signal_id=signal_id, market_id=market.id,
                              market_question=market.question or "", outcome=outcome, side="buy",
                              expected_price=round(price, 4), size_usd=size, status="rejected",
                              entry_reason=entry_reason, exit_reason=reason[:40],
-                             bankroll_before=st.bankroll))
+                             fill_outcome=fill_outcome, venue_error=venue_error,
+                             requested_size_usd=size or None, bankroll_before=st.bankroll))
         db.commit()
 
     ok, reason = check_can_open(db, cfg, wallet=wallet, market_id=market.id)
     if not ok:
-        _reject(reason)
+        _reject(reason, fill_outcome="rejected")
         return None
     open_ = _open(db)
     available_cash = round(st.bankroll - sum(e.size_usd for e in open_), 2)
@@ -486,30 +602,38 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
                                wallet_exposure=_wallet_exposure(open_, wallet),
                                market_exposure=_market_exposure(open_, market.id))
     if stake is None:
-        _reject("no capital room within caps")
+        _reject("no capital room within caps", fill_outcome="rejected")
         return None
     try:
-        fill = get_executor(cfg).place(db=db, market=market, outcome=outcome, price=price,
-                                       size_usd=stake, cfg=cfg)
+        result = get_executor(cfg).place(db=db, market=market, outcome=outcome, price=price,
+                                         size_usd=stake, cfg=cfg)
     except ExecutionRejected as exc:
-        _reject(f"exec: {exc}", size=stake)
+        # unfilled_cancelled / submit_error / cancel_error / pre-trade rejects.
+        # Capture the FULL venue error text (never truncated) in venue_error.
+        _reject(f"exec: {exc}", size=stake, fill_outcome=(exc.outcome or "rejected"),
+                venue_error=exc.venue_error)
         return None
     except Exception as exc:  # noqa: BLE001  (unexpected -> reject + halt, fail closed)
-        _reject(f"error: {exc}", size=stake)
+        _reject(f"error: {exc}", size=stake, fill_outcome="error", venue_error=_full_err(exc))
         _trip_halt(db, st, f"executor error: {str(exc)[:60]}")
         return None
 
-    pc = max(0.01, min(0.99, fill.fill_price))
+    # filled or partially_filled_cancelled -> open a position for the ACTUAL filled
+    # amount (a partial fill is smaller than the requested stake).
+    pc = max(0.01, min(0.99, result.fill_price))
+    filled_usd = round(result.filled_usd, 2)
     ex = LiveExecution(
         idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
         wallet_address=wallet, signal_id=signal_id, market_id=market.id,
         market_question=market.question or "", outcome=outcome, side="buy",
-        expected_price=round(price, 4), limit_price=round(fill.limit_price, 4),
-        fill_price=round(fill.fill_price, 4), slippage=round((fill.fill_price - price) / price, 4) if price else 0.0,
-        fees=round(fill.fees, 4), size_usd=stake, shares=round(stake / pc, 4),
-        order_id=fill.order_id, order_latency_ms=fill.order_latency_ms,
-        confirm_latency_ms=fill.confirm_latency_ms, status="open",
-        entry_reason=entry_reason, bankroll_before=st.bankroll)
+        expected_price=round(price, 4), limit_price=round(result.limit_price, 4),
+        fill_price=round(result.fill_price, 4),
+        slippage=round((result.fill_price - price) / price, 4) if price else 0.0,
+        fees=round(result.fees, 4), size_usd=filled_usd, requested_size_usd=stake,
+        shares=round(result.filled_shares, 4), fill_outcome=result.outcome,
+        venue_error=result.venue_error, order_id=result.order_id,
+        order_latency_ms=result.order_latency_ms, confirm_latency_ms=result.confirm_latency_ms,
+        status="open", entry_reason=entry_reason, bankroll_before=st.bankroll)
     db.add(ex)
     db.commit()
     # one-order test: auto-halt after the configured number of orders
@@ -558,7 +682,8 @@ def settle_live(db: Session) -> dict:
 # 'would_execute' (qualifies; diagnostic) are outcomes, not filters.
 _FILTER_KEYS = ("already_processed", "trading_disabled", "wallet_not_eligible",
                 "low_edge", "low_confidence", "market_closed", "stale",
-                "duplicate", "risk_blocked", "no_capital", "slippage", "exec_error")
+                "duplicate", "risk_blocked", "no_capital", "slippage",
+                "unfilled_cancelled", "exec_error")
 
 
 def _ranking(db: Session) -> tuple[set, dict]:
@@ -572,9 +697,16 @@ def _ranking(db: Session) -> tuple[set, dict]:
     return set(eligible), score_map
 
 
-def _categorize_rejection(reason: str) -> str:
-    """Map a process_signal rejection reason to a report category."""
+def _categorize_rejection(reason: str, outcome: str | None = None) -> str:
+    """Map a process_signal rejection to a report category. Prefers the precise
+    execution outcome when present (limit-at-reference outcomes)."""
+    if outcome == "unfilled_cancelled":
+        return "unfilled_cancelled"
+    if outcome in ("submit_error", "cancel_error", "error"):
+        return "exec_error"
     r = (reason or "").lower()
+    if "unfilled_cancelled" in r:
+        return "unfilled_cancelled"
     if "slippage" in r:
         return "slippage"
     if "no capital" in r or "below min" in r or "min order" in r:
@@ -664,12 +796,14 @@ def _decide_one(db: Session, s, cfg: LiveConfig, eligible: set, score_map: dict,
         gates["risk_passed"] = True
         gates["submitted"] = True
         gates["filled"] = True
-        return done("filled", "filled", f"order placed ${ex.size_usd:.2f} @ {ex.fill_price}", exec_id=ex.id)
+        note = "partial " if ex.fill_outcome == "partially_filled_cancelled" else ""
+        return done("filled", "filled", f"{note}order placed ${ex.size_usd:.2f} @ {ex.fill_price}", exec_id=ex.id)
     rej = db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == idem))
     rr = (rej.exit_reason or "") if rej else "rejected"
-    category = _categorize_rejection(rr)
+    category = _categorize_rejection(rr, getattr(rej, "fill_outcome", None) if rej else None)
     gates["risk_passed"] = category not in ("risk_blocked", "no_capital")
-    gates["submitted"] = category in ("slippage", "exec_error")
+    # we reached the venue (order posted) for unfilled/cancel outcomes
+    gates["submitted"] = category in ("slippage", "exec_error", "unfilled_cancelled")
     gates["filled"] = False
     return done("rejected", category, rr, exec_id=(rej.id if rej else None))
 
@@ -842,6 +976,10 @@ def status(db: Session) -> dict:
                        "max_per_wallet": cfg.max_per_wallet, "daily_loss_stop": cfg.daily_loss_stop,
                        "total_loss_stop": cfg.total_loss_stop},
         "max_orders": cfg.max_orders, "max_slippage_pct": cfg.max_slippage_pct,
+        "execution": {  # limit-at-reference: never chase price; rest then cancel
+            "order_mode": cfg.order_mode, "order_ttl_seconds": cfg.order_ttl_seconds,
+            "cancel_if_unfilled": cfg.cancel_if_unfilled, "allow_partial_fill": cfg.allow_partial_fill,
+            "effective_slippage": 0.0},
         "state": {"starting_bankroll": st.starting_bankroll, "bankroll": st.bankroll,
                   "halted": st.halted, "halt_reason": st.halt_reason},
         "open_positions": len(open_), "open_exposure": round(sum(e.size_usd for e in open_), 2),
@@ -859,9 +997,11 @@ def list_executions(db: Session, limit: int = 100) -> list[dict]:
         "signal_id": e.signal_id, "market_id": e.market_id, "market_question": e.market_question,
         "outcome": e.outcome, "side": e.side, "expected_price": e.expected_price,
         "limit_price": e.limit_price, "fill_price": e.fill_price, "slippage": e.slippage,
-        "fees": e.fees, "size_usd": e.size_usd, "shares": e.shares, "order_id": e.order_id,
+        "fees": e.fees, "size_usd": e.size_usd, "requested_size_usd": e.requested_size_usd,
+        "shares": e.shares, "order_id": e.order_id,
         "order_latency_ms": e.order_latency_ms, "confirm_latency_ms": e.confirm_latency_ms,
-        "status": e.status, "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
+        "status": e.status, "fill_outcome": e.fill_outcome, "venue_error": e.venue_error,
+        "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
         "realized_pnl": e.realized_pnl, "bankroll_before": e.bankroll_before,
         "bankroll_after": e.bankroll_after,
     } for e in rows]
