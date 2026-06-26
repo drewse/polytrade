@@ -218,21 +218,31 @@ class PolymarketExecutor:
     """REAL order submission via the official py-clob-client (verified against
     v0.34.6). Fail-closed.
 
-    AUTH IS TWO-TIER (both required):
-      * L1 — the funded wallet PRIVATE KEY, used to SIGN orders.
-      * L2 — Relayer/CLOB API credentials (api_key/api_secret/api_passphrase),
-        used to AUTHENTICATE posting orders. If provided via env they're used
-        directly; otherwise they are derived from the L1 key as a fallback.
+    AUTH (verified against py-clob-client 0.34.6 SOURCE, not docs/memory):
+      * L1 = the wallet PRIVATE KEY -> Signer(key). Used to EIP-712-sign orders.
+      * L2 = ApiCreds(api_key, api_secret, api_passphrase). Used to HMAC-sign the
+        POST of each order (headers/headers.create_level_2_headers ->
+        signing/hmac with creds.api_secret).
+      * The L2 secret/passphrase are NOT provided by the operator and are NOT
+        shown in the Polymarket UI: client.create_or_derive_api_creds() makes an
+        L1-signed request to the CLOB which RETURNS {apiKey, secret, passphrase}
+        (client.derive_api_key). So we DERIVE them from the private key. (That is
+        precisely why the UI only exposes the API Key + Address.)
+      * Signer address = the EOA from the private key. `funder` is the address
+        that HOLDS the USDC; it DEFAULTS to the signer's EOA. For Polymarket
+        proxy wallets (where the UI 'Address' / RELAYER_API_KEY_ADDRESS differs
+        from the EOA) pass that address as the funder with the matching
+        signature_type (0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE).
 
     Required env (read at order time, never stored/logged):
-      POLYMARKET_PRIVATE_KEY      funded wallet key (operator's)            [L1, required]
-      POLYMARKET_API_KEY          Relayer API key                          [L2, recommended]
-      POLYMARKET_API_SECRET       Relayer API secret                       [L2]
-      POLYMARKET_API_PASSPHRASE   Relayer API passphrase                   [L2]
-      POLYMARKET_CLOB_HOST        default https://clob.polymarket.com
-      POLYMARKET_CHAIN_ID         default 137 (Polygon)
-      POLYMARKET_SIGNATURE_TYPE   0=EOA (default), 1=email/magic, 2=proxy  [VERIFY for your wallet]
-      POLYMARKET_FUNDER           proxy/funder address (only if signature_type != 0)
+      POLYMARKET_PRIVATE_KEY       funded wallet key                        [required]
+      RELAYER_API_KEY_ADDRESS      account/funder address from the UI       [proxy wallets]
+        (or POLYMARKET_FUNDER — same meaning)
+      POLYMARKET_SIGNATURE_TYPE    0=EOA(default) · 1=POLY_PROXY · 2=POLY_GNOSIS_SAFE
+      POLYMARKET_CLOB_HOST         default https://clob.polymarket.com
+      POLYMARKET_CHAIN_ID          default 137 (Polygon)
+      (POLYMARKET_API_KEY/SECRET/PASSPHRASE are OPTIONAL manual overrides only;
+       normally unused — the creds are derived from the key.)
     """
     name = "polymarket"
 
@@ -256,18 +266,18 @@ class PolymarketExecutor:
         host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
         chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
-        funder = os.getenv("POLYMARKET_FUNDER") or None
-        # L2 creds: use the operator's exported Relayer credentials if present,
-        # else derive them from the L1 key.
-        api_key = os.getenv("POLYMARKET_API_KEY")
-        api_secret = os.getenv("POLYMARKET_API_SECRET")
-        api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE")
-        provided = ApiCreds(api_key=api_key, api_secret=api_secret,
-                            api_passphrase=api_passphrase) if (api_key and api_secret and api_passphrase) else None
+        # funder = address holding USDC (the UI 'Address' for proxy wallets);
+        # defaults to the signer EOA when unset.
+        funder = os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS") or None
+        # Optional manual full-creds override; normally None -> we DERIVE from key.
+        ak, asec, apas = (os.getenv("POLYMARKET_API_KEY"), os.getenv("POLYMARKET_API_SECRET"),
+                          os.getenv("POLYMARKET_API_PASSPHRASE"))
+        manual = ApiCreds(api_key=ak, api_secret=asec, api_passphrase=apas) if (ak and asec and apas) else None
         try:
-            client = ClobClient(host, key=key, chain_id=chain_id, creds=provided,
+            client = ClobClient(host, key=key, chain_id=chain_id, creds=manual,
                                 signature_type=sig_type, funder=funder)
-            if provided is None:                       # fall back to derive-from-key
+            if manual is None:
+                # derive {apiKey, secret, passphrase} from the private key (L1-signed)
                 client.set_api_creds(client.create_or_derive_api_creds())
             client.assert_level_2_auth()               # fail now if L2 auth is incomplete
         except ExecutionRejected:
@@ -484,10 +494,12 @@ def status(db: Session) -> dict:
         "executor": cfg.executor,
         "real_orders_placed": _order_count(db, "polymarket"),
         "orders_this_executor": _order_count(db, cfg.executor),
-        "auth": {  # two-tier: L1 private key (sign) + L2 Relayer api creds (post)
+        "auth": {  # L1 = private key (signs); L2 secret/passphrase are DERIVED from it
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
-            "l2_api_creds_present": all(os.getenv(k) for k in (
-                "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")),
+            "l2_creds_source": "derived_from_private_key",  # UI never exposes secret/passphrase
+            "funder": os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")
+                      or "(defaults to signer EOA)",
+            "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
         "strategy_copied": cfg.strategy,
         "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
