@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import LiveExecution, LiveState, Market
+from .models import LiveExecution, LiveSignalDecision, LiveState, Market
 
 
 class ExecutionRejected(Exception):
@@ -130,6 +130,7 @@ class LiveConfig:
     max_slippage_pct: float
     min_edge: float          # only copy signals with at least this edge
     min_confidence: float
+    signal_ttl_min: float    # a signal older than this is EXPIRED (never acted on)
 
 
 def get_config() -> LiveConfig:
@@ -149,6 +150,7 @@ def get_config() -> LiveConfig:
         max_slippage_pct=float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03")),
         min_edge=float(os.getenv("LIVE_MIN_EDGE", "0.05")),
         min_confidence=float(os.getenv("LIVE_MIN_CONFIDENCE", "65")),
+        signal_ttl_min=float(os.getenv("LIVE_SIGNAL_TTL_MIN", "30")),
     )
 
 
@@ -538,47 +540,250 @@ def settle_live(db: Session) -> dict:
     return {"closed": closed, "bankroll": st.bankroll}
 
 
-def process_new_signals(db: Session, limit: int = 20, place: bool = True) -> dict:
-    """ALWAYS settles existing live positions. Places NEW orders only when
-    `place=True` AND enabled. The background worker calls this with place=False
-    (settle/monitor only) so a real order is NEVER auto-placed — placement
-    happens solely via the explicit /api/live/run-once endpoint (manual control)."""
+# ===========================================================================
+# EVENT-DRIVEN execution pipeline + full decision observability
+#
+# The worker calls run_pipeline(place=True) every cycle: signals are created
+# moments earlier in the SAME cycle, so a brand-new qualifying signal is acted on
+# immediately — no "is there a signal right now" polling. Each NEW signal (one
+# with no LiveSignalDecision row) flows through the exact gate sequence below and
+# leaves a permanent audit row, so it is evaluated exactly once and can never
+# execute twice. /api/live/run-once calls run_pipeline(place=False): the SAME
+# decision logic, but a pure read-only DIAGNOSTIC that places nothing and writes
+# no rows — our primary debugging tool. The gates, ranking, sizing and risk
+# limits are unchanged; this only changes WHEN execution triggers and records WHY.
+# ===========================================================================
+
+# Every signal is bucketed into exactly one of these. 'filled' (placed) and
+# 'would_execute' (qualifies; diagnostic) are outcomes, not filters.
+_FILTER_KEYS = ("already_processed", "trading_disabled", "wallet_not_eligible",
+                "low_edge", "low_confidence", "market_closed", "stale",
+                "duplicate", "risk_blocked", "no_capital", "slippage", "exec_error")
+
+
+def _ranking(db: Session) -> tuple[set, dict]:
+    """Production wallet ranking evaluated ONCE per pass (unchanged logic). Returns
+    the eligible top-N address set + {address: production_rank_score} for the report."""
+    from . import live_ranking
+    cfg = live_ranking._cfg()
+    ranked = live_ranking.rank_wallets(db, include_failed=True)
+    score_map = {r["address"]: r["production_rank_score"] for r in ranked}
+    eligible = [r["address"] for r in ranked if r["eligible"]][: cfg["top_n"]]
+    return set(eligible), score_map
+
+
+def _categorize_rejection(reason: str) -> str:
+    """Map a process_signal rejection reason to a report category."""
+    r = (reason or "").lower()
+    if "slippage" in r:
+        return "slippage"
+    if "no capital" in r or "below min" in r or "min order" in r:
+        return "no_capital"
+    if any(k in r for k in ("exec:", "submit", "auth", "book", "token_id",
+                            "not installed", "not filled", "error")):
+        return "exec_error"
+    return "risk_blocked"   # halted / max orders / loss stop / config invalid / positions
+
+
+def _decide_one(db: Session, s, cfg: LiveConfig, eligible: set, score_map: dict,
+                place: bool) -> tuple[dict, bool, int | None]:
+    """Run one NEW signal through the full gate sequence. Returns
+    (candidate_report, should_record, execution_id). When place=True and the
+    signal qualifies, the (unchanged) order pipeline is invoked."""
+    from .models import Wallet
+    w = db.get(Wallet, s.wallet_id)
+    m = db.get(Market, s.market_id)
+    addr = w.address if w else None
+    edge = float(s.edge_estimate or 0.0)
+    conf = float(s.confidence or 0.0)
+    gates: dict = {}
+    cand = {"signal_id": s.id, "wallet": addr, "edge": round(edge, 4),
+            "confidence": round(conf, 1), "production_score": score_map.get(addr),
+            "eligible": False, "gates": gates, "status": None, "category": None, "reason": None}
+
+    def done(status, category, reason, record=True, exec_id=None):
+        cand["status"], cand["category"], cand["reason"] = status, category, reason
+        return cand, record, exec_id
+
+    # GATE 1 — trading enabled. Do NOT record while disabled, so the signal is
+    # re-evaluated once trading is turned on (it must not be silently consumed).
+    gates["trading_enabled"] = cfg.enabled
+    if not cfg.enabled:
+        return done("skipped", "trading_disabled", "LIVE_TRADING_ENABLED is false", record=False)
+
+    # GATE 2 — production wallet ranking (profitability filters + top-N).
+    is_elig = bool(addr and addr in eligible)
+    gates["wallet_eligible"] = is_elig
+    if not is_elig:
+        return done("skipped", "wallet_not_eligible",
+                    f"wallet {(addr or '?')[:12]} not in production top-{len(eligible)}")
+
+    # GATE 3 — edge threshold.
+    gates["edge_ok"] = edge >= cfg.min_edge
+    if edge < cfg.min_edge:
+        return done("skipped", "low_edge", f"edge {edge:.3f} < min {cfg.min_edge}")
+
+    # GATE 4 — confidence threshold.
+    gates["confidence_ok"] = conf >= cfg.min_confidence
+    if conf < cfg.min_confidence:
+        return done("skipped", "low_confidence", f"confidence {conf:.0f} < min {cfg.min_confidence:.0f}")
+
+    # GATE 5 — market still open.
+    market_open = bool(m and not m.resolved)
+    gates["market_open"] = market_open
+    if not market_open:
+        return done("skipped", "market_closed", "market missing or already resolved")
+
+    # GATE 6 — signal freshness (don't act on a stale signal).
+    age_min = (datetime.utcnow() - s.created_at).total_seconds() / 60.0 if s.created_at else 0.0
+    fresh = age_min <= cfg.signal_ttl_min
+    gates["fresh"] = fresh
+    if not fresh:
+        return done("expired", "stale", f"signal age {age_min:.0f}m > TTL {cfg.signal_ttl_min:.0f}m")
+
+    # Passed every pre-execution gate -> this is an ACTIONABLE signal.
+    cand["eligible"] = True
+    if not place:
+        # diagnostic: report that it qualifies; the worker performs the execution.
+        return done("eligible", "would_execute", "qualifies — worker will execute", record=False)
+
+    # GATE 7 — duplicate protection (idempotency on strategy:signal).
+    idem = f"{cfg.strategy}:{s.id}"
+    pre = db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == idem))
+    if pre is not None:
+        gates["duplicate_check"] = False
+        return done("skipped", "duplicate", "execution already exists for this signal", exec_id=pre.id)
+    gates["duplicate_check"] = True
+
+    # GATES 8-10 — risk + sizing + slippage + submit, via the unchanged, tested
+    # order pipeline (it logs a LiveExecution: 'open' on fill, 'rejected' otherwise).
+    ex = process_signal(db, strategy_key=cfg.strategy, wallet=addr, signal_id=s.id, market=m,
+                        outcome=s.outcome, price=float(s.observed_price or 0.5),
+                        entry_reason=f"copy {(addr or '')[:10]} conf={conf:.0f} edge={edge}")
+    if ex is not None:
+        gates["risk_passed"] = True
+        gates["submitted"] = True
+        gates["filled"] = True
+        return done("filled", "filled", f"order placed ${ex.size_usd:.2f} @ {ex.fill_price}", exec_id=ex.id)
+    rej = db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == idem))
+    rr = (rej.exit_reason or "") if rej else "rejected"
+    category = _categorize_rejection(rr)
+    gates["risk_passed"] = category not in ("risk_blocked", "no_capital")
+    gates["submitted"] = category in ("slippage", "exec_error")
+    gates["filled"] = False
+    return done("rejected", category, rr, exec_id=(rej.id if rej else None))
+
+
+def _record_decision(db: Session, s, cand: dict, execution_id: int | None) -> None:
+    """Persist the per-signal audit row (the 'processed' marker). The unique
+    constraint makes a concurrent double-record a harmless no-op."""
+    try:
+        db.add(LiveSignalDecision(
+            signal_id=s.id, status=cand["status"], category=cand["category"],
+            reason=(cand["reason"] or "")[:1000], wallet_address=cand["wallet"],
+            edge=cand["edge"], confidence=cand["confidence"],
+            production_score=cand["production_score"], gates=cand["gates"],
+            execution_id=execution_id))
+        db.commit()
+    except Exception:  # noqa: BLE001  (unique violation -> already recorded)
+        db.rollback()
+
+
+def _decision_to_candidate(d: LiveSignalDecision) -> dict:
+    """Render an already-recorded decision back into the report (the audit trail)."""
+    return {"signal_id": d.signal_id, "wallet": d.wallet_address, "edge": d.edge,
+            "confidence": d.confidence, "production_score": d.production_score,
+            "eligible": (d.gates or {}).get("market_open", False) and d.status in ("filled", "rejected"),
+            "gates": d.gates or {}, "status": d.status, "category": d.category,
+            "reason": d.reason, "recorded": True}
+
+
+def _summarize(report: dict) -> str:
+    if report["placed"]:
+        return f"placed {report['placed']} order(s)"
+    if report["new_evaluated"] == 0:
+        return "no new signals"
+    if report["mode"] == "diagnostic" and report["eligible"]:
+        return f"{report['eligible']} qualifying signal(s) pending worker execution"
+    if report["eligible"] == 0:
+        return "no new qualifying signals"
+    return "qualifying signals evaluated; none filled"
+
+
+def run_pipeline(db: Session, place: bool = True) -> dict:
+    """The single decision pipeline shared by the worker (place=True, event-driven
+    execution) and /api/live/run-once (place=False, read-only diagnostic).
+
+    ALWAYS settles/monitors existing live positions. Then evaluates every signal
+    in the recent window: those already carrying a decision are reported from their
+    stored audit row (never re-run); brand-NEW signals flow through the full gate
+    sequence and, when place=True, are executed + recorded. Returns a complete,
+    explainable decision report."""
     settle_live(db)
     cfg = get_config()
-    if not place:
-        return {"enabled": cfg.enabled, "placed": 0, "mode": "settle_only"}
-    if not cfg.enabled:
-        return {"enabled": False, "placed": 0}
-    from .models import PaperSignal, Wallet
-    from . import live_ranking
-    # PRODUCTION wallet selection: only copy wallets that pass the profitability
-    # filters and rank in the top-N by production_rank_score (NOT raw copyability).
-    eligible = live_ranking.eligible_addresses(db)
-    recent = db.scalars(select(PaperSignal).where(
-        PaperSignal.created_at >= datetime.utcnow() - timedelta(hours=2))
-        .order_by(PaperSignal.created_at.desc()).limit(limit)).all()
-    done = set(db.scalars(select(LiveExecution.signal_id)).all())
-    placed = 0
-    for s in recent:
-        if s.id in done:
+    window_min = float(os.getenv("LIVE_SIGNAL_WINDOW_MIN", "120"))
+    from .models import PaperSignal
+
+    cutoff = datetime.utcnow() - timedelta(minutes=window_min)
+    sigs = db.scalars(select(PaperSignal).where(PaperSignal.created_at >= cutoff)
+                      .order_by(PaperSignal.created_at.asc())).all()
+    report = {
+        "placed": 0, "mode": "execute" if place else "diagnostic",
+        "signals_seen": len(sigs), "new_evaluated": 0, "eligible": 0,
+        "executor_called": False, "reason": "",
+        "filtered": {k: 0 for k in _FILTER_KEYS}, "candidates": [],
+    }
+    if not sigs:
+        report["reason"] = "no signals in window"
+        return report
+
+    decisions = {d.signal_id: d for d in db.scalars(select(LiveSignalDecision).where(
+        LiveSignalDecision.signal_id.in_([s.id for s in sigs]))).all()}
+    # Only reconstruct the production ranking when there is at least one NEW signal
+    # to score (the worker runs every cycle; skip the work when nothing is new).
+    has_new = any(s.id not in decisions for s in sigs)
+    eligible, score_map = _ranking(db) if has_new else (set(), {})
+
+    for s in sigs:
+        prior = decisions.get(s.id)
+        if prior is not None:                       # already processed -> never re-run
+            report["filtered"]["already_processed"] += 1
+            report["candidates"].append(_decision_to_candidate(prior))
             continue
-        # copy only Top-Decile-Edge-like signals: strong edge + confidence
-        if float(s.edge_estimate or 0) < cfg.min_edge or float(s.confidence or 0) < cfg.min_confidence:
-            continue
-        w = db.get(Wallet, s.wallet_id)
-        m = db.get(Market, s.market_id)
-        if not (w and m) or m.resolved:
-            continue
-        if w.address not in eligible:            # production ranking gate
-            continue
-        ex = process_signal(db, strategy_key=cfg.strategy, wallet=w.address, signal_id=s.id,
-                            market=m, outcome=s.outcome, price=float(s.observed_price or 0.5),
-                            entry_reason=f"copy {w.address[:10]} conf={s.confidence:.0f} edge={s.edge_estimate}")
-        if ex:
-            placed += 1
-        if get_state(db).halted:    # one-order test halts mid-loop
+        report["new_evaluated"] += 1
+        cand, record, exec_id = _decide_one(db, s, cfg, eligible, score_map, place)
+        report["candidates"].append(cand)
+        if cand["eligible"]:
+            report["eligible"] += 1
+        cat = cand["category"]
+        if cat == "filled":
+            report["placed"] += 1
+            report["executor_called"] = True
+        elif cat in ("slippage", "exec_error"):
+            report["executor_called"] = True
+            report["filtered"][cat] += 1
+        elif cat in report["filtered"]:
+            report["filtered"][cat] += 1
+        if place and record:
+            _record_decision(db, s, cand, exec_id)
+        if place and get_state(db).halted:          # one-order test: stop after the halt
             break
-    return {"enabled": True, "placed": placed}
+
+    report["reason"] = _summarize(report)
+    return report
+
+
+def signal_decisions(db: Session, limit: int = 100) -> list[dict]:
+    """Recent per-signal decision audit rows (newest first) — the execution trail."""
+    rows = db.scalars(select(LiveSignalDecision).order_by(
+        LiveSignalDecision.created_at.desc()).limit(limit)).all()
+    return [{
+        "id": d.id, "created_at": d.created_at.isoformat() if d.created_at else None,
+        "signal_id": d.signal_id, "status": d.status, "category": d.category,
+        "reason": d.reason, "wallet": d.wallet_address, "edge": d.edge,
+        "confidence": d.confidence, "production_score": d.production_score,
+        "gates": d.gates or {}, "execution_id": d.execution_id,
+    } for d in rows]
 
 
 def reconcile(db: Session, reported_balance: float, tolerance: float = 0.50) -> dict:

@@ -99,7 +99,7 @@ def test_executor_gates_on_production_eligibility(in_memory_db, monkeypatch):
                            observed_price=0.5, suggested_entry=0.5, confidence=80,
                            edge_estimate=0.1, reason="t", created_at=datetime.utcnow()))
     db.commit()
-    live.process_new_signals(db)
+    live.run_pipeline(db, place=True)
     placed = db.scalars(select(LiveExecution).where(LiveExecution.status == "open")).all()
     addrs = {e.wallet_address for e in placed}
     assert "0xwin" in addrs and "0xlos" not in addrs     # only the profitable wallet copied

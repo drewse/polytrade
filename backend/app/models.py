@@ -458,6 +458,32 @@ class LiveState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class LiveSignalDecision(Base):
+    """Per-signal LIVE decision audit trail — the heart of the event-driven
+    executor's observability. Exactly ONE row per PaperSignal the live pipeline
+    has evaluated; the existence of a row is the 'processed' marker that
+    guarantees a signal is never executed twice. Records the full gate-by-gate
+    outcome so EVERY decision (placed or not) is explainable — there is never an
+    unexplained 'placed=0'. Live-only; touches no paper-research code."""
+
+    __tablename__ = "live_signal_decisions"
+    __table_args__ = (UniqueConstraint("signal_id", name="uq_live_signal_decision"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    signal_id: Mapped[int] = mapped_column(Integer, index=True)
+    # terminal lifecycle state: filled | skipped | rejected | expired
+    status: Mapped[str] = mapped_column(String(12), index=True)
+    category: Mapped[str] = mapped_column(String(32))      # precise machine reason key
+    reason: Mapped[str] = mapped_column(Text, default="")  # human-readable explanation
+    wallet_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    edge: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    production_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gates: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ordered gate trail
+    execution_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # -> LiveExecution
+
+
 class ReplayState(Base):
     """Singleton (id=1) checkpoint for the historical replay engine — supports
     resume / incremental replay so we never restart from scratch. PAPER ONLY."""

@@ -803,13 +803,15 @@ def run_ingest_cycle(db: Session) -> dict:
         status["errors"].append(f"top20: {exc}")
         print(f"[ingest] top20 error: {exc}")
 
-    # 6c. Live execution layer: settle/monitor live positions always; place new
-    #     orders only when LIVE_TRADING_ENABLED (default false). Fully guarded.
+    # 6c. Live execution layer (EVENT-DRIVEN): settle/monitor live positions, then
+    #     immediately evaluate the signals just created this cycle and execute any
+    #     that qualify. Real placement only when LIVE_TRADING_ENABLED (default
+    #     false); every signal leaves an explainable decision row. Fully guarded.
     try:
         from . import live
-        # settle/monitor only — the worker NEVER auto-places live orders;
-        # placement is manual via /api/live/run-once.
-        live.process_new_signals(db, place=False)
+        live_report = live.run_pipeline(db, place=True)
+        if live_report.get("placed"):
+            print(f"[ingest] live: placed {live_report['placed']} order(s)")
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         status["errors"].append(f"live: {exc}")

@@ -377,9 +377,18 @@ def live_halt(reason: str = "manual", db: Session = Depends(get_db)) -> MessageO
 
 @app.post("/api/live/run-once", response_model=MessageOut)
 def live_run_once(db: Session = Depends(get_db)) -> MessageOut:
-    """Controlled trigger: settle existing positions and attempt to place new
-    orders now (honors LIVE_MAX_ORDERS — set it to 1 for a single-order test)."""
-    return MessageOut(message="live run-once", detail=live.process_new_signals(db))
+    """DIAGNOSTIC: runs the exact event-driven decision pipeline read-only (places
+    nothing, writes no rows) and returns a complete decision report — signals seen,
+    eligible count, per-candidate gates and the precise reason each signal was or
+    was not acted on. Actual execution is event-driven in the worker. There is
+    never again an unexplained 'placed=0'."""
+    return MessageOut(message="live decision report", detail=live.run_pipeline(db, place=False))
+
+
+@app.get("/api/live/decisions", response_model=MessageOut)
+def live_decisions(limit: int = 100, db: Session = Depends(get_db)) -> MessageOut:
+    """The per-signal execution audit trail (newest first)."""
+    return MessageOut(message="live decisions", detail={"decisions": live.signal_decisions(db, limit)})
 
 
 @app.post("/api/admin/rescore-wallets", response_model=MessageOut)

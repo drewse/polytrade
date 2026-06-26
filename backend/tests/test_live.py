@@ -10,7 +10,10 @@ from sqlalchemy import select
 
 from app import live
 from app.live import ExecutionRejected
-from app.models import LiveExecution, LiveState, Market
+from app.models import (
+    LiveExecution, LiveSignalDecision, LiveState, Market,
+    PaperSignal, Wallet, WalletCandidate, WalletStat,
+)
 
 
 def _market(db, mid="m1", resolved=False, outcome="Yes"):
@@ -278,17 +281,26 @@ def test_reset_test_state_refuses_with_real_filled_order(in_memory_db):
     assert _count(db) == 1                                     # real order untouched
 
 
-def test_worker_settle_only_never_places(in_memory_db, monkeypatch):
+def test_run_once_is_diagnostic_only(in_memory_db, monkeypatch):
+    # /api/live/run-once => run_pipeline(place=False): never places, never records
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
     monkeypatch.setenv("LIVE_EXECUTOR", "polymarket")
-    out = live.process_new_signals(in_memory_db, place=False)
-    assert out["mode"] == "settle_only" and out["placed"] == 0
-    assert _count(in_memory_db) == 0     # nothing placed even though enabled
+    out = live.run_pipeline(in_memory_db, place=False)
+    assert out["mode"] == "diagnostic" and out["placed"] == 0
+    assert out["executor_called"] is False
+    assert _count(in_memory_db) == 0                      # no executions
+    assert _decisions(in_memory_db) == 0                 # no decision rows written
 
 
 def _count(db):
     from sqlalchemy import func
     return db.scalar(select(func.count()).select_from(LiveExecution)) or 0
+
+
+def _decisions(db):
+    from sqlalchemy import func
+    from app.models import LiveSignalDecision
+    return db.scalar(select(func.count()).select_from(LiveSignalDecision)) or 0
 
 
 def test_status_caps_max_loss_at_40(in_memory_db, monkeypatch):
@@ -298,3 +310,125 @@ def test_status_caps_max_loss_at_40(in_memory_db, monkeypatch):
     assert s["sizing"]["position_usd"] == 2.0 and s["sizing"]["method"] == "fixed_dollar"
     assert s["limits_usd"]["total_loss_stop"] == 40.0
     assert s["max_possible_loss"] == 40.0
+
+
+# ===========================================================================
+# Event-driven execution pipeline + decision observability
+# ===========================================================================
+def _eligible_wallet(db, addr="0xwin"):
+    """A wallet that clears the production filters (profitable, active, settled)."""
+    w = Wallet(address=addr, copy_enabled=True,
+               last_active=datetime.utcnow() - timedelta(days=2))
+    db.add(w); db.flush()
+    db.add(WalletStat(wallet_id=w.id, num_trades=100, num_settled=100, realized_roi=0.28,
+                      win_rate=0.6, profit_factor=2.2, expectancy=10.0, sharpe=0.5,
+                      recency_score=0.9, partial_history=False, consistency=0.6))
+    db.add(WalletCandidate(wallet_id=w.id, copyability_score=70.0, classification="good_candidate"))
+    return w
+
+
+def _signal(db, w, m, *, edge=0.1, conf=80, age_min=0, outcome="Yes", price=0.5):
+    s = PaperSignal(wallet_id=w.id, market_id=m.id, outcome=outcome, side="buy",
+                    observed_price=price, suggested_entry=price, confidence=conf,
+                    edge_estimate=edge, reason="t",
+                    created_at=datetime.utcnow() - timedelta(minutes=age_min))
+    db.add(s); db.flush()
+    return s
+
+
+@pytest.fixture
+def live_env(monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
+    monkeypatch.setenv("LIVE_STARTING_BANKROLL", "40")
+    monkeypatch.setenv("LIVE_MAX_ORDERS", "0")
+    monkeypatch.setenv("LIVE_MIN_EDGE", "0.05")
+    monkeypatch.setenv("LIVE_MIN_CONFIDENCE", "65")
+    monkeypatch.setenv("LIVE_SIGNAL_TTL_MIN", "30")
+
+
+def test_event_driven_places_and_records_full_trail(in_memory_db, live_env):
+    db = in_memory_db
+    w = _eligible_wallet(db); m = _market(db, "mw"); _signal(db, w, m); db.commit()
+    rep = live.run_pipeline(db, place=True)
+    assert rep["mode"] == "execute" and rep["placed"] == 1 and rep["executor_called"] is True
+    assert rep["eligible"] == 1 and rep["signals_seen"] == 1 and rep["new_evaluated"] == 1
+    ex = db.scalars(select(LiveExecution).where(LiveExecution.status == "open")).all()
+    assert len(ex) == 1 and ex[0].wallet_address == "0xwin"
+    d = db.scalar(select(LiveSignalDecision))
+    assert d.status == "filled" and d.category == "filled" and d.execution_id == ex[0].id
+    # full audit trail: detected -> wallet -> edge -> confidence -> open -> fresh -> risk -> filled
+    for g in ("trading_enabled", "wallet_eligible", "edge_ok", "confidence_ok",
+              "market_open", "fresh", "duplicate_check", "risk_passed", "submitted", "filled"):
+        assert d.gates[g] is True
+
+
+def test_no_double_execution(in_memory_db, live_env):
+    db = in_memory_db
+    w = _eligible_wallet(db); m = _market(db, "mw"); _signal(db, w, m); db.commit()
+    r1 = live.run_pipeline(db, place=True)
+    r2 = live.run_pipeline(db, place=True)        # second cycle: same signal
+    assert r1["placed"] == 1 and r2["placed"] == 0
+    assert r2["filtered"]["already_processed"] == 1 and r2["new_evaluated"] == 0
+    assert _count(db) == 1 and _decisions(db) == 1   # exactly one order + one decision, ever
+
+
+def test_non_qualifying_recorded_with_exact_reason(in_memory_db, live_env):
+    db = in_memory_db
+    w = _eligible_wallet(db); m = _market(db, "mw")
+    _signal(db, w, m, edge=0.01)                  # below LIVE_MIN_EDGE
+    db.commit()
+    rep = live.run_pipeline(db, place=True)
+    assert rep["placed"] == 0 and rep["filtered"]["low_edge"] == 1
+    d = db.scalar(select(LiveSignalDecision))
+    assert d.status == "skipped" and d.category == "low_edge"
+    assert d.gates["wallet_eligible"] is True and d.gates["edge_ok"] is False
+    assert "edge" in d.reason
+
+
+def test_wallet_not_eligible_skipped(in_memory_db, live_env):
+    db = in_memory_db
+    # losing wallet -> fails production filters
+    los = Wallet(address="0xlose", copy_enabled=True, last_active=datetime.utcnow())
+    db.add(los); db.flush()
+    db.add(WalletStat(wallet_id=los.id, num_trades=100, num_settled=100, realized_roi=-0.05,
+                      win_rate=0.4, profit_factor=0.8, recency_score=0.5))
+    m = _market(db, "mw"); _signal(db, los, m); db.commit()
+    rep = live.run_pipeline(db, place=True)
+    assert rep["placed"] == 0 and rep["filtered"]["wallet_not_eligible"] == 1
+    assert db.scalar(select(LiveSignalDecision)).category == "wallet_not_eligible"
+
+
+def test_stale_signal_expired(in_memory_db, live_env):
+    db = in_memory_db
+    w = _eligible_wallet(db); m = _market(db, "mw")
+    _signal(db, w, m, age_min=60)                 # older than TTL (30m), inside window (120m)
+    db.commit()
+    rep = live.run_pipeline(db, place=True)
+    assert rep["filtered"]["stale"] == 1 and rep["placed"] == 0
+    assert db.scalar(select(LiveSignalDecision)).status == "expired"
+
+
+def test_run_once_diagnoses_without_side_effects(in_memory_db, live_env):
+    db = in_memory_db
+    w = _eligible_wallet(db); m = _market(db, "mw"); _signal(db, w, m); db.commit()
+    rep = live.run_pipeline(db, place=False)      # the run-once diagnostic
+    assert rep["mode"] == "diagnostic" and rep["placed"] == 0 and rep["eligible"] == 1
+    cand = rep["candidates"][0]
+    assert cand["status"] == "eligible" and cand["category"] == "would_execute"
+    assert cand["production_score"] > 0 and cand["wallet"] == "0xwin"
+    assert _count(db) == 0 and _decisions(db) == 0    # zero side effects
+    assert live.run_pipeline(db, place=True)["placed"] == 1   # worker then executes it
+
+
+def test_one_order_mode_stops_after_one(in_memory_db, live_env, monkeypatch):
+    monkeypatch.setenv("LIVE_MAX_ORDERS", "1")
+    db = in_memory_db
+    w = _eligible_wallet(db)
+    m1 = _market(db, "m1"); m2 = _market(db, "m2")
+    _signal(db, w, m1); _signal(db, w, m2)        # two qualifying signals
+    db.commit()
+    rep = live.run_pipeline(db, place=True)
+    assert rep["placed"] == 1                      # exactly one, despite two qualifying
+    assert live.get_state(db).halted is True       # auto-halt after one-order test
+    assert _count(db) == 1                          # only one execution exists
