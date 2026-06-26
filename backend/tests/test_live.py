@@ -181,7 +181,65 @@ def test_polymarket_path_rejects_and_logs_not_halt_on_no_key(in_memory_db, monke
                               market=m, outcome="Yes", price=0.5, entry_reason="t")
     assert out is None
     ex = in_memory_db.scalar(select(LiveExecution).where(LiveExecution.status == "rejected"))
-    assert ex is not None and "PRIVATE_KEY" in (ex.exit_reason or "")
+    # no key -> wallet_check is invalid -> blocked at the gate (fail closed, no submit)
+    assert ex is not None and "config invalid" in (ex.exit_reason or "")
+
+
+def _derive(key):
+    from eth_account import Account
+    return Account.from_key(key).address
+
+
+KEY = "0x" + "1" * 64  # deterministic test key (never a real funded wallet)
+
+
+def test_wallet_check_eoa_match_valid(monkeypatch):
+    addr = _derive(KEY)
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)
+    monkeypatch.setenv("RELAYER_API_KEY_ADDRESS", addr)
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "0")
+    wc = live.wallet_check()
+    assert wc["derived_eoa"].lower() == addr.lower()
+    assert wc["addresses_match"] is True
+    assert wc["recommended_signature_type"] == 0
+    assert wc["configuration_valid"] is True
+
+
+def test_wallet_check_proxy_mismatch_invalid_when_sig0(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)
+    monkeypatch.setenv("RELAYER_API_KEY_ADDRESS", "0x000000000000000000000000000000000000dEaD")
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "0")
+    wc = live.wallet_check()
+    assert wc["addresses_match"] is False
+    assert wc["configuration_valid"] is False        # EOA sig on a proxy wallet
+    assert wc["recommended_signature_type"] is None  # 1 vs 2 not determinable
+    assert "proxy" in wc["note"].lower()
+
+
+def test_wallet_check_proxy_valid_when_proxy_sig_set(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)
+    monkeypatch.setenv("RELAYER_API_KEY_ADDRESS", "0x000000000000000000000000000000000000dEaD")
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "1")
+    wc = live.wallet_check()
+    assert wc["addresses_match"] is False and wc["configuration_valid"] is True
+
+
+def test_wallet_check_no_key(monkeypatch):
+    monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
+    wc = live.wallet_check()
+    assert wc["derived_eoa"] is None and wc["configuration_valid"] is False
+
+
+def test_invalid_wallet_config_blocks_real_order(in_memory_db, monkeypatch):
+    # proxy wallet + sig_type 0 -> placement must be refused before any submission
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_EXECUTOR", "polymarket")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)
+    monkeypatch.setenv("RELAYER_API_KEY_ADDRESS", "0x000000000000000000000000000000000000dEaD")
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "0")
+    cfg = live.get_config()
+    ok, reason = live.check_can_open(in_memory_db, cfg, wallet="0xw", market_id="m")
+    assert not ok and "wallet config invalid" in reason
 
 
 def test_status_reports_py_clob_installed(in_memory_db):

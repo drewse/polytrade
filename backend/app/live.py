@@ -44,6 +44,71 @@ def py_clob_installed() -> bool:
     return importlib.util.find_spec("py_clob_client") is not None
 
 
+def wallet_check() -> dict:
+    """Pre-flight wallet configuration diagnostic. Derives the EOA from the
+    private key and compares it to the configured funder, so we know whether the
+    signature_type is correct BEFORE the first live order. Exposes ONLY public
+    addresses + validation results — never the private key.
+
+    sig types: 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE.
+      * EOA wallet  (funder == signer EOA): correct sig_type is 0.
+      * Proxy wallet (funder != signer EOA): correct sig_type is 1 or 2; which one
+        cannot be derived from the address alone (no local proxy-address
+        derivation in py-clob-client) — verify against how the account was made.
+    """
+    key = os.getenv("POLYMARKET_PRIVATE_KEY")
+    configured_funder = os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")
+    current_sig = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+
+    derived = None
+    note = None
+    if key:
+        try:
+            from eth_account import Account
+            derived = Account.from_key(key).address       # public address only
+        except Exception as exc:  # noqa: BLE001
+            note = f"could not derive EOA: {exc}"
+
+    if derived is None:
+        return {"derived_eoa": None, "configured_funder": configured_funder,
+                "addresses_match": None, "recommended_signature_type": None,
+                "current_signature_type": current_sig, "configuration_valid": False,
+                "note": note or "POLYMARKET_PRIVATE_KEY not set — cannot validate"}
+
+    deoa = derived.lower()
+    cfun = configured_funder.lower() if configured_funder else None
+
+    if cfun is None or cfun == deoa:
+        # EOA wallet: funder equals the signer (or unset -> defaults to signer).
+        valid = current_sig == 0
+        return {
+            "derived_eoa": derived, "configured_funder": configured_funder or derived,
+            "addresses_match": True, "recommended_signature_type": 0,
+            "current_signature_type": current_sig, "configuration_valid": valid,
+            "note": (None if valid else
+                     "EOA wallet (funder == signer) but signature_type != 0 — set "
+                     "POLYMARKET_SIGNATURE_TYPE=0.") if configured_funder else
+                    ("EOA assumed (no funder configured). If your USDC is in a Polymarket "
+                     "proxy, set RELAYER_API_KEY_ADDRESS to that address."
+                     if valid else "Set POLYMARKET_SIGNATURE_TYPE=0 for an EOA wallet."),
+        }
+
+    # Proxy wallet: configured funder differs from the signer EOA.
+    valid = current_sig in (1, 2)   # a proxy type must be set; 1 vs 2 not auto-determinable
+    return {
+        "derived_eoa": derived, "configured_funder": configured_funder,
+        "addresses_match": False, "recommended_signature_type": None,
+        "current_signature_type": current_sig, "configuration_valid": valid,
+        "note": ("Proxy wallet detected: the funded address differs from your key's EOA. "
+                 "Set POLYMARKET_SIGNATURE_TYPE to 1 (POLY_PROXY — email/Magic login) or 2 "
+                 "(POLY_GNOSIS_SAFE — browser/Safe wallet); the exact type cannot be derived "
+                 "from the address, so verify against how the account was created. The first "
+                 "$1 order is the final check."
+                 + ("" if valid else " Currently signature_type=0 (EOA) which is INVALID for a "
+                    "proxy wallet — order placement is blocked until corrected.")),
+    }
+
+
 def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
@@ -155,6 +220,11 @@ def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str)
         return False, "LIVE_TRADING_ENABLED is false"
     if st.halted:
         return False, f"trading halted: {st.halt_reason}"
+    # real orders: refuse until the wallet configuration is verified valid
+    if cfg.executor == "polymarket":
+        wc = wallet_check()
+        if not wc["configuration_valid"]:
+            return False, f"wallet config invalid: {wc.get('note') or 'see /api/live/status.wallet_check'}"
     open_ = _open(db)
     if len(open_) >= cfg.max_positions:
         return False, f"max open positions ({cfg.max_positions}) reached"
@@ -542,6 +612,7 @@ def status(db: Session) -> dict:
                       or "(defaults to signer EOA)",
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
+        "wallet_check": wallet_check(),
         "strategy_copied": cfg.strategy,
         "wallet_selection": "production_rank_score (40% reputation, 30% PF, 20% ROI, "
                             "10% recency; filters ROI>0, PF>1.20) — see /api/live/wallet-ranking",
