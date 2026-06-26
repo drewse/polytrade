@@ -38,6 +38,12 @@ class ExecutionRejected(Exception):
     """A pre-trade/venue check refused this order (logged as 'rejected')."""
 
 
+def py_clob_installed() -> bool:
+    """Whether the real-execution dependency is present in THIS environment."""
+    import importlib.util
+    return importlib.util.find_spec("py_clob_client") is not None
+
+
 def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
@@ -166,11 +172,35 @@ def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str)
     return True, "ok"
 
 
+def reset_test_state(db: Session) -> dict:
+    """Clear REJECTED + DRY-RUN execution attempts (test artifacts) and the halt
+    latch, so a blocked bankroll reset can proceed. Refuses if ANY real filled
+    order exists — it can never delete real orders.
+
+    Allowed only when: real_orders_placed == 0, no filled live orders, no open
+    live positions (all from the polymarket executor)."""
+    real_filled = db.scalar(select(func.count()).select_from(LiveExecution).where(
+        LiveExecution.executor == "polymarket", LiveExecution.status.in_(("open", "closed"))))
+    if real_filled:
+        return {"ok": False, "error": f"{int(real_filled)} real polymarket order(s) exist; "
+                                      "refusing (real orders are never deleted)"}
+    n = db.query(LiveExecution).filter(
+        (LiveExecution.status == "rejected") | (LiveExecution.executor == "dry_run")
+    ).delete(synchronize_session=False)
+    st = get_state(db)
+    st.halted = False
+    st.halt_reason = None
+    db.commit()
+    return {"ok": True, "cleared_attempts": int(n or 0),
+            "real_orders_preserved": int(db.scalar(select(func.count()).select_from(
+                LiveExecution).where(LiveExecution.executor == "polymarket")) or 0)}
+
+
 def set_bankroll(db: Session, amount: float) -> dict:
     """Align the tracked starting/current bankroll with the ACTUAL funded balance.
     Only allowed with no executions yet (clean slate) so it can't rewrite history."""
     if db.scalar(select(func.count()).select_from(LiveExecution)):
-        return {"ok": False, "error": "executions exist; cannot reset bankroll"}
+        return {"ok": False, "error": "executions exist; run /api/live/reset-test-state first"}
     st = get_state(db)
     st.starting_bankroll = round(amount, 2)
     st.bankroll = round(amount, 2)
@@ -438,11 +468,15 @@ def settle_live(db: Session) -> dict:
     return {"closed": closed, "bankroll": st.bankroll}
 
 
-def process_new_signals(db: Session, limit: int = 20) -> dict:
-    """Worker hook. ALWAYS settles existing live positions. Places new orders only
-    when enabled, copying the chosen strategy's signals (edge/confidence filtered)."""
+def process_new_signals(db: Session, limit: int = 20, place: bool = True) -> dict:
+    """ALWAYS settles existing live positions. Places NEW orders only when
+    `place=True` AND enabled. The background worker calls this with place=False
+    (settle/monitor only) so a real order is NEVER auto-placed — placement
+    happens solely via the explicit /api/live/run-once endpoint (manual control)."""
     settle_live(db)
     cfg = get_config()
+    if not place:
+        return {"enabled": cfg.enabled, "placed": 0, "mode": "settle_only"}
     if not cfg.enabled:
         return {"enabled": False, "placed": 0}
     from .models import PaperSignal, Wallet
@@ -501,6 +535,7 @@ def status(db: Session) -> dict:
         "real_orders_placed": _order_count(db, "polymarket"),
         "orders_this_executor": _order_count(db, cfg.executor),
         "auth": {  # L1 = private key (signs); L2 secret/passphrase are DERIVED from it
+            "py_clob_client_installed": py_clob_installed(),
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
             "l2_creds_source": "derived_from_private_key",  # UI never exposes secret/passphrase
             "funder": os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")

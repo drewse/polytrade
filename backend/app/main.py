@@ -352,6 +352,12 @@ def live_reconcile(balance: float, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="reconciliation", detail=live.reconcile(db, balance))
 
 
+@app.post("/api/live/reset-test-state", response_model=MessageOut)
+def live_reset_test_state(db: Session = Depends(get_db)) -> MessageOut:
+    """Clear rejected/dry-run test attempts + halt latch (never real orders)."""
+    return MessageOut(message="test state reset", detail=live.reset_test_state(db))
+
+
 @app.post("/api/live/set-bankroll", response_model=MessageOut)
 def live_set_bankroll(amount: float, db: Session = Depends(get_db)) -> MessageOut:
     """Set tracked bankroll to the ACTUAL funded balance (clean slate only)."""

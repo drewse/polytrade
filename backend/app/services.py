@@ -807,7 +807,9 @@ def run_ingest_cycle(db: Session) -> dict:
     #     orders only when LIVE_TRADING_ENABLED (default false). Fully guarded.
     try:
         from . import live
-        live.process_new_signals(db)
+        # settle/monitor only — the worker NEVER auto-places live orders;
+        # placement is manual via /api/live/run-once.
+        live.process_new_signals(db, place=False)
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         status["errors"].append(f"live: {exc}")

@@ -6,3 +6,5 @@ pydantic-settings==2.5.2
 httpx==0.27.2
 python-dateutil==2.9.0.post0
 pytest==8.3.3
+# Live Polymarket execution (real orders). Exact version verified in audit.
+py-clob-client==0.34.6

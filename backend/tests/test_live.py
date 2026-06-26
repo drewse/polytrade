@@ -184,6 +184,55 @@ def test_polymarket_path_rejects_and_logs_not_halt_on_no_key(in_memory_db, monke
     assert ex is not None and "PRIVATE_KEY" in (ex.exit_reason or "")
 
 
+def test_status_reports_py_clob_installed(in_memory_db):
+    s = live.status(in_memory_db)
+    assert "py_clob_client_installed" in s["auth"]
+    assert s["auth"]["py_clob_client_installed"] is live.py_clob_installed()
+
+
+def test_reset_test_state_clears_attempts_and_enables_bankroll(in_memory_db):
+    db = in_memory_db
+    # rejected (polymarket) + dry-run attempts exist -> set_bankroll blocked
+    db.add(LiveExecution(idempotency_key="r1", executor="polymarket", strategy_key="s",
+                         wallet_address="0xw", market_id="m", outcome="Yes", expected_price=0.5,
+                         size_usd=0.0, status="rejected", bankroll_before=100))
+    db.add(LiveExecution(idempotency_key="d1", executor="dry_run", strategy_key="s",
+                         wallet_address="0xw", market_id="m2", outcome="Yes", expected_price=0.5,
+                         size_usd=2.0, status="open", bankroll_before=100))
+    db.commit()
+    assert live.set_bankroll(db, 41.41)["ok"] is False        # blocked by attempts
+    res = live.reset_test_state(db)
+    assert res["ok"] and res["cleared_attempts"] == 2
+    assert _count(db) == 0                                     # all attempts gone
+    assert live.set_bankroll(db, 41.41)["ok"] is True          # now allowed
+    assert live.get_state(db).bankroll == 41.41
+
+
+def test_reset_test_state_refuses_with_real_filled_order(in_memory_db):
+    db = in_memory_db
+    db.add(LiveExecution(idempotency_key="real1", executor="polymarket", strategy_key="s",
+                         wallet_address="0xw", market_id="m", outcome="Yes", expected_price=0.5,
+                         size_usd=1.0, status="closed", realized_pnl=0.5, bankroll_before=41,
+                         order_id="0xabc"))
+    db.commit()
+    res = live.reset_test_state(db)
+    assert res["ok"] is False and "real" in res["error"].lower()
+    assert _count(db) == 1                                     # real order untouched
+
+
+def test_worker_settle_only_never_places(in_memory_db, monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_EXECUTOR", "polymarket")
+    out = live.process_new_signals(in_memory_db, place=False)
+    assert out["mode"] == "settle_only" and out["placed"] == 0
+    assert _count(in_memory_db) == 0     # nothing placed even though enabled
+
+
+def _count(db):
+    from sqlalchemy import func
+    return db.scalar(select(func.count()).select_from(LiveExecution)) or 0
+
+
 def test_status_caps_max_loss_at_40(in_memory_db, monkeypatch):
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
     s = live.status(in_memory_db)
