@@ -97,6 +97,11 @@ class WalletStat(Base):
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     realized_roi: Mapped[float] = mapped_column(Float, default=0.0)   # fraction, e.g. 0.25 = 25%
     win_rate: Mapped[float] = mapped_column(Float, default=0.0)        # 0..1
+    # profitability metrics (drive the redesigned copyability model)
+    profit_factor: Mapped[float] = mapped_column(Float, default=0.0)
+    expectancy: Mapped[float] = mapped_column(Float, default=0.0)      # USD per settled position
+    sharpe: Mapped[float] = mapped_column(Float, default=0.0)          # per-trade
+    max_drawdown: Mapped[float] = mapped_column(Float, default=0.0)    # fraction 0..1
     avg_trade_size: Mapped[float] = mapped_column(Float, default=0.0)
     consistency: Mapped[float] = mapped_column(Float, default=0.0)     # 0..1
     recency_score: Mapped[float] = mapped_column(Float, default=0.0)   # 0..1
@@ -300,7 +305,8 @@ class Top20Strategy(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     param_hash: Mapped[str] = mapped_column(String(32), default="")  # reproducibility id
     params: Mapped[dict] = mapped_column(JSON, default=dict)  # filter/sizing knobs (transparency)
-    metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # persisted Phase-1 analytics
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # persisted Phase-1 analytics (notional)
+    realistic_metrics: Mapped[dict] = mapped_column(JSON, default=dict)  # capital-constrained replay
     signals_evaluated: Mapped[int] = mapped_column(Integer, default=0)
     trades_entered: Mapped[int] = mapped_column(Integer, default=0)
     last_signal_id: Mapped[int] = mapped_column(Integer, default=0)  # evaluation watermark

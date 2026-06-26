@@ -51,6 +51,11 @@ class ScoreResult:
     score: float
     classification: str
     num_settled: int = 0
+    # profitability metrics (drive the redesigned copyability model)
+    profit_factor: float = 0.0
+    expectancy: float = 0.0
+    sharpe: float = 0.0
+    max_drawdown: float = 0.0
 
 
 def _clip01(x: float) -> float:
@@ -133,6 +138,24 @@ def score_wallet(trades: list[Trade], settled=None) -> ScoreResult:
     last_ts = max((t.timestamp for t in trades), default=None)
     recency = _recency_score(last_ts)
 
+    # --- profitability metrics from settled positions (for copyability) -------
+    pnls = [t.realized_pnl for t in settled]
+    rets = [t.realized_pnl / t.size for t in settled if getattr(t, "size", 0)]
+    gross_w = sum(p for p in pnls if p > 0)
+    gross_l = -sum(p for p in pnls if p < 0)
+    profit_factor = (gross_w / gross_l) if gross_l > 0 else (min(999.0, gross_w) if gross_w else 0.0)
+    expectancy = (sum(pnls) / len(pnls)) if pnls else 0.0
+    if len(rets) > 1 and statistics.pstdev(rets) > 0:
+        wallet_sharpe = statistics.mean(rets) / statistics.pstdev(rets)
+    else:
+        wallet_sharpe = 0.0
+    cum = peak = mdd = 0.0
+    for t in sorted(settled, key=lambda x: x.timestamp):
+        cum += t.realized_pnl
+        peak = max(peak, cum)
+        if peak > 0:
+            mdd = max(mdd, (peak - cum) / peak)
+
     # category performance: realized roi per category
     cat_pnl: dict[str, float] = defaultdict(float)
     cat_size: dict[str, float] = defaultdict(float)
@@ -179,6 +202,10 @@ def score_wallet(trades: list[Trade], settled=None) -> ScoreResult:
         score=score,
         classification=classification,
         num_settled=len(settled),
+        profit_factor=round(profit_factor, 4),
+        expectancy=round(expectancy, 4),
+        sharpe=round(wallet_sharpe, 4),
+        max_drawdown=round(mdd, 4),
     )
 
 

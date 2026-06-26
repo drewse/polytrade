@@ -325,6 +325,15 @@ def ingest_run(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="Ingest cycle complete", detail=result)
 
 
+@app.post("/api/admin/rescore-wallets", response_model=MessageOut)
+def admin_rescore_wallets(db: Session = Depends(get_db)) -> MessageOut:
+    """Recompute all wallet stats (incl. PF/expectancy/Sharpe/drawdown) and
+    re-evaluate copyability with the revised formula. Paper-only research action."""
+    n = services.recompute_all_wallet_stats(db, reconstruct=True)
+    disc = services.run_discovery(db)
+    return MessageOut(message=f"Rescored {n} wallets", detail=disc)
+
+
 @app.post("/api/mock/seed", response_model=MessageOut)
 def mock_seed(db: Session = Depends(get_db)) -> MessageOut:
     services.ensure_settings(db)
@@ -601,6 +610,28 @@ def replay_run(max_trades: int = 400, db: Session = Depends(get_db)) -> dict:
 @app.post("/api/replay/reset")
 def replay_reset(db: Session = Depends(get_db)) -> dict:
     return top20.replay_reset(db)
+
+
+@app.post("/api/replay/run-realistic")
+def replay_run_realistic(db: Session = Depends(get_db)) -> dict:
+    """Capital-constrained realistic portfolio simulation (Issue 2)."""
+    return top20.replay_run_realistic(db)
+
+
+@app.get("/api/replay/realistic")
+def replay_realistic(db: Session = Depends(get_db)) -> dict:
+    return top20.realistic_view(db)
+
+
+@app.get("/api/replay/comparison")
+def replay_comparison(db: Session = Depends(get_db)) -> dict:
+    """Notional (unlimited capital) vs realistic ($10k constrained) per strategy."""
+    return top20.replay_comparison(db)
+
+
+@app.post("/api/replay/reset-realistic")
+def replay_reset_realistic(db: Session = Depends(get_db)) -> dict:
+    return top20.replay_reset_realistic(db)
 
 
 # --- research analytics (Phases 26-29) --------------------------------------

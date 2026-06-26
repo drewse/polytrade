@@ -357,6 +357,10 @@ def recompute_wallet_stats(
     stat.realized_pnl = result.realized_pnl
     stat.realized_roi = result.realized_roi
     stat.win_rate = result.win_rate
+    stat.profit_factor = result.profit_factor
+    stat.expectancy = result.expectancy
+    stat.sharpe = result.sharpe
+    stat.max_drawdown = result.max_drawdown
     stat.avg_trade_size = result.avg_trade_size
     stat.consistency = result.consistency
     stat.recency_score = result.recency_score

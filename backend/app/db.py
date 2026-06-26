@@ -51,6 +51,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "wallet_stats": {
         "partial_history": "BOOLEAN DEFAULT 0",
         "num_settled": "INTEGER DEFAULT 0",
+        "profit_factor": "FLOAT DEFAULT 0",
+        "expectancy": "FLOAT DEFAULT 0",
+        "sharpe": "FLOAT DEFAULT 0",
+        "max_drawdown": "FLOAT DEFAULT 0",
     },
     "top20_strategies": {
         "exit_policy": "VARCHAR DEFAULT 'hold'",
@@ -61,6 +65,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "status": "VARCHAR DEFAULT 'production'",
         "notes": "TEXT DEFAULT ''",
         "param_hash": "VARCHAR DEFAULT ''",
+        "realistic_metrics": "JSON",
     },
     "top20_trades": {
         "entry_confidence": "FLOAT DEFAULT 0",

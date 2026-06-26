@@ -372,7 +372,10 @@ def _trade_path_curve(closed: list, open_: list, starting_bankroll: float) -> li
 
 
 def _metrics_for(db: Session, strat: Top20Strategy) -> dict:
-    trades = db.scalars(select(Top20Trade).where(Top20Trade.strategy_id == strat.id)).all()
+    # Notional leaderboard EXCLUDES realistic-mode trades (different bankroll
+    # model) so the two simulations never mix into one equity figure.
+    trades = db.scalars(select(Top20Trade).where(
+        Top20Trade.strategy_id == strat.id, Top20Trade.source != "realistic")).all()
     closed = [t for t in trades if t.status == "closed"]
     open_ = [t for t in trades if t.status == "open"]
     # Drawdown/consistency from the true trade path (cumulative realized P&L),
@@ -393,7 +396,8 @@ def snapshot(db: Session) -> int:
     now = datetime.utcnow()
     n = 0
     for strat in db.scalars(select(Top20Strategy)).all():
-        trades = db.scalars(select(Top20Trade).where(Top20Trade.strategy_id == strat.id)).all()
+        trades = db.scalars(select(Top20Trade).where(
+            Top20Trade.strategy_id == strat.id, Top20Trade.source != "realistic")).all()
         closed = [t for t in trades if t.status == "closed"]
         open_ = [t for t in trades if t.status == "open"]
         realized = round(sum(t.realized_pnl for t in closed), 2)
@@ -980,6 +984,57 @@ def replay_backfill_wallets(db: Session, max_wallets: int = 5) -> dict:
 
 def replay_run(db: Session, max_trades: int = 400) -> dict:
     return replay_mod.run(db, max_trades=max_trades)
+
+
+def replay_run_realistic(db: Session) -> dict:
+    """Issue 2 — run the capital-constrained realistic portfolio simulation."""
+    return replay_mod.run_realistic(db)
+
+
+def realistic_view(db: Session) -> dict:
+    rows = [{"id": s.id, "key": s.key, "name": s.name, **(s.realistic_metrics or {})}
+            for s in db.scalars(select(Top20Strategy).order_by(Top20Strategy.id)).all()]
+    return {"paper_only": True, "starting_capital": 10000.0, "strategies": rows}
+
+
+def replay_comparison(db: Session) -> dict:
+    """Notional (unlimited capital) vs realistic ($10k constrained) per strategy,
+    showing how much the notional leaderboard was inflated."""
+    out = []
+    for s in db.scalars(select(Top20Strategy).order_by(Top20Strategy.id)).all():
+        nm = _metrics_for(db, s)            # notional (live+replay, fixed-bankroll)
+        rm = s.realistic_metrics or {}
+        if not rm:
+            continue
+        n_ret = nm.get("total_return", 0.0)
+        r_ret = rm.get("total_return", 0.0)
+        out.append({
+            "key": s.key, "name": s.name,
+            "notional": {"total_return": n_ret, "sharpe": nm.get("sharpe"),
+                         "profit_factor": nm.get("profit_factor"), "max_drawdown": nm.get("max_drawdown"),
+                         "trades": nm.get("closed_positions"), "avg_position_size": nm.get("avg_position_size")},
+            "realistic": {"total_return": r_ret, "sharpe": rm.get("sharpe"),
+                          "profit_factor": rm.get("profit_factor"), "max_drawdown": rm.get("max_drawdown"),
+                          "trades": rm.get("trades"), "rejected_trades": rm.get("rejected_trades"),
+                          "avg_position_size": rm.get("avg_position_size"),
+                          "capital_utilization": rm.get("capital_utilization"),
+                          "kelly_utilization": rm.get("kelly_utilization")},
+            "return_inflation_x": round(n_ret / r_ret, 2) if r_ret not in (0, None) else None,
+        })
+    out.sort(key=lambda r: r["realistic"]["total_return"] or 0, reverse=True)
+    return {"paper_only": True,
+            "note": "notional assumes unlimited capital (fixed $10k bankroll per trade); "
+                    "realistic constrains a single compounding $10k account.",
+            "comparison": out}
+
+
+def replay_reset_realistic(db: Session) -> dict:
+    db.query(Top20FeatureVector).filter(Top20FeatureVector.source == "realistic").delete()
+    db.query(Top20Trade).filter(Top20Trade.source == "realistic").delete()
+    for s in db.scalars(select(Top20Strategy)).all():
+        s.realistic_metrics = {}
+    db.commit()
+    return {"paper_only": True, "reset": "realistic"}
 
 
 def replay_reset(db: Session) -> dict:

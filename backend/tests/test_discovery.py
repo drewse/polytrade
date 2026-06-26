@@ -41,7 +41,9 @@ def test_select_for_backfill_caps_and_prioritizes():
 # --- copyability scoring -----------------------------------------------------
 def _stat(**kw):
     base = dict(num_trades=60, realized_roi=0.25, win_rate=0.68, avg_trade_size=250,
-                recency_score=0.8, consistency=0.7, category_performance={"Crypto": 0.3})
+                recency_score=0.8, consistency=0.7, category_performance={"Crypto": 0.3},
+                # profitable defaults for the new copyability model
+                profit_factor=2.0, expectancy=40.0, sharpe=0.8, max_drawdown=0.15)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -59,6 +61,19 @@ def test_elite_candidate_scores_high():
     assert r.classification in ("elite_candidate", "good_candidate")
     assert r.copyability_score >= 60
     assert not r.suspected_noise
+
+
+def test_high_winrate_loser_never_outranks_profitable_wallet():
+    # the audit example: ~90% win rate but ROI -9%, PF 0.47 -> a money loser.
+    loser = copyability.score_copyability(
+        _stat(realized_roi=-0.09, win_rate=0.90, profit_factor=0.47, expectancy=-5.0),
+        _trades(100, distinct=20))
+    winner = copyability.score_copyability(
+        _stat(realized_roi=0.20, win_rate=0.55, profit_factor=1.8, expectancy=30.0),
+        _trades(100, distinct=20))
+    assert loser.classification == "ignore"          # not good/elite anymore
+    assert loser.copyability_score < 40
+    assert winner.copyability_score > loser.copyability_score
 
 
 def test_tiny_sample_is_insufficient():
@@ -113,7 +128,8 @@ def _seed_wallet(db, addr, n, win_pnl=50, size=250, distinct=12):
     db.flush()
     db.add(WalletStat(wallet_id=w.id, num_trades=n, realized_roi=0.25, win_rate=0.66,
                       avg_trade_size=size, recency_score=0.8, consistency=0.7,
-                      score=70, classification="sharp",
+                      score=70, classification="sharp", profit_factor=2.0,
+                      expectancy=40.0, sharpe=0.8, max_drawdown=0.15,
                       category_performance={"Crypto": 0.3}))
     from app.models import Market
     for i in range(distinct):

@@ -288,6 +288,196 @@ def run(db: Session, max_trades: int = 400) -> dict:
             "checkpoint_trade_id": last_id, "total_feature_vectors": st.feature_vectors}
 
 
+def run_realistic(db: Session, max_signals: int = 100000) -> dict:
+    """REALISTIC PORTFOLIO MODE (Issue 2): each strategy owns a real $10k bankroll.
+
+    Differs from the notional replay in exactly the bankroll model:
+      * Kelly sizes from CURRENT equity (compounding), not a fixed $10k.
+      * Opening a position RESERVES cash; that cash can't be reused until the
+        market resolves (no leverage, no borrowing, no synthetic capital).
+      * If a strategy lacks the cash for the min bet, the trade is REJECTED.
+      * Per-market exposure cap applies against current equity.
+      * Bankroll can never go negative (max loss == reserved stake).
+    Processed in strict chronological order so reservations are time-correct.
+    Deterministic. Stores per-strategy realistic metrics. PAPER ONLY.
+    """
+    from .engine import ensure_strategies, _trade_path_curve
+    from . import analytics
+
+    ensure_strategies(db)
+    # clean prior realistic run (full re-simulation each time)
+    db.query(Top20FeatureVector).filter(Top20FeatureVector.source == "realistic").delete()
+    db.query(Top20Trade).filter(Top20Trade.source == "realistic").delete()
+    db.commit()
+
+    timelines = _build_wallet_timelines(db)
+    strategies = list(db.scalars(select(Top20Strategy).order_by(Top20Strategy.id)).all())
+
+    rows = db.execute(
+        select(Trade, Market).join(Market, Trade.market_id == Market.id)
+        .where(Market.resolved == True, Market.resolved_outcome.is_not(None),  # noqa: E712
+               Market.volume >= MIN_VOLUME, Trade.size >= MIN_SIZE)
+        .order_by(Trade.id)
+    ).all()
+
+    # 1) qualifying signals (point-in-time, no look-ahead)
+    signals = []
+    for trade, market in rows:
+        if market.resolved_at and trade.timestamp and market.resolved_at <= trade.timestamp:
+            continue
+        tl = timelines.get(trade.wallet_id)
+        if tl is None:
+            continue
+        rep = _point_in_time(tl, trade.timestamp)
+        if rep["n"] < MIN_PRIOR_SETTLED or rep["score"] < MIN_SCORE:
+            continue
+        rank = sum(1 for wid, otl in timelines.items()
+                   if wid != trade.wallet_id and _point_in_time(otl, trade.timestamp)["score"] > rep["score"])
+        signals.append((trade, market, rep, rank))
+        if len(signals) >= max_signals:
+            break
+
+    # 2) chronological event timeline: opens at trade time, resolves at resolution
+    events = []
+    seen_markets = {}
+    for idx, (trade, market, rep, rank) in enumerate(signals):
+        events.append((trade.timestamp, 0, idx))                  # 0 = OPEN
+        seen_markets[market.id] = market
+    for mid, m in seen_markets.items():
+        events.append((m.resolved_at or datetime.max, 1, mid))    # 1 = RESOLVE (after opens)
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    # 3) per-strategy capital state
+    START = 10_000.0
+    state = {s.id: {"cash": START, "committed": 0.0, "mkt": {}, "open": {},
+                    "rejected": 0, "taken": 0, "peak_equity": START, "peak_committed": 0.0,
+                    "util_sum": 0.0, "util_n": 0, "kelly_used": []} for s in strategies}
+
+    for _, etype, payload in events:
+        if etype == 0:  # OPEN
+            trade, market, rep, rank = signals[payload]
+            price = float(trade.price or 0.5)
+            edge = round(rep["win_rate"] - price, 4)
+            liq = float(market.volume or 0) or float(market.liquidity or 0)
+            category = categorize(market.question, market.category)
+            ctx = Ctx(wallet_id=trade.wallet_id, classification=_class(rep["score"]),
+                      confidence=rep["score"], edge=edge, liquidity=liq, age_min=0.0,
+                      price=price, outcome=trade.outcome, market_id=market.id, category=category,
+                      win_rate=rep["win_rate"], sharpe=rep["roi"] / 0.3, roi=rep["roi"],
+                      copyability=rep["score"], specialization=0.0, recency=1.0, num_settled=rep["n"])
+            shared = Shared({trade.wallet_id: rank}, {trade.wallet_id: rank}, {trade.wallet_id: rank},
+                            {trade.wallet_id: rank}, 0.0, set())
+            for d in STRATEGIES:
+                strat = next((s for s in strategies if s.key == d.key), None)
+                if strat is None:
+                    continue
+                stt = state[strat.id]
+                admit, _ = decide(d, ctx, shared)
+                if not admit:
+                    continue
+                equity = stt["cash"] + stt["committed"]
+                if equity <= d.sizing.min_bet or stt["cash"] < d.sizing.min_bet:
+                    stt["rejected"] += 1   # bankrupt / no cash
+                    continue
+                p = probability.estimate(probability.ProbFeatures(
+                    market_price=price, edge=edge, win_rate=rep["win_rate"], sharpe=ctx.sharpe,
+                    roi=rep["roi"], confidence=rep["score"], specialization=0.0,
+                    liquidity=liq, num_settled=rep["n"]))
+                res = size_position(d.sizing, price=price, p=p, bankroll=equity,   # <-- CURRENT equity
+                                    market_exposure_used=stt["mkt"].get(market.id, 0.0),
+                                    confidence=rep["score"], edge=edge, quality=rep["score"])
+                if res.stake is None:
+                    continue
+                stake = res.stake
+                # no leverage: cannot stake more than available cash
+                if stake > stt["cash"]:
+                    if stt["cash"] >= d.sizing.min_bet:
+                        stake = round(stt["cash"], 2)
+                    else:
+                        stt["rejected"] += 1
+                        continue
+                shares = round(stake / max(0.01, min(0.99, price)), 4)
+                # reserve capital
+                stt["cash"] -= stake
+                stt["committed"] += stake
+                stt["mkt"][market.id] = stt["mkt"].get(market.id, 0.0) + stake
+                stt["open"].setdefault(market.id, []).append(
+                    {"stake": stake, "shares": shares, "outcome": trade.outcome, "price": price,
+                     "entry_time": trade.timestamp, "p": p, "kelly": res.kelly_fraction,
+                     "mult": d.sizing.kelly_multiplier, "edge": edge, "rank": rank,
+                     "rep": rep, "category": category, "wallet": tl["address"] if (tl := timelines.get(trade.wallet_id)) else "",
+                     "exit_policy": d.exit_policy})
+                stt["taken"] += 1
+                # kelly utilization: actual / uncapped target
+                target = max(1e-9, res.target_fraction * equity)
+                stt["kelly_used"].append(min(1.0, stake / target))
+                eq2 = stt["cash"] + stt["committed"]
+                stt["peak_equity"] = max(stt["peak_equity"], eq2)
+                stt["peak_committed"] = max(stt["peak_committed"], stt["committed"])
+                stt["util_sum"] += stt["committed"] / eq2 if eq2 > 0 else 0
+                stt["util_n"] += 1
+        else:  # RESOLVE
+            mid = payload
+            market = seen_markets[mid]
+            won_outcome = market.resolved_outcome
+            for strat in strategies:
+                stt = state[strat.id]
+                positions = stt["open"].pop(mid, [])
+                for pos in positions:
+                    won = won_outcome == pos["outcome"]
+                    payout = pos["shares"] * (1.0 if won else 0.0)
+                    realized = round(payout - pos["stake"], 2)
+                    # release reservation, bank the payout
+                    stt["committed"] -= pos["stake"]
+                    stt["mkt"][mid] = max(0.0, stt["mkt"].get(mid, 0.0) - pos["stake"])
+                    stt["cash"] += payout
+                    hold = round((market.resolved_at - pos["entry_time"]).total_seconds() / 60.0, 1) \
+                        if market.resolved_at else None
+                    t = Top20Trade(
+                        strategy_id=strat.id, signal_id=None, wallet_address=pos["wallet"],
+                        market_id=mid, market_question=market.question or "", outcome=pos["outcome"],
+                        side="buy", entry_price=round(pos["price"], 4), size_shares=pos["shares"],
+                        stake=pos["stake"], estimated_probability=round(pos["p"], 4),
+                        kelly_fraction=pos["kelly"], fractional_kelly_used=pos["mult"],
+                        sizing_reason="realistic", entry_time=pos["entry_time"], status="closed",
+                        source="realistic", current_price=1.0 if won else 0.0,
+                        exit_price=1.0 if won else 0.0, realized_pnl=realized, unrealized_pnl=0.0,
+                        closed_at=market.resolved_at, holding_minutes=hold, exit_reason="resolved",
+                        entry_confidence=pos["rep"]["score"], entry_edge=pos["edge"], wallet_rank=pos["rank"])
+                    db.add(t)
+    db.commit()
+
+    # 4) per-strategy realistic metrics from the realistic trades
+    out = []
+    for strat in strategies:
+        stt = state[strat.id]
+        trades = db.scalars(select(Top20Trade).where(
+            Top20Trade.strategy_id == strat.id, Top20Trade.source == "realistic")).all()
+        pnls = [t.realized_pnl for t in trades]
+        rets = [t.realized_pnl / t.stake for t in trades if t.stake]
+        curve = _trade_path_curve(trades, [], START)
+        final_eq = round(stt["cash"] + stt["committed"], 2)  # committed==0 at end
+        gross_w = sum(p for p in pnls if p > 0); gross_l = -sum(p for p in pnls if p < 0)
+        pf = round(gross_w / gross_l, 4) if gross_l else (round(min(999, gross_w), 4) if gross_w else 0.0)
+        m = {
+            "final_equity": final_eq, "total_return": round((final_eq - START) / START, 4),
+            "trades": len(trades), "rejected_trades": stt["rejected"],
+            "sharpe": analytics.sharpe(rets), "max_drawdown": analytics.max_drawdown(curve),
+            "profit_factor": pf, "expectancy": round(sum(pnls) / len(pnls), 2) if pnls else 0.0,
+            "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls), 4) if pnls else 0.0,
+            "avg_position_size": round(sum(t.stake for t in trades) / len(trades), 2) if trades else 0.0,
+            "capital_utilization": round(stt["util_sum"] / stt["util_n"], 4) if stt["util_n"] else 0.0,
+            "peak_capital_utilization": round(stt["peak_committed"] / stt["peak_equity"], 4) if stt["peak_equity"] else 0.0,
+            "kelly_utilization": round(sum(stt["kelly_used"]) / len(stt["kelly_used"]), 4) if stt["kelly_used"] else 0.0,
+            "bankrupt": final_eq <= START * 0.01,
+        }
+        strat.realistic_metrics = m
+        out.append({"key": strat.key, "name": strat.name, **m})
+    db.commit()
+    return {"paper_only": True, "mode": "realistic", "signals": len(signals),
+            "strategies": out}
+
+
 def _class(score: float) -> str:
     if score >= 79:
         return "elite_candidate"

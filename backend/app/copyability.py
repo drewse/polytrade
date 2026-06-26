@@ -32,15 +32,29 @@ WATCH = 40.0
 MIN_SETTLED = 8           # need at least this many *resolved* trades to judge edge
 TRUST_SETTLED = 45        # sample size at which we fully trust the numbers
 
+# Redesigned weights (sum = 1.0). Rationale — copyability must reflect whether a
+# wallet ACTUALLY MAKES MONEY, not how often it wins. A high win rate on a 0..1
+# prediction market is cheap (buy favorites at 0.9, win 90% of the time, still
+# lose money on the 10% that miss). So profitability metrics dominate and win
+# rate is heavily de-weighted:
+#   roi 0.28          — the core question: did it make money per dollar risked?
+#   profit_factor 0.20 — gross wins / gross losses; <1 means a net loser. Directly
+#                        catches the "many small wins, few big losses" trap.
+#   sharpe 0.14       — risk-adjusted return; rewards steady edge over lucky spikes.
+#   drawdown 0.10     — penalize wallets that bleed deeply even if they recover.
+#   expectancy 0.08   — average $ P&L per settled position (EV sign + magnitude).
+#   sample 0.08       — more settled positions => more trustworthy.
+#   consistency 0.07  — stable win rate across time, not one hot streak.
+#   win 0.05          — REDUCED from 0.18; a tiebreaker, never the driver.
 WEIGHTS = {
-    "roi": 0.26,
-    "win": 0.18,
-    "consistency": 0.14,
-    "recency": 0.10,
-    "notional": 0.08,
-    "diversity": 0.12,
-    "specialization": 0.06,
-    "sample": 0.06,
+    "roi": 0.28,
+    "profit_factor": 0.20,
+    "sharpe": 0.14,
+    "drawdown": 0.10,
+    "expectancy": 0.08,
+    "sample": 0.08,
+    "consistency": 0.07,
+    "win": 0.05,
 }
 
 
@@ -78,6 +92,11 @@ def score_copyability(stat, trades, min_trade_count: int = 15) -> CopyabilityRes
     consistency = float(getattr(stat, "consistency", 0.0) or 0.0)
     recency = float(getattr(stat, "recency_score", 0.0) or 0.0)
     cats = getattr(stat, "category_performance", {}) or {}
+    # profitability metrics (the new drivers)
+    pf = float(getattr(stat, "profit_factor", 0.0) or 0.0)
+    expectancy = float(getattr(stat, "expectancy", 0.0) or 0.0)
+    sharpe = float(getattr(stat, "sharpe", 0.0) or 0.0)
+    drawdown = float(getattr(stat, "max_drawdown", 0.0) or 0.0)
 
     reasons: list[str] = []
 
@@ -105,32 +124,42 @@ def score_copyability(stat, trades, min_trade_count: int = 15) -> CopyabilityRes
             reasons=reasons,
         )
 
-    # ---- normalized factors (0..1) ----------------------------------------
-    roi_n = _clip(0.5 + roi)                          # -0.5..+0.5 -> 0..1
-    win_n = _clip((win_rate - 0.45) / 0.35)           # 0.45->0, 0.80->1
-    cons_n = _clip(consistency)
-    rec_n = _clip(recency)
-    notional_n = _clip(math.log10(avg_size + 1) / 3.0)
-    diversity_n = _clip(distinct_markets / 20.0)
-    spec = max(cats.values()) if cats else 0.0
-    spec_n = _clip(spec / 0.4)
+    # ---- normalized factors (0..1) — profitability-centric ----------------
+    roi_n = _clip((roi + 0.10) / 0.40)        # ROI -10%->0, +30%->1 (neg ROI ~0)
+    pf_n = _clip((pf - 1.0) / 1.5)            # PF 1.0->0, 2.5->1 (PF<1 -> 0)
+    sharpe_n = _clip((sharpe + 0.2) / 1.2)    # -0.2->0, 1.0->1
+    dd_n = _clip(1.0 - drawdown / 0.5)        # 0% DD->1, 50%+ DD->0
+    exp_n = _clip(expectancy / 100.0)         # $0/pos->0, $100/pos->1
     sample_n = _clip(n_settled / TRUST_SETTLED)
+    cons_n = _clip(consistency)
+    win_n = _clip((win_rate - 0.45) / 0.35)   # 0.45->0, 0.80->1 (reduced weight)
 
     base = (
         WEIGHTS["roi"] * roi_n
-        + WEIGHTS["win"] * win_n
-        + WEIGHTS["consistency"] * cons_n
-        + WEIGHTS["recency"] * rec_n
-        + WEIGHTS["notional"] * notional_n
-        + WEIGHTS["diversity"] * diversity_n
-        + WEIGHTS["specialization"] * spec_n
+        + WEIGHTS["profit_factor"] * pf_n
+        + WEIGHTS["sharpe"] * sharpe_n
+        + WEIGHTS["drawdown"] * dd_n
+        + WEIGHTS["expectancy"] * exp_n
         + WEIGHTS["sample"] * sample_n
+        + WEIGHTS["consistency"] * cons_n
+        + WEIGHTS["win"] * win_n
     )
     score = 100.0 * base
 
     # ---- small-sample shrinkage toward neutral (50) -----------------------
     trust = _clip(n_settled / TRUST_SETTLED)
     score = 50.0 + (score - 50.0) * (0.45 + 0.55 * trust)
+
+    # ---- PROFITABILITY GATE (authoritative) -------------------------------
+    # A wallet that loses money must never outrank a profitable one. Any of
+    # negative ROI, profit factor < 1, or non-positive expectancy caps the
+    # score below the watchlist floor (=> at most 'ignore'), regardless of how
+    # high its win rate is.
+    unprofitable = roi < 0 or pf < 1.0 or expectancy <= 0
+    if unprofitable:
+        score = min(score, WATCH - 1.0)  # <40 -> ignore tier
+        reasons.append(
+            f"unprofitable: ROI {roi*100:.1f}%, PF {pf:.2f}, expectancy ${expectancy:.0f}")
 
     # ---- too-good-to-be-true ---------------------------------------------
     if win_rate > 0.9 and n_settled < 25:
@@ -143,18 +172,17 @@ def score_copyability(stat, trades, min_trade_count: int = 15) -> CopyabilityRes
 
     score = round(_clip(score, 0.0, 100.0), 1)
 
-    # ---- positive descriptors --------------------------------------------
+    # ---- descriptors ------------------------------------------------------
     if roi > 0.15:
         reasons.append(f"strong ROI ({roi*100:.0f}%)")
-    if win_rate >= 0.6 and not suspected_noise:
-        reasons.append(f"solid win rate ({win_rate*100:.0f}%)")
-    if distinct_markets >= 12:
-        reasons.append(f"diversified across {distinct_markets} markets")
-    if spec > 0.2:
-        best = max(cats, key=cats.get)
-        reasons.append(f"specialist edge in {best} ({cats[best]*100:.0f}%)")
-    if recency > 0.6:
-        reasons.append("recently active")
+    if pf >= 1.5:
+        reasons.append(f"profit factor {pf:.2f}")
+    if sharpe >= 0.4:
+        reasons.append(f"solid Sharpe ({sharpe:.2f})")
+    if drawdown > 0.4:
+        reasons.append(f"deep drawdown ({drawdown*100:.0f}%)")
+    if win_rate >= 0.6 and roi > 0:
+        reasons.append(f"win rate {win_rate*100:.0f}%")
 
     classification = classify(score, suspected_noise)
     if not reasons:
