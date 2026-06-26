@@ -215,14 +215,24 @@ class DryRunExecutor:
 
 
 class PolymarketExecutor:
-    """REAL order submission via the official py-clob-client. Fail-closed.
+    """REAL order submission via the official py-clob-client (verified against
+    v0.34.6). Fail-closed.
+
+    AUTH IS TWO-TIER (both required):
+      * L1 — the funded wallet PRIVATE KEY, used to SIGN orders.
+      * L2 — Relayer/CLOB API credentials (api_key/api_secret/api_passphrase),
+        used to AUTHENTICATE posting orders. If provided via env they're used
+        directly; otherwise they are derived from the L1 key as a fallback.
 
     Required env (read at order time, never stored/logged):
-      POLYMARKET_PRIVATE_KEY   funded wallet key (operator's)
-      POLYMARKET_CLOB_HOST     default https://clob.polymarket.com
-      POLYMARKET_CHAIN_ID      default 137 (Polygon)
-      POLYMARKET_SIGNATURE_TYPE 0=EOA (default), 1=email/magic, 2=proxy  [OPERATOR VERIFY for your wallet type]
-      POLYMARKET_FUNDER        proxy/funder address (only if signature_type != 0)
+      POLYMARKET_PRIVATE_KEY      funded wallet key (operator's)            [L1, required]
+      POLYMARKET_API_KEY          Relayer API key                          [L2, recommended]
+      POLYMARKET_API_SECRET       Relayer API secret                       [L2]
+      POLYMARKET_API_PASSPHRASE   Relayer API passphrase                   [L2]
+      POLYMARKET_CLOB_HOST        default https://clob.polymarket.com
+      POLYMARKET_CHAIN_ID         default 137 (Polygon)
+      POLYMARKET_SIGNATURE_TYPE   0=EOA (default), 1=email/magic, 2=proxy  [VERIFY for your wallet]
+      POLYMARKET_FUNDER           proxy/funder address (only if signature_type != 0)
     """
     name = "polymarket"
 
@@ -233,7 +243,7 @@ class PolymarketExecutor:
             raise ExecutionRejected("POLYMARKET_PRIVATE_KEY not set")
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
         except Exception as exc:  # noqa: BLE001
             raise ExecutionRejected(f"py-clob-client not installed: {exc}")
@@ -247,22 +257,30 @@ class PolymarketExecutor:
         chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
         funder = os.getenv("POLYMARKET_FUNDER") or None
+        # L2 creds: use the operator's exported Relayer credentials if present,
+        # else derive them from the L1 key.
+        api_key = os.getenv("POLYMARKET_API_KEY")
+        api_secret = os.getenv("POLYMARKET_API_SECRET")
+        api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE")
+        provided = ApiCreds(api_key=api_key, api_secret=api_secret,
+                            api_passphrase=api_passphrase) if (api_key and api_secret and api_passphrase) else None
         try:
-            client = ClobClient(host, key=key, chain_id=chain_id,
+            client = ClobClient(host, key=key, chain_id=chain_id, creds=provided,
                                 signature_type=sig_type, funder=funder)
-            client.set_api_creds(client.create_or_derive_api_creds())
-        except Exception as exc:  # noqa: BLE001  (auth failure -> reject)
+            if provided is None:                       # fall back to derive-from-key
+                client.set_api_creds(client.create_or_derive_api_creds())
+            client.assert_level_2_auth()               # fail now if L2 auth is incomplete
+        except ExecutionRejected:
+            raise
+        except Exception as exc:  # noqa: BLE001  (auth failure -> reject, never place)
             raise ExecutionRejected(f"auth/init failed: {exc}")
 
-        # tick size + current book (best ask for a buy)
-        try:
-            tick = float(client.get_tick_size(token_id))
-        except Exception:  # noqa: BLE001
-            tick = 0.01
+        # current book — best ask for a buy; tick size comes from the book summary
         try:
             book = client.get_order_book(token_id)
             asks = getattr(book, "asks", None) or []
             best_ask = min((float(a.price) for a in asks), default=None)
+            tick = float(getattr(book, "tick_size", None) or 0.01)
         except Exception as exc:  # noqa: BLE001
             raise ExecutionRejected(f"order book fetch failed: {exc}")
         if best_ask is None or best_ask <= 0:
@@ -466,6 +484,11 @@ def status(db: Session) -> dict:
         "executor": cfg.executor,
         "real_orders_placed": _order_count(db, "polymarket"),
         "orders_this_executor": _order_count(db, cfg.executor),
+        "auth": {  # two-tier: L1 private key (sign) + L2 Relayer api creds (post)
+            "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
+            "l2_api_creds_present": all(os.getenv(k) for k in (
+                "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")),
+        },
         "strategy_copied": cfg.strategy,
         "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
                    "min_stake": cfg.min_stake, "no_compounding": True, "no_leverage": True},
