@@ -440,6 +440,8 @@ class LiveExecution(Base):
     fill_outcome: Mapped[str | None] = mapped_column(String(28), nullable=True)   # filled|partially_filled_cancelled|unfilled_cancelled|submit_error|cancel_error|simulated
     venue_error: Mapped[str | None] = mapped_column(Text, nullable=True)          # FULL untruncated venue error text
     requested_size_usd: Mapped[float | None] = mapped_column(Float, nullable=True)  # intended stake (size_usd = filled)
+    tick_size: Mapped[float | None] = mapped_column(Float, nullable=True)          # venue book tick used for the decision
+    min_order_size: Mapped[float | None] = mapped_column(Float, nullable=True)     # venue book min order size (shares) used
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     bankroll_before: Mapped[float] = mapped_column(Float, default=0.0)
     bankroll_after: Mapped[float | None] = mapped_column(Float, nullable=True)

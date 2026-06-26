@@ -441,22 +441,31 @@ class _FakeClient:
     """Mocks ONLY the network calls of py-clob-client-v2; the executor's own logic
     (limit pricing, TTL, fill check, cancel) runs for real against it. Mirrors the
     v2 API: get_tick_size, dict order book, OrderArgsV2, cancel_orders([id])."""
-    def __init__(self, *, ask, tick=0.01, get_order=None, post_resp=None,
-                 post_exc=None, cancel_exc=None):
+    def __init__(self, *, ask, tick=0.01, book_tick=None, book_min=None, get_order=None,
+                 post_resp=None, post_exc=None, cancel_exc=None):
         self.ask = ask
-        self.tick = tick
+        self.tick = tick                  # value returned by get_tick_size() fallback
+        self.book_tick = book_tick        # tick_size present IN the book response (or None)
+        self.book_min = book_min          # min_order_size present IN the book response (or None)
         self._get_order = get_order
         self._post_resp = post_resp or {"orderID": "oid-1", "status": "live"}
         self._post_exc = post_exc
         self._cancel_exc = cancel_exc
+        self.tick_size_calls = 0
         self.posted = []          # OrderArgsV2 submitted
         self.cancelled = []       # order ids cancelled
 
     def get_tick_size(self, token_id):
+        self.tick_size_calls += 1
         return str(self.tick)
 
     def get_order_book(self, token_id):
-        return {"asks": [{"price": str(self.ask), "size": "1000"}]}   # v2: raw dict
+        book = {"asks": [{"price": str(self.ask), "size": "1000"}]}   # v2: raw dict
+        if self.book_tick is not None:
+            book["tick_size"] = str(self.book_tick)
+        if self.book_min is not None:
+            book["min_order_size"] = str(self.book_min)
+        return book
 
     def create_order(self, order_args, options=None):
         self.posted.append(order_args)
@@ -631,3 +640,51 @@ def test_sdk_info_reports_v2(monkeypatch):
     info = live.sdk_info()
     assert info["sdk_package"] == "py-clob-client-v2" and info["clob_api_mode"] == "v2"
     assert info["collateral"] == "USDC" and info["v2_sdk_installed"] is True
+
+
+# --- venue-provided book metadata (tick_size / min_order_size) ---------------
+def test_book_tick_size_overrides_get_tick_size(in_memory_db, monkeypatch):
+    # 1. book.tick_size (0.001) is used for flooring; get_tick_size() NOT called
+    fake = _FakeClient(ask=0.48, tick=0.01, book_tick=0.001,
+                       get_order={"size_matched": 999, "status": "matched"})
+    res = _place(monkeypatch, in_memory_db, fake, price=0.505)
+    assert res.outcome == "filled"
+    assert res.tick_size == 0.001                 # book tick recorded
+    assert res.limit_price == 0.505               # floored on 0.001 grid (0.01 would give 0.50)
+    assert fake.tick_size_calls == 0              # fallback never consulted
+
+
+def test_book_min_order_size_enforced(in_memory_db, monkeypatch):
+    # 2. book.min_order_size (5 shares) rejects a sub-minimum order, fail closed
+    fake = _FakeClient(ask=0.48, book_tick=0.01, book_min=5,
+                       get_order={"size_matched": 999, "status": "matched"})
+    with pytest.raises(ExecutionRejected) as ei:
+        _place(monkeypatch, in_memory_db, fake, price=0.50)   # 1.10/0.50 = 2.2 shares < 5
+    assert "min_order_size" in str(ei.value) and "shares" in str(ei.value)
+    assert not fake.posted                         # never submitted
+    assert live._categorize_rejection(str(ei.value)) == "no_capital"
+
+
+def test_missing_book_metadata_falls_back_safely(in_memory_db, monkeypatch):
+    # 3. no tick_size/min_order_size in book -> get_tick_size() + config notional floor
+    fake = _FakeClient(ask=0.48, tick=0.01,        # book_tick/book_min default None
+                       get_order={"size_matched": 999, "status": "matched"})
+    res = _place(monkeypatch, in_memory_db, fake, price=0.50)
+    assert res.outcome == "filled"
+    assert res.tick_size == 0.01 and fake.tick_size_calls == 1   # fallback used
+    assert res.min_order_size is None              # fell back to config.min_stake
+
+
+def test_used_tick_and_min_size_logged_on_execution(in_memory_db, monkeypatch):
+    # 4. the tick/min used are recorded on the execution decision row
+    fake = _FakeClient(ask=0.18, book_tick=0.01, book_min=5,
+                       get_order={"size_matched": 999, "status": "matched"})
+    monkeypatch.setattr(live.PolymarketExecutor, "_build_client", lambda self, key: fake)
+    _poly_cfg(monkeypatch)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    m = _market(in_memory_db, "mtick")
+    ex = live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=77,
+                             market=m, outcome="Yes", price=0.20, entry_reason="copy")
+    # 1.10/0.20 = 5.5 shares >= 5 -> fills, and the venue metadata is persisted
+    assert ex.status == "open" and ex.fill_outcome == "filled"
+    assert ex.tick_size == 0.01 and ex.min_order_size == 5.0

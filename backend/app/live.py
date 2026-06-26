@@ -376,6 +376,8 @@ class OrderResult:
     order_latency_ms: float
     confirm_latency_ms: float
     venue_error: str | None = None
+    tick_size: float | None = None        # venue book tick used (or fallback)
+    min_order_size: float | None = None   # venue book min order size (shares) used
 
 
 def _full_err(exc: Exception) -> str:
@@ -534,11 +536,17 @@ class PolymarketExecutor:
 
         client = self._build_client(key)
 
-        # tick + book. v2 get_order_book returns a raw DICT (asks=[{price,size}]);
-        # tick comes from get_tick_size. Parsed defensively (dict OR object).
+        # v2 get_order_book returns a raw DICT that also carries tick_size +
+        # min_order_size (shares). Prefer those venue-provided values; fall back to
+        # get_tick_size() and the config notional floor only when absent.
         try:
-            tick = float(client.get_tick_size(token_id))
             book = client.get_order_book(token_id)
+            book_tick = book.get("tick_size") if isinstance(book, dict) else None
+            book_min = book.get("min_order_size") if isinstance(book, dict) else None
+            if book_tick is not None:
+                tick, tick_src = float(book_tick), "book"
+            else:
+                tick, tick_src = float(client.get_tick_size(token_id)), "get_tick_size"
             asks = (book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)) or []
             best_ask = min((_ask_price(a) for a in asks), default=None)
         except Exception as exc:  # noqa: BLE001
@@ -547,14 +555,31 @@ class PolymarketExecutor:
         if best_ask is None or best_ask <= 0:
             raise ExecutionRejected("no asks / empty book")
 
+        # venue minimum (shares) when the book provides it; else the config floor.
+        min_shares = float(book_min) if book_min is not None else None
+        min_src = "book.min_order_size" if min_shares is not None else "config.min_stake"
+
         # LIMIT AT REFERENCE — never chase. Floor the reference to the tick grid so
         # the limit never EXCEEDS the reference (we accept reference or better only).
         import math
         reference = float(price)
         limit_price = round(min(0.99, max(tick, math.floor(reference / tick) * tick)), 4)
         shares = round(size_usd / limit_price, 2)
-        # PRESERVED min-order-size gate
-        if shares <= 0 or shares * limit_price < cfg.min_stake:
+
+        # log the venue metadata used for THIS execution decision
+        print(f"[live] exec token={token_id[:14]}… ref={reference} tick={tick}({tick_src}) "
+              f"limit={limit_price} shares={shares} "
+              f"min={min_shares if min_shares is not None else cfg.min_stake}({min_src})")
+
+        # MIN-ORDER-SIZE gate (fail closed). Venue min is in SHARES; the config
+        # fallback is a USD notional. No sizing change — validate only.
+        if shares <= 0:
+            raise ExecutionRejected("below min order size (0 shares)")
+        if min_shares is not None:
+            if shares < min_shares:
+                raise ExecutionRejected(
+                    f"below venue min_order_size ({shares} < {min_shares} shares)")
+        elif shares * limit_price < cfg.min_stake:
             raise ExecutionRejected(f"below min order size (${shares*limit_price:.2f})")
 
         # SUBMIT a GTC limit at the reference; we manage TTL + cancel ourselves
@@ -602,7 +627,7 @@ class PolymarketExecutor:
             return OrderResult(outcome="filled", fill_price=limit_price, limit_price=limit_price,
                                filled_usd=round(shares * limit_price, 2), filled_shares=shares,
                                fees=0.0, order_id=order_id, order_latency_ms=latency,
-                               confirm_latency_ms=latency)
+                               confirm_latency_ms=latency, tick_size=tick, min_order_size=min_shares)
         if none_:
             if cancel_err:
                 raise ExecutionRejected(f"cancel_error: {cancel_err}", outcome="cancel_error",
@@ -616,7 +641,7 @@ class PolymarketExecutor:
                            limit_price=limit_price, filled_usd=round(filled * limit_price, 2),
                            filled_shares=filled, fees=0.0, order_id=order_id,
                            order_latency_ms=latency, confirm_latency_ms=latency,
-                           venue_error=cancel_err)
+                           venue_error=cancel_err, tick_size=tick, min_order_size=min_shares)
 
 
 def _token_id_for(market: Market, outcome: str) -> str | None:
@@ -703,6 +728,7 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         slippage=round((result.fill_price - price) / price, 4) if price else 0.0,
         fees=round(result.fees, 4), size_usd=filled_usd, requested_size_usd=stake,
         shares=round(result.filled_shares, 4), fill_outcome=result.outcome,
+        tick_size=result.tick_size, min_order_size=result.min_order_size,
         venue_error=result.venue_error, order_id=result.order_id,
         order_latency_ms=result.order_latency_ms, confirm_latency_ms=result.confirm_latency_ms,
         status="open", entry_reason=entry_reason, bankroll_before=st.bankroll)
@@ -789,7 +815,7 @@ def _categorize_rejection(reason: str, outcome: str | None = None) -> str:
         return "geoblocked"
     if "slippage" in r:
         return "slippage"
-    if "no capital" in r or "below min" in r or "min order" in r:
+    if "no capital" in r or "below min" in r or "min order" in r or "min_order_size" in r:
         return "no_capital"
     if any(k in r for k in ("exec:", "submit", "auth", "book", "token_id",
                             "not installed", "not filled", "error", "sdk")):
@@ -1080,6 +1106,7 @@ def list_executions(db: Session, limit: int = 100) -> list[dict]:
         "outcome": e.outcome, "side": e.side, "expected_price": e.expected_price,
         "limit_price": e.limit_price, "fill_price": e.fill_price, "slippage": e.slippage,
         "fees": e.fees, "size_usd": e.size_usd, "requested_size_usd": e.requested_size_usd,
+        "tick_size": e.tick_size, "min_order_size": e.min_order_size,
         "shares": e.shares, "order_id": e.order_id,
         "order_latency_ms": e.order_latency_ms, "confirm_latency_ms": e.confirm_latency_ms,
         "status": e.status, "fill_outcome": e.fill_outcome, "venue_error": e.venue_error,
