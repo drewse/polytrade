@@ -13,9 +13,11 @@ import Markets from './pages/Markets.jsx'
 import Discovery from './pages/Discovery.jsx'
 import Backtests from './pages/Backtests.jsx'
 import Settings from './pages/Settings.jsx'
+import LiveTrading from './pages/LiveTrading.jsx'
 
 const NAV = [
   { to: '/overview', label: 'Overview' },
+  { to: '/live-trading', label: 'Live Trading' },
   { to: '/top-20', label: 'TOP 20' },
   { to: '/portfolio', label: 'Portfolio' },
   { to: '/research', label: 'Research' },
@@ -99,6 +101,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           <Route path="/overview" element={<Overview />} />
+          <Route path="/live-trading" element={<LiveTrading />} />
           <Route path="/top-20" element={<Top20 />} />
           <Route path="/portfolio" element={<Portfolio />} />
           <Route path="/research" element={<Research />} />

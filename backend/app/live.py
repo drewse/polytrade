@@ -774,16 +774,30 @@ def run_pipeline(db: Session, place: bool = True) -> dict:
 
 
 def signal_decisions(db: Session, limit: int = 100) -> list[dict]:
-    """Recent per-signal decision audit rows (newest first) — the execution trail."""
+    """Recent per-signal decision audit rows (newest first) — the execution trail.
+    Read-only; joins the originating signal -> market for display context."""
+    from .models import PaperSignal
     rows = db.scalars(select(LiveSignalDecision).order_by(
         LiveSignalDecision.created_at.desc()).limit(limit)).all()
-    return [{
-        "id": d.id, "created_at": d.created_at.isoformat() if d.created_at else None,
-        "signal_id": d.signal_id, "status": d.status, "category": d.category,
-        "reason": d.reason, "wallet": d.wallet_address, "edge": d.edge,
-        "confidence": d.confidence, "production_score": d.production_score,
-        "gates": d.gates or {}, "execution_id": d.execution_id,
-    } for d in rows]
+    sigs = {s.id: s for s in db.scalars(select(PaperSignal).where(
+        PaperSignal.id.in_([d.signal_id for d in rows]))).all()} if rows else {}
+    mkts = {m.id: m for m in db.scalars(select(Market).where(
+        Market.id.in_({s.market_id for s in sigs.values()}))).all()} if sigs else {}
+    out = []
+    for d in rows:
+        s = sigs.get(d.signal_id)
+        m = mkts.get(s.market_id) if s else None
+        out.append({
+            "id": d.id, "created_at": d.created_at.isoformat() if d.created_at else None,
+            "signal_id": d.signal_id, "status": d.status, "category": d.category,
+            "reason": d.reason, "wallet": d.wallet_address, "edge": d.edge,
+            "confidence": d.confidence, "production_score": d.production_score,
+            "gates": d.gates or {}, "execution_id": d.execution_id,
+            "market_id": (s.market_id if s else None),
+            "market": (m.question if m else None),
+            "outcome": (s.outcome if s else None),
+        })
+    return out
 
 
 def reconcile(db: Session, reported_balance: float, tolerance: float = 0.50) -> dict:

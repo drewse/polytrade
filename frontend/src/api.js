@@ -110,6 +110,16 @@ export const api = {
   researchRegimes: () => request('/api/research/regimes'),
   trackCandidate: (address) => request(`/api/discovery/candidates/${address}/track`, { method: 'POST' }),
   ignoreCandidate: (address) => request(`/api/discovery/candidates/${address}/ignore`, { method: 'POST' }),
+  // live real-money executor (monitoring + safe controls; NO enable-trading control)
+  liveStatus: () => request('/api/live/status'),
+  liveExecutions: (limit = 50) => request(`/api/live/executions?limit=${limit}`),
+  liveDecisions: (limit = 100) => request(`/api/live/decisions?limit=${limit}`),
+  liveRanking: (limit = 20) => request(`/api/live/wallet-ranking?limit=${limit}`),
+  liveHalt: (reason = 'manual') =>
+    request(`/api/live/halt?reason=${encodeURIComponent(reason)}`, { method: 'POST' }),
+  liveResume: () => request('/api/live/resume', { method: 'POST' }),
+  liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
+  liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),
 }
 
 export const COPY_CLASS = {
