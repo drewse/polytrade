@@ -446,6 +446,10 @@ def process_new_signals(db: Session, limit: int = 20) -> dict:
     if not cfg.enabled:
         return {"enabled": False, "placed": 0}
     from .models import PaperSignal, Wallet
+    from . import live_ranking
+    # PRODUCTION wallet selection: only copy wallets that pass the profitability
+    # filters and rank in the top-N by production_rank_score (NOT raw copyability).
+    eligible = live_ranking.eligible_addresses(db)
     recent = db.scalars(select(PaperSignal).where(
         PaperSignal.created_at >= datetime.utcnow() - timedelta(hours=2))
         .order_by(PaperSignal.created_at.desc()).limit(limit)).all()
@@ -460,6 +464,8 @@ def process_new_signals(db: Session, limit: int = 20) -> dict:
         w = db.get(Wallet, s.wallet_id)
         m = db.get(Market, s.market_id)
         if not (w and m) or m.resolved:
+            continue
+        if w.address not in eligible:            # production ranking gate
             continue
         ex = process_signal(db, strategy_key=cfg.strategy, wallet=w.address, signal_id=s.id,
                             market=m, outcome=s.outcome, price=float(s.observed_price or 0.5),
@@ -502,6 +508,8 @@ def status(db: Session) -> dict:
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
         "strategy_copied": cfg.strategy,
+        "wallet_selection": "production_rank_score (40% reputation, 30% PF, 20% ROI, "
+                            "10% recency; filters ROI>0, PF>1.20) — see /api/live/wallet-ranking",
         "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
                    "min_stake": cfg.min_stake, "no_compounding": True, "no_leverage": True},
         "limits_usd": {"max_position": cfg.position_usd, "max_total_risk": cfg.max_total_risk,

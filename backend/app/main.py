@@ -338,6 +338,14 @@ def live_executions(limit: int = 100, db: Session = Depends(get_db)) -> dict:
     return {"executions": live.list_executions(db, limit)}
 
 
+@app.get("/api/live/wallet-ranking")
+def live_wallet_ranking(limit: int = 20, db: Session = Depends(get_db)) -> dict:
+    """Production wallet ranking (profitability-first) used to select live trades.
+    Exposes both copyability (legacy) and production_rank_score (new)."""
+    from . import live_ranking
+    return live_ranking.ranking_view(db, limit)
+
+
 @app.post("/api/live/reconcile", response_model=MessageOut)
 def live_reconcile(balance: float, db: Session = Depends(get_db)) -> MessageOut:
     """Reconcile computed bankroll against the venue-reported balance."""
