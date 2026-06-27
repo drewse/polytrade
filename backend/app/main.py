@@ -444,6 +444,24 @@ def live_shadow_portfolio(limit: int = 200, db: Session = Depends(get_db)) -> Me
     return MessageOut(message="shadow portfolio", detail=shadow.shadow_portfolio(db, limit=limit))
 
 
+@app.get("/api/live/discovery-candidates", response_model=MessageOut)
+def live_discovery_candidates(limit: int = 300, db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY: wallets discovered from leaderboards / top holders / recent
+    trades, with backfill priority + eligibility status. Discovering a wallet
+    never makes it tradable or changes production eligibility."""
+    from . import discovery2
+    return MessageOut(message="discovery candidates", detail=discovery2.discovery_candidates(db, limit=limit))
+
+
+@app.post("/api/live/discovery/refresh", response_model=MessageOut)
+def live_discovery_refresh(db: Session = Depends(get_db)) -> MessageOut:
+    """Fetch Polymarket leaderboard + top-holder wallets into the discovery queue.
+    Writes ONLY discovery metadata (discovery_sources) — never Wallet/WalletStat,
+    so production eligibility, ranking, sizing, and live trading are unchanged."""
+    from . import discovery2
+    return MessageOut(message="discovery refreshed", detail=discovery2.refresh_discovery(db))
+
+
 @app.get("/api/live/auth-check", response_model=MessageOut)
 def live_auth_check() -> MessageOut:
     """READ-ONLY: validate the live API credentials with one authenticated GET

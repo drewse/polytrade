@@ -490,6 +490,32 @@ class LiveSignalDecision(Base):
     execution_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # -> LiveExecution
 
 
+class DiscoverySource(Base):
+    """Where a wallet was discovered + its backfill priority (Discovery 2.0).
+
+    Read-mostly DISCOVERY metadata only. Registering a wallet here does NOT make
+    it tradable or production-eligible — eligibility still requires WalletStat +
+    the (unchanged) production ranking. One row per (wallet, source, detail);
+    refresh upserts. Future similar-wallet/leader-follower graph sources can reuse
+    the same table by adding new discovery_source values."""
+
+    __tablename__ = "discovery_sources"
+    __table_args__ = (UniqueConstraint("wallet_address", "discovery_source", "source_detail",
+                                       name="uq_discovery_source"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    wallet_address: Mapped[str] = mapped_column(String(64), index=True)
+    discovery_source: Mapped[str] = mapped_column(String(40), index=True)  # profit_leaderboard|volume_leaderboard|top_holders|recent_trades
+    source_detail: Mapped[str] = mapped_column(String(80), default="")     # profit_30d | profit_7d | volume_30d | holders:<mkt> | recent
+    source_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    discovery_score: Mapped[float] = mapped_column(Float, default=0.0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    needs_backfill: Mapped[bool] = mapped_column(Boolean, default=True)
+    backfill_priority: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+
 class ReplayState(Base):
     """Singleton (id=1) checkpoint for the historical replay engine — supports
     resume / incremental replay so we never restart from scratch. PAPER ONLY."""

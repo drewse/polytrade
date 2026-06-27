@@ -3,6 +3,7 @@ import { api, fmt } from '../api'
 import { Loading, Empty, WalletLink } from '../components/common.jsx'
 import PromotionCandidates from './PromotionCandidates.jsx'
 import ShadowPortfolio from './ShadowPortfolio.jsx'
+import DiscoveryCandidates from './DiscoveryCandidates.jsx'
 
 const REFRESH_MS = 10000
 
@@ -219,10 +220,12 @@ export default function LiveTrading() {
         <button className={`tab ${tab === 'dashboard' ? 'active' : ''}`} onClick={() => setTab('dashboard')}>Dashboard</button>
         <button className={`tab ${tab === 'promotion' ? 'active' : ''}`} onClick={() => setTab('promotion')}>Promotion Candidates</button>
         <button className={`tab ${tab === 'shadow' ? 'active' : ''}`} onClick={() => setTab('shadow')}>Shadow Portfolio</button>
+        <button className={`tab ${tab === 'discovery' ? 'active' : ''}`} onClick={() => setTab('discovery')}>Discovery Candidates</button>
       </div>
 
       {tab === 'promotion' && <PromotionCandidates />}
       {tab === 'shadow' && <ShadowPortfolio />}
+      {tab === 'discovery' && <DiscoveryCandidates />}
 
       {tab === 'dashboard' && <>
       {/* ---- trading control state ---- */}
