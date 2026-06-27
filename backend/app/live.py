@@ -110,6 +110,14 @@ def _configured_funder() -> str | None:
     return os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS") or _DEFAULT_FUNDER
 
 
+def _manual_l2_creds_present() -> bool:
+    """Whether all three L2 API creds are configured (so we use the account's own
+    creds instead of deriving from the key). Returns a BOOLEAN only — the secret
+    and passphrase values are never read into any output/log."""
+    return all(os.getenv(k) for k in
+               ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE"))
+
+
 def wallet_check() -> dict:
     """Pre-flight wallet configuration diagnostic. Derives the EOA from the
     private key and compares it to the configured funder, so we know whether the
@@ -1077,10 +1085,12 @@ def status(db: Session) -> dict:
         "executor": cfg.executor,
         "real_orders_placed": _order_count(db, "polymarket"),
         "orders_this_executor": _order_count(db, cfg.executor),
-        "auth": {  # L1 = private key (signs); L2 secret/passphrase are DERIVED from it
+        "auth": {  # L1 = private key (signs). L2 = manual API creds if all 3 set, else derived.
             "py_clob_client_installed": py_clob_installed(),   # v2 SDK present
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
-            "l2_creds_source": "derived_from_private_key",  # UI never exposes secret/passphrase
+            # booleans only — NEVER expose the secret/passphrase values
+            "l2_manual_creds_present": _manual_l2_creds_present(),
+            "l2_creds_source": "manual_api_creds" if _manual_l2_creds_present() else "derived_from_private_key",
             "funder": _configured_funder() or "(defaults to signer EOA)",
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
