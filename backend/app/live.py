@@ -375,8 +375,42 @@ def resume(db: Session) -> dict:
 
 def halt(db: Session, reason: str = "manual") -> dict:
     st = get_state(db)
-    _trip_halt(db, st, reason)
-    return {"halted": True, "reason": reason}
+    _trip_halt(db, st, f"halted (manual): {reason}" if reason != "manual" else "halted (manual)")
+    return {"halted": True, "reason": st.halt_reason}
+
+
+def pause(db: Session) -> dict:
+    """Manual pause — same latch as halt, distinct reason so the UI can show a
+    'paused' (operator-initiated) state vs a safety-tripped 'halted'."""
+    st = get_state(db)
+    _trip_halt(db, st, "paused (manual)")
+    return {"halted": True, "reason": st.halt_reason}
+
+
+def _trading_state(cfg: LiveConfig, st: LiveState, real_orders: int) -> str:
+    """Single derived state for the dashboard:
+    running | paused | halted | max_orders_reached | error."""
+    if st.halted:
+        r = (st.halt_reason or "").lower()
+        if "max order" in r or "one-order" in r:
+            return "max_orders_reached"
+        if "error" in r:
+            return "error"
+        if "pause" in r:
+            return "paused"
+        return "halted"
+    if not cfg.enabled:
+        return "paused"
+    if cfg.max_orders > 0 and real_orders >= cfg.max_orders:
+        return "max_orders_reached"
+    return "running"
+
+
+def _latest_venue_error(db: Session) -> str | None:
+    """Most recent captured venue error (full text), for the dashboard."""
+    e = db.scalar(select(LiveExecution).where(LiveExecution.venue_error.is_not(None))
+                  .order_by(LiveExecution.created_at.desc()))
+    return e.venue_error if e else None
 
 
 # ---------------------------------------------------------------------------
@@ -1122,11 +1156,15 @@ def status(db: Session) -> dict:
     st = get_state(db)
     open_ = _open(db)
     now = datetime.utcnow()
+    real_orders = _order_count(db, "polymarket")
     return {
         "paper_trading_default": True,
         "live_trading_enabled": cfg.enabled,
         "executor": cfg.executor,
-        "real_orders_placed": _order_count(db, "polymarket"),
+        "trading_state": _trading_state(cfg, st, real_orders),   # running|paused|halted|max_orders_reached|error
+        "real_orders_placed": real_orders,
+        "max_real_orders": cfg.max_orders,
+        "latest_venue_error": _latest_venue_error(db),
         "orders_this_executor": _order_count(db, cfg.executor),
         "auth": {  # L1 = private key (signs). L2 = manual API creds if all 3 set, else derived.
             "py_clob_client_installed": py_clob_installed(),   # v2 SDK present

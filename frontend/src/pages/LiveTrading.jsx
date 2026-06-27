@@ -8,20 +8,27 @@ const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '—')
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
 
-// ---- overall live-state pill (🟢 / 🟡 / 🔴 / ⚠️) -------------------------
+// ---- overall live-state pill — driven by backend trading_state -----------
+const STATE_MAP = {
+  running: { emoji: '🟢', label: 'Running', tone: 'pos' },
+  paused: { emoji: '🟡', label: 'Paused', tone: 'warn' },
+  halted: { emoji: '🔴', label: 'Halted', tone: 'neg' },
+  max_orders_reached: { emoji: '🟡', label: 'Max orders reached', tone: 'warn' },
+  error: { emoji: '🔴', label: 'Error', tone: 'neg' },
+}
 function liveState(s) {
   if (!s) return { emoji: '…', label: 'Loading', tone: 'muted', detail: '' }
-  if (s.state?.halted) return { emoji: '🔴', label: 'Halted', tone: 'neg', detail: s.state.halt_reason || '' }
   const real = s.executor === 'polymarket'
   const misconfig =
     !s.wallet_check?.configuration_valid ||
     (real && (!s.auth?.py_clob_client_installed || !s.auth?.l1_private_key_present))
   if (misconfig) return { emoji: '⚠️', label: 'Misconfigured', tone: 'warn', detail: s.wallet_check?.note || 'check wallet/auth config' }
-  if (!s.live_trading_enabled) return { emoji: '🟡', label: 'Live trading disabled', tone: 'warn', detail: 'LIVE_TRADING_ENABLED is false' }
-  if (s.max_orders > 0 && s.real_orders_placed >= s.max_orders)
-    return { emoji: '🟡', label: 'Order quota reached', tone: 'warn', detail: `${s.real_orders_placed}/${s.max_orders} orders placed` }
-  if (s.open_positions > 0) return { emoji: '🟢', label: 'Live — position open', tone: 'pos', detail: `${s.open_positions} open` }
-  return { emoji: '🟢', label: 'Ready — waiting for signal', tone: 'pos', detail: 'armed; no qualifying signal yet' }
+  const m = STATE_MAP[s.trading_state] || { emoji: '🟡', label: s.trading_state || 'unknown', tone: 'warn' }
+  const detail = s.state?.halt_reason
+    || (s.trading_state === 'running'
+        ? (s.open_positions > 0 ? `${s.open_positions} open position(s)` : 'armed — copying eligible signals')
+        : '')
+  return { ...m, detail }
 }
 
 function Pill({ tone, children }) {
@@ -164,6 +171,7 @@ export default function LiveTrading() {
 
   const ls = liveState(s)
   const lim = s?.limits_usd || {}
+  const stopped = s?.trading_state !== 'running'   // halted | paused | max_orders_reached | error
 
   return (
     <div className="live-page">
@@ -188,23 +196,33 @@ export default function LiveTrading() {
         </div>
         <div className="toolbar live-controls">
           <button className="secondary" onClick={load} disabled={busy === 'refresh'}>↻ Refresh</button>
+          <button onClick={() => act('resume', api.liveResume, 'Resume live trading — new orders may be placed. Continue?')}
+            disabled={busy === 'resume' || stopped === false}>▶ Resume Trading</button>
+          <button className="danger" onClick={() => act('pause', api.livePause, 'Pause live trading. No new orders until you resume. Continue?')}
+            disabled={busy === 'pause' || stopped === true}>⏸ Pause / Halt Trading</button>
           <button className="secondary" onClick={onRunOnce} disabled={busy === 'runonce'}>
             {busy === 'runonce' ? 'Running…' : 'Run once (diagnostic)'}
           </button>
-          {s?.state?.halted ? (
-            <button onClick={() => act('resume', api.liveResume, 'Resume live trading — new orders may be placed. Continue?')} disabled={busy === 'resume'}>
-              ▶ Resume
-            </button>
-          ) : (
-            <button className="danger" onClick={() => act('halt', () => api.liveHalt('manual'), 'Halt live trading immediately. No new orders will be placed until you resume. Continue?')} disabled={busy === 'halt'}>
-              ■ Halt
-            </button>
-          )}
           <div className="reconcile-box">
             <input type="number" step="0.01" placeholder="venue $balance" value={balance}
               onChange={(e) => setBalance(e.target.value)} style={{ width: 120 }} />
             <button className="secondary" onClick={onReconcile} disabled={busy === 'reconcile'}>Reconcile</button>
           </div>
+        </div>
+      </div>
+
+      {/* ---- trading control state ---- */}
+      <div className="panel live-control-panel">
+        <div className="live-control-state">
+          <span className={`live-pill ${ls.tone}`} style={{ fontSize: 14, marginLeft: 0 }}>{ls.emoji} {String(s?.trading_state || '—').toUpperCase()}</span>
+          <span className="muted small">{ls.detail}</span>
+        </div>
+        <div className="live-control-metrics">
+          <div><span>Real orders placed</span><b>{s?.real_orders_placed ?? 0} / {s?.max_real_orders ?? s?.max_orders}</b></div>
+          <div><span>Open positions</span><b>{s?.open_positions ?? 0}</b></div>
+          <div><span>Cash / bankroll</span><b>{fmt.usd2((s?.state?.bankroll ?? 0) - (s?.open_exposure ?? 0))} / {fmt.usd2(s?.state?.bankroll)}</b></div>
+          <div><span>Latest venue error</span><b className={s?.latest_venue_error ? 'neg' : 'pos'} title={s?.latest_venue_error || ''}>
+            {s?.latest_venue_error ? String(s.latest_venue_error).slice(0, 60) + '…' : 'none'}</b></div>
         </div>
       </div>
 

@@ -117,6 +117,7 @@ export const api = {
   liveRanking: (limit = 20) => request(`/api/live/wallet-ranking?limit=${limit}`),
   liveHalt: (reason = 'manual') =>
     request(`/api/live/halt?reason=${encodeURIComponent(reason)}`, { method: 'POST' }),
+  livePause: () => request('/api/live/pause', { method: 'POST' }),
   liveResume: () => request('/api/live/resume', { method: 'POST' }),
   liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
   liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),

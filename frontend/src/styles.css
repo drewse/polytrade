@@ -184,6 +184,12 @@ input, select {
 .gate.bad { color: var(--red); font-weight: 600; white-space: normal; }
 .diag-strip { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; color: var(--text); }
 .small { font-size: 12px; }
+.live-control-panel { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; justify-content: space-between; }
+.live-control-state { display: flex; flex-direction: column; gap: 4px; }
+.live-control-metrics { display: flex; flex-wrap: wrap; gap: 10px; }
+.live-control-metrics > div { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 130px; }
+.live-control-metrics span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+.live-control-metrics b { font-size: 14px; }
 
 /* ---- TOP 20 page ---- */
 .paper-banner {

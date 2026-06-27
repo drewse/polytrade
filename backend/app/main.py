@@ -390,13 +390,24 @@ def live_set_bankroll(amount: float, db: Session = Depends(get_db)) -> MessageOu
 
 @app.post("/api/live/resume", response_model=MessageOut)
 def live_resume(db: Session = Depends(get_db)) -> MessageOut:
-    """Manual intervention to clear a tripped halt and resume new orders."""
-    return MessageOut(message="resumed", detail=live.resume(db))
+    """Clear a tripped halt/pause and resume new orders. Returns the new status."""
+    live.resume(db)
+    return MessageOut(message="resumed", detail=live.status(db))
 
 
 @app.post("/api/live/halt", response_model=MessageOut)
 def live_halt(reason: str = "manual", db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut(message="halted", detail=live.halt(db, reason))
+    """Hard halt (operator stop). Returns the new status."""
+    live.halt(db, reason)
+    return MessageOut(message="halted", detail=live.status(db))
+
+
+@app.post("/api/live/pause", response_model=MessageOut)
+def live_pause(db: Session = Depends(get_db)) -> MessageOut:
+    """Pause trading (operator-initiated; same safety latch as halt, shown as
+    'paused'). Returns the new status."""
+    live.pause(db)
+    return MessageOut(message="paused", detail=live.status(db))
 
 
 @app.post("/api/live/run-once", response_model=MessageOut)
