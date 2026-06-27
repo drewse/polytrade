@@ -491,6 +491,9 @@ def _poly_cfg(monkeypatch):
     monkeypatch.setenv("LIVE_POSITION_USD", "1.10")
     monkeypatch.setenv("ORDER_TTL_SECONDS", "0")          # no real sleep in tests
     monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", KEY)     # past the no-key guard
+    # funder == signer EOA -> EOA-valid config (overrides the baked proxy default)
+    monkeypatch.setenv("POLYMARKET_FUNDER", _derive(KEY))
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "0")
     return live.get_config()
 
 

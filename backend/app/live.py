@@ -97,6 +97,19 @@ def _assert_real_sdk() -> None:
             "removed before real trading (use py-clob-client-v2 only)", outcome="archived_sdk")
 
 
+# The funded Polymarket deposit/proxy wallet (the order MAKER). Verified on-chain:
+# it is a Polymarket proxy whose owner() is the signer EOA and which holds the
+# funded USDC. Baked as the default because Railway repeatedly failed to apply the
+# POLYMARKET_FUNDER env var; the env var STILL overrides this when present. For any
+# other deployment, set POLYMARKET_FUNDER (or change this back to None).
+_DEFAULT_FUNDER = "0x4Ab19f0662B24841F58b372Cf93A907e37d99116"
+
+
+def _configured_funder() -> str | None:
+    """The maker/funder address: env override, else the verified proxy default."""
+    return os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS") or _DEFAULT_FUNDER
+
+
 def wallet_check() -> dict:
     """Pre-flight wallet configuration diagnostic. Derives the EOA from the
     private key and compares it to the configured funder, so we know whether the
@@ -110,7 +123,7 @@ def wallet_check() -> dict:
         derivation in py-clob-client) — verify against how the account was made.
     """
     key = os.getenv("POLYMARKET_PRIVATE_KEY")
-    configured_funder = os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")
+    configured_funder = _configured_funder()
     current_sig = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
 
     derived = None
@@ -490,7 +503,7 @@ class PolymarketExecutor:
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
         # funder = address holding USDC (the UI 'Address' for proxy wallets);
         # defaults to the signer EOA when unset.
-        funder = os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS") or None
+        funder = _configured_funder()
         # Optional manual full-creds override; normally None -> we DERIVE from key.
         ak, asec, apas = (os.getenv("POLYMARKET_API_KEY"), os.getenv("POLYMARKET_API_SECRET"),
                           os.getenv("POLYMARKET_API_PASSPHRASE"))
@@ -1068,8 +1081,7 @@ def status(db: Session) -> dict:
             "py_clob_client_installed": py_clob_installed(),   # v2 SDK present
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
             "l2_creds_source": "derived_from_private_key",  # UI never exposes secret/passphrase
-            "funder": os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS")
-                      or "(defaults to signer EOA)",
+            "funder": _configured_funder() or "(defaults to signer EOA)",
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
         "sdk": sdk_info(),
