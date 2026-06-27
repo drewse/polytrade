@@ -1035,6 +1035,31 @@ def run_pipeline(db: Session, place: bool = True) -> dict:
     return report
 
 
+def auth_check() -> dict:
+    """READ-ONLY L2 auth validation: build the client and make ONE benign
+    authenticated GET (list open orders) to confirm the API credentials work.
+    Never places an order; never exposes the secret/passphrase. Use after a creds
+    change to validate instantly instead of waiting for a venue order attempt."""
+    out = {
+        "l2_creds_source": "manual_api_creds" if _manual_l2_creds_present() else "derived_from_private_key",
+        "l2_manual_creds_present": _manual_l2_creds_present(),
+        "funder": _configured_funder(), "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
+    }
+    if not os.getenv("POLYMARKET_PRIVATE_KEY"):
+        return {**out, "ok": False, "stage": "key", "error": "POLYMARKET_PRIVATE_KEY not set"}
+    try:
+        client = PolymarketExecutor()._build_client(os.getenv("POLYMARKET_PRIVATE_KEY"))
+    except ExecutionRejected as exc:
+        return {**out, "ok": False, "stage": "build_auth", "error": str(exc), "venue_error": exc.venue_error}
+    try:
+        orders = client.get_orders()             # L2-authenticated GET — no order placed
+        n = len(orders) if isinstance(orders, list) else None
+        return {**out, "ok": True, "stage": "l2_auth", "open_orders": n,
+                "detail": "API credentials authenticate successfully"}
+    except Exception as exc:  # noqa: BLE001
+        return {**out, "ok": False, "stage": "l2_auth", "error": _full_err(exc)}
+
+
 def signal_decisions(db: Session, limit: int = 100) -> list[dict]:
     """Recent per-signal decision audit rows (newest first) — the execution trail.
     Read-only; joins the originating signal -> market for display context."""

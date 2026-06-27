@@ -415,6 +415,13 @@ def live_decisions(limit: int = 100, db: Session = Depends(get_db)) -> MessageOu
     return MessageOut(message="live decisions", detail={"decisions": live.signal_decisions(db, limit)})
 
 
+@app.get("/api/live/auth-check", response_model=MessageOut)
+def live_auth_check() -> MessageOut:
+    """READ-ONLY: validate the live API credentials with one authenticated GET
+    (no order placed, no secrets exposed). Returns ok=true if L2 auth succeeds."""
+    return MessageOut(message="live auth check", detail=live.auth_check())
+
+
 @app.post("/api/admin/rescore-wallets", response_model=MessageOut)
 def admin_rescore_wallets(db: Session = Depends(get_db)) -> MessageOut:
     """Recompute all wallet stats (incl. PF/expectancy/Sharpe/drawdown) and
