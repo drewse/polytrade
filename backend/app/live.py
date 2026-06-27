@@ -1052,7 +1052,7 @@ def auth_check() -> dict:
     except ExecutionRejected as exc:
         return {**out, "ok": False, "stage": "build_auth", "error": str(exc), "venue_error": exc.venue_error}
     try:
-        orders = client.get_orders()             # L2-authenticated GET — no order placed
+        orders = client.get_open_orders(only_first_page=True)   # L2 GET — no order placed
         n = len(orders) if isinstance(orders, list) else None
         return {**out, "ok": True, "stage": "l2_auth", "open_orders": n,
                 "detail": "API credentials authenticate successfully"}
