@@ -407,8 +407,9 @@ def _trading_state(cfg: LiveConfig, st: LiveState, real_orders: int) -> str:
 
 
 def _latest_venue_error(db: Session) -> str | None:
-    """Most recent captured venue error (full text), for the dashboard."""
-    e = db.scalar(select(LiveExecution).where(LiveExecution.venue_error.is_not(None))
+    """venue_error of the MOST RECENT execution (null when the latest attempt
+    succeeded) — so a stale pre-fix error doesn't read as a current problem."""
+    e = db.scalar(select(LiveExecution).where(LiveExecution.executor == "polymarket")
                   .order_by(LiveExecution.created_at.desc()))
     return e.venue_error if e else None
 
