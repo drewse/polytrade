@@ -114,19 +114,90 @@ export function DiscoveryCandidatesTable({ candidates }) {
   )
 }
 
+const BF_KIND = { pending: 'open', running: 'insufficient_data', completed: 'yes', failed: 'bad', skipped: 'neutral' }
+function BfCard({ label, value, tone }) {
+  return <div className="card"><div className="label">{label}</div><div className={`value ${tone || ''}`}>{value}</div></div>
+}
+
+// Pure Backfill Queue panel — exported for testing.
+export function BackfillQueue({ status, queue, onRun, running }) {
+  const s = status || {}
+  return (
+    <div className="panel">
+      <div className="page-head" style={{ marginBottom: 8 }}>
+        <h2 style={{ margin: 0 }}>Backfill Queue</h2>
+        <button data-testid="run-backfill" onClick={onRun} disabled={running}>
+          {running ? 'Running batch…' : '▶ Run Backfill Batch'}
+        </button>
+      </div>
+      <div className="cards">
+        <BfCard label="Pending" value={s.pending ?? 0} />
+        <BfCard label="Running" value={s.running ?? 0} />
+        <BfCard label="Completed" value={s.completed ?? 0} tone="pos" />
+        <BfCard label="Failed" value={s.failed ?? 0} tone={s.failed ? 'neg' : ''} />
+        <BfCard label="Currently running" value={(s.currently_running || []).length
+          ? <WalletLink address={s.currently_running[0]} /> : '—'} />
+        <BfCard label="Last run" value={s.last_run ? fmt.ago(s.last_run) : '—'} />
+      </div>
+      {(s.latest_errors || []).length > 0 && (
+        <div className="diag-strip neg">Latest errors: {s.latest_errors.slice(0, 3)
+          .map((e) => `${(e.wallet || '').slice(0, 8)}…: ${e.error}`).join('  ·  ')}</div>
+      )}
+      {!queue?.length ? <Empty>Backfill queue is empty.</Empty> : (
+        <div className="table-wrap">
+          <table data-testid="backfill-table">
+            <thead><tr>
+              <th>Wallet</th><th>Source</th><th className="right">Disc Score</th>
+              <th className="right">Priority</th><th>Status</th><th className="right">Trades</th>
+              <th>Stats</th><th>Error</th><th>Last Attempt</th>
+            </tr></thead>
+            <tbody>
+              {queue.map((c) => (
+                <tr key={c.wallet} data-testid="backfill-row">
+                  <td className="mono"><WalletLink address={c.wallet} /></td>
+                  <td className="small">{c.discovery_sources.map((x) => SOURCE_LABEL[x] || x).join(', ')}</td>
+                  <td className="right">{num(c.discovery_score, 1)}</td>
+                  <td className="right">{c.backfill_priority}</td>
+                  <td><span className={`badge ${BF_KIND[c.backfill_status] || 'neutral'}`}>{c.backfill_status}</span></td>
+                  <td className="right">{c.trades_imported || 0}</td>
+                  <td>{c.stats_updated ? '✓' : '—'}</td>
+                  <td className="small neg" title={c.backfill_error || ''}>{c.backfill_error ? c.backfill_error.slice(0, 36) : '—'}</td>
+                  <td className="small">{fmt.ago(c.last_backfill_attempt_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function DiscoveryCandidates() {
   const [data, setData] = useState(null)
+  const [bfStatus, setBfStatus] = useState(null)
+  const [bfRunning, setBfRunning] = useState(false)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
 
-  const load = () => api.liveDiscoveryCandidates(300)
-    .then((d) => { setData(d?.detail || d); setError(null) })
-    .catch((e) => setError(e.message))
-    .finally(() => setLoading(false))
+  const load = () => Promise.all([
+    api.liveDiscoveryCandidates(300).then((d) => setData(d?.detail || d)),
+    api.liveDiscoveryBackfillStatus().then((d) => setBfStatus(d?.detail || d)).catch(() => {}),
+  ]).then(() => setError(null)).catch((e) => setError(e.message)).finally(() => setLoading(false))
 
   useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const runBackfill = async () => {
+    setBfRunning(true)
+    try {
+      const r = await api.liveDiscoveryBackfillRunOnce(5)
+      const d = r?.detail || {}
+      setMsg(`Backfill batch: ${d.completed ?? 0} completed, ${d.failed ?? 0} failed, ${d.trades_imported ?? 0} trades imported. ${d.note || ''}`)
+      await load()
+    } catch (e) { setMsg(e.message) } finally { setBfRunning(false) }
+  }
 
   const refresh = async () => {
     setBusy(true)
@@ -156,6 +227,14 @@ export default function DiscoveryCandidates() {
         Discovering a wallet never makes it tradable — normal backfill + ranking + eligibility still apply.
       </p>
       {msg && <div className="diag-strip">{msg}</div>}
+
+      <BackfillQueue
+        status={bfStatus}
+        queue={(data?.candidates || []).filter((c) => c.needs_backfill
+          || ['pending', 'running', 'failed'].includes(c.backfill_status)).slice(0, 50)}
+        onRun={runBackfill} running={bfRunning} />
+
+      <h3 style={{ margin: '18px 0 8px' }}>All Discovered Wallets</h3>
       <DiscoveryCandidatesTable candidates={data?.candidates || []} />
     </div>
   )

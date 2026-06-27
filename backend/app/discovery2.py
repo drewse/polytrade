@@ -150,7 +150,8 @@ def refresh_discovery(db: Session, *, profit_fn=fetch_profit_leaderboard,
             db.add(DiscoverySource(wallet_address=addr, discovery_source=source,
                                    source_detail=detail, source_rank=rank, discovery_score=sc,
                                    first_seen=now, last_seen=now, needs_backfill=nb,
-                                   backfill_priority=pr))
+                                   backfill_priority=pr,
+                                   backfill_status=("skipped" if not nb else "pending")))
             new_rows += 1
     db.commit()
     return {
@@ -197,6 +198,13 @@ def discovery_candidates(db: Session, *, limit: int = 300) -> dict:
             "source_rank": min([d.source_rank for d in ds if d.source_rank is not None], default=None),
             "backfill_priority": max(d.backfill_priority for d in ds),
             "needs_backfill": st is None,                     # live: no stats -> still needs backfill
+            # backfill-worker tracking (read-only display)
+            "backfill_status": ds[0].backfill_status or "pending",
+            "trades_imported": max((d.trades_imported or 0) for d in ds),
+            "stats_updated": any(d.stats_updated for d in ds),
+            "backfill_error": next((d.backfill_error for d in ds if d.backfill_error), None),
+            "last_backfill_attempt_at": (lambda v: v.isoformat() if v else None)(
+                max((d.last_backfill_attempt_at for d in ds if d.last_backfill_attempt_at), default=None)),
             "first_seen": min(d.first_seen for d in ds).isoformat(),
             "last_seen": max(d.last_seen for d in ds).isoformat(),
             # current wallet stats if available

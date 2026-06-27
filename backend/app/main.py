@@ -462,6 +462,24 @@ def live_discovery_refresh(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="discovery refreshed", detail=discovery2.refresh_discovery(db))
 
 
+@app.post("/api/live/discovery-backfill/run-once", response_model=MessageOut)
+def live_discovery_backfill_run_once(batch: int = 5, db: Session = Depends(get_db)) -> MessageOut:
+    """Backfill the top `batch` queued discovery wallets (priority order) into
+    WalletStat using existing backfill logic. Creates stats only — never forces
+    eligibility or triggers a live trade; eligibility may change only via the
+    unchanged ranking once stats exist."""
+    from . import discovery_backfill
+    return MessageOut(message="backfill batch", detail=discovery_backfill.run_backfill_batch(db, batch=batch))
+
+
+@app.get("/api/live/discovery-backfill/status", response_model=MessageOut)
+def live_discovery_backfill_status(db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY backfill queue status: pending/running/completed/failed counts,
+    latest errors, last run time, recently completed wallets."""
+    from . import discovery_backfill
+    return MessageOut(message="backfill status", detail=discovery_backfill.backfill_status(db))
+
+
 @app.get("/api/live/auth-check", response_model=MessageOut)
 def live_auth_check() -> MessageOut:
     """READ-ONLY: validate the live API credentials with one authenticated GET

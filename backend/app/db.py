@@ -88,6 +88,14 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "tick_size": "FLOAT",               # venue book tick_size used for the decision
         "min_order_size": "FLOAT",          # venue book min_order_size (shares) used
     },
+    "discovery_sources": {
+        "backfill_status": "VARCHAR DEFAULT 'pending'",
+        "last_backfill_attempt_at": "DATETIME",
+        "backfill_completed_at": "DATETIME",
+        "backfill_error": "TEXT",
+        "trades_imported": "INTEGER DEFAULT 0",
+        "stats_updated": "BOOLEAN DEFAULT 0",
+    },
     "ingest_status": {"last_discovery_at": "DATETIME"},
     "paper_signals": {
         "edge_estimate": "FLOAT DEFAULT 0.0",

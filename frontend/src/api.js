@@ -119,6 +119,9 @@ export const api = {
   liveShadowPortfolio: (limit = 200) => request(`/api/live/shadow-portfolio?limit=${limit}`),
   liveDiscoveryCandidates: (limit = 300) => request(`/api/live/discovery-candidates?limit=${limit}`),
   liveDiscoveryRefresh: () => request('/api/live/discovery/refresh', { method: 'POST' }),
+  liveDiscoveryBackfillStatus: () => request('/api/live/discovery-backfill/status'),
+  liveDiscoveryBackfillRunOnce: (batch = 5) =>
+    request(`/api/live/discovery-backfill/run-once?batch=${batch}`, { method: 'POST' }),
   liveHalt: (reason = 'manual') =>
     request(`/api/live/halt?reason=${encodeURIComponent(reason)}`, { method: 'POST' }),
   livePause: () => request('/api/live/pause', { method: 'POST' }),

@@ -514,6 +514,13 @@ class DiscoverySource(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     needs_backfill: Mapped[bool] = mapped_column(Boolean, default=True)
     backfill_priority: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    # backfill-worker tracking (additive; discovery only — never forces eligibility)
+    backfill_status: Mapped[str] = mapped_column(String(12), default="pending")  # pending|running|completed|failed|skipped
+    last_backfill_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    backfill_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    backfill_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trades_imported: Mapped[int] = mapped_column(Integer, default=0)
+    stats_updated: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class ReplayState(Base):
