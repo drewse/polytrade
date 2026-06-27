@@ -426,6 +426,15 @@ def live_decisions(limit: int = 100, db: Session = Depends(get_db)) -> MessageOu
     return MessageOut(message="live decisions", detail={"decisions": live.signal_decisions(db, limit)})
 
 
+@app.get("/api/live/promotion-candidates", response_model=MessageOut)
+def live_promotion_candidates(limit: int = 200, db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY analytics 'farm system': wallets NOT in production that look
+    promising from real signal history. Changes no trading logic, eligibility,
+    ranking, sizing, or risk — purely informational."""
+    from . import promotion
+    return MessageOut(message="promotion candidates", detail=promotion.promotion_candidates(db, limit=limit))
+
+
 @app.get("/api/live/auth-check", response_model=MessageOut)
 def live_auth_check() -> MessageOut:
     """READ-ONLY: validate the live API credentials with one authenticated GET

@@ -190,6 +190,16 @@ input, select {
 .live-control-metrics > div { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 130px; }
 .live-control-metrics span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
 .live-control-metrics b { font-size: 14px; }
+.live-tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+.live-tabs .tab { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); border-radius: 0; padding: 8px 14px; }
+.live-tabs .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.wallet-link { color: var(--accent); text-decoration: none; }
+.wallet-link:hover { text-decoration: underline; }
+.promo-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.promo-filters { display: flex; gap: 6px; flex-wrap: wrap; }
+.promo-tools { display: flex; gap: 10px; align-items: center; }
+.promo-tools select { width: auto; padding: 6px 8px; }
+.promo-search { width: 200px; }
 
 /* ---- TOP 20 page ---- */
 .paper-banner {

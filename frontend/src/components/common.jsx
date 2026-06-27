@@ -26,6 +26,24 @@ export function Badge({ kind, children }) {
   return <span className={`badge ${kind}`}>{children}</span>
 }
 
+// Shortened address text (does NOT change what's displayed — just for reuse).
+export const shortAddr = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '—')
+
+// Polymarket public profile URL for a wallet/proxy address.
+export const polymarketProfileUrl = (address) => `https://polymarket.com/profile/${address}`
+
+// Wallet address rendered as a clickable link to the Polymarket profile (new tab).
+// Keeps the shortened text — only adds the hyperlink.
+export function WalletLink({ address, text }) {
+  if (!address) return <span className="muted">—</span>
+  return (
+    <a className="wallet-link" href={polymarketProfileUrl(address)} target="_blank"
+       rel="noopener noreferrer" title={`${address} — open Polymarket profile`}>
+      {text || shortAddr(address)}
+    </a>
+  )
+}
+
 export function PnL({ value, fmtFn }) {
   const cls = value > 0 ? 'pos' : value < 0 ? 'neg' : 'muted'
   const sign = value > 0 ? '+' : ''

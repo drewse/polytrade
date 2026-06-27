@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmt } from '../api'
-import { Loading, Empty } from '../components/common.jsx'
+import { Loading, Empty, WalletLink } from '../components/common.jsx'
+import PromotionCandidates from './PromotionCandidates.jsx'
 
 const REFRESH_MS = 10000
 
@@ -103,6 +104,7 @@ export default function LiveTrading() {
   const [toast, setToast] = useState(null)
   const [diag, setDiag] = useState(null)
   const [balance, setBalance] = useState('')
+  const [tab, setTab] = useState('dashboard')   // dashboard | promotion
   const timer = useRef(null)
 
   const load = useCallback(async () => {
@@ -211,6 +213,15 @@ export default function LiveTrading() {
         </div>
       </div>
 
+      {/* ---- tabs ---- */}
+      <div className="live-tabs">
+        <button className={`tab ${tab === 'dashboard' ? 'active' : ''}`} onClick={() => setTab('dashboard')}>Dashboard</button>
+        <button className={`tab ${tab === 'promotion' ? 'active' : ''}`} onClick={() => setTab('promotion')}>Promotion Candidates</button>
+      </div>
+
+      {tab === 'promotion' && <PromotionCandidates />}
+
+      {tab === 'dashboard' && <>
       {/* ---- trading control state ---- */}
       <div className="panel live-control-panel">
         <div className="live-control-state">
@@ -291,7 +302,7 @@ export default function LiveTrading() {
                     <td><span className={`badge ${DEC_TONE[d.status] || 'neutral'}`}>{d.status}</span></td>
                     <td className="small">{d.category}</td>
                     <td className="small" title={d.market || ''}>{(d.market || d.market_id || '—').slice(0, 40)}</td>
-                    <td className="mono" title={d.wallet || ''}>{short(d.wallet)}</td>
+                    <td className="mono"><WalletLink address={d.wallet} /></td>
                     <td className="right">{num(d.edge, 3)}</td>
                     <td className="right">{num(d.confidence, 0)}</td>
                     <td className="right">{num(d.production_score, 1)}</td>
@@ -336,7 +347,7 @@ export default function LiveTrading() {
                     <td className="right">{num(e.shares, 2)}</td>
                     <td className="right">{e.slippage == null ? '—' : pct(e.slippage)}</td>
                     <td className="mono small" title={e.order_id || ''}>{e.order_id ? short(e.order_id) : '—'}</td>
-                    <td className="mono" title={e.wallet || ''}>{short(e.wallet)}</td>
+                    <td className="mono"><WalletLink address={e.wallet} /></td>
                     <td className="small" title={e.venue_error || ''}>
                       {e.fill_outcome && <b>{e.fill_outcome}</b>}{e.fill_outcome ? ' — ' : ''}
                       {e.venue_error || e.exit_reason || e.entry_reason || '—'}
@@ -368,7 +379,7 @@ export default function LiveTrading() {
                 {data.ranking.top.map((w, i) => (
                   <tr key={w.address}>
                     <td>{i + 1}</td>
-                    <td className="mono" title={w.address}>{short(w.address)}</td>
+                    <td className="mono"><WalletLink address={w.address} /></td>
                     <td className="right"><b>{num(w.production_rank_score, 1)}</b></td>
                     <td className="right">{num(w.copyability, 1)}</td>
                     <td className="right">{w.reputation_score == null ? '—' : num(w.reputation_score, 1)}</td>
@@ -386,6 +397,7 @@ export default function LiveTrading() {
       <p className="muted small" style={{ marginTop: 8 }}>
         Read-only monitor. No control here can enable live trading; no private keys or secrets are exposed.
       </p>
+      </>}
 
       {toast && <div className={`toast ${toast.isErr ? 'err' : ''}`}>{toast.message}</div>}
     </div>
