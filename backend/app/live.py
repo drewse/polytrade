@@ -197,12 +197,11 @@ class LiveConfig:
     position_usd: float      # fixed $ per position
     min_stake: float         # venue minimum / dust floor
     max_total_risk: float    # cap on total open exposure
-    max_positions: int
+    max_positions: int       # MAX CONCURRENT open positions (refuse-without-halt at the gate)
     max_per_market: float
     max_per_wallet: float
     daily_loss_stop: float   # absolute $
     total_loss_stop: float   # absolute $
-    max_orders: int          # 0 = unlimited; 1 = one-order test then auto-halt
     max_slippage_pct: float
     min_edge: float          # only copy signals with at least this edge
     min_confidence: float
@@ -222,12 +221,14 @@ def get_config() -> LiveConfig:
         position_usd=float(os.getenv("LIVE_POSITION_USD", "2.0")),
         min_stake=float(os.getenv("LIVE_MIN_STAKE", "1.0")),
         max_total_risk=float(os.getenv("LIVE_MAX_TOTAL_RISK", "40.0")),
-        max_positions=int(os.getenv("LIVE_MAX_POSITIONS", "10")),
+        # MAX CONCURRENT open positions. Canonical env LIVE_MAX_OPEN_POSITIONS;
+        # falls back to the legacy LIVE_MAX_POSITIONS for backwards compatibility.
+        max_positions=int(os.getenv("LIVE_MAX_OPEN_POSITIONS",
+                                    os.getenv("LIVE_MAX_POSITIONS", "10"))),
         max_per_market=float(os.getenv("LIVE_MAX_PER_MARKET", "4.0")),
         max_per_wallet=float(os.getenv("LIVE_MAX_PER_WALLET", "8.0")),
         daily_loss_stop=float(os.getenv("LIVE_DAILY_LOSS_STOP", "10.0")),
         total_loss_stop=float(os.getenv("LIVE_TOTAL_LOSS_STOP", "40.0")),
-        max_orders=int(os.getenv("LIVE_MAX_ORDERS", "1")),
         max_slippage_pct=float(os.getenv("LIVE_MAX_SLIPPAGE_PCT", "0.03")),
         min_edge=float(os.getenv("LIVE_MIN_EDGE", "0.05")),
         min_confidence=float(os.getenv("LIVE_MIN_CONFIDENCE", "65")),
@@ -313,11 +314,11 @@ def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str)
         if not wc["configuration_valid"]:
             return False, f"wallet config invalid: {wc.get('note') or 'see /api/live/status.wallet_check'}"
     open_ = _open(db)
+    # MAX CONCURRENT positions: refuse a NEW entry without halting — existing
+    # positions keep running and the next qualifying signal opens automatically
+    # as soon as one settles/closes and frees a slot. NOT a lifetime cap.
     if len(open_) >= cfg.max_positions:
         return False, f"max open positions ({cfg.max_positions}) reached"
-    if cfg.max_orders > 0 and _order_count(db, cfg.executor) >= cfg.max_orders:
-        _trip_halt(db, st, f"max orders ({cfg.max_orders}) reached")
-        return False, "max orders reached — halted"
     now = datetime.utcnow()
     day_pnl = _realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
     if day_pnl <= -cfg.daily_loss_stop:
@@ -387,13 +388,13 @@ def pause(db: Session) -> dict:
     return {"halted": True, "reason": st.halt_reason}
 
 
-def _trading_state(cfg: LiveConfig, st: LiveState, real_orders: int) -> str:
-    """Single derived state for the dashboard:
-    running | paused | halted | max_orders_reached | error."""
+def _trading_state(cfg: LiveConfig, st: LiveState) -> str:
+    """Single derived state for the dashboard: running | paused | halted | error.
+    There is NO lifetime-order cap — concurrent exposure is bounded at the open
+    gate by cfg.max_positions (refuse-without-halt), so reaching the open-position
+    limit is normal 'running', not a halted state."""
     if st.halted:
         r = (st.halt_reason or "").lower()
-        if "max order" in r or "one-order" in r:
-            return "max_orders_reached"
         if "error" in r:
             return "error"
         if "pause" in r:
@@ -401,8 +402,6 @@ def _trading_state(cfg: LiveConfig, st: LiveState, real_orders: int) -> str:
         return "halted"
     if not cfg.enabled:
         return "paused"
-    if cfg.max_orders > 0 and real_orders >= cfg.max_orders:
-        return "max_orders_reached"
     return "running"
 
 
@@ -786,9 +785,8 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         status="open", entry_reason=entry_reason, bankroll_before=st.bankroll)
     db.add(ex)
     db.commit()
-    # one-order test: auto-halt after the configured number of orders
-    if cfg.max_orders > 0 and _order_count(db, cfg.executor) >= cfg.max_orders:
-        _trip_halt(db, st, f"one-order test complete ({cfg.max_orders}) — manual resume required")
+    # No lifetime-order cap: trading is bounded by MAX CONCURRENT open positions
+    # (enforced at check_can_open), not by how many orders have ever been placed.
     return ex
 
 
@@ -1059,7 +1057,7 @@ def run_pipeline(db: Session, place: bool = True) -> dict:
             report["filtered"][cat] += 1
         if place and record:
             _record_decision(db, s, cand, exec_id)
-        if place and get_state(db).halted:          # one-order test: stop after the halt
+        if place and get_state(db).halted:          # a safety stop tripped mid-loop -> stop placing
             break
 
     report["reason"] = _summarize(report)
@@ -1162,9 +1160,12 @@ def status(db: Session) -> dict:
         "paper_trading_default": True,
         "live_trading_enabled": cfg.enabled,
         "executor": cfg.executor,
-        "trading_state": _trading_state(cfg, st, real_orders),   # running|paused|halted|max_orders_reached|error
-        "real_orders_placed": real_orders,
-        "max_real_orders": cfg.max_orders,
+        "trading_state": _trading_state(cfg, st),   # running | paused | halted | error
+        # Concurrent-exposure limit (the live cap). Lifetime order count is kept
+        # below as audit-only info — it no longer caps or halts anything.
+        "open_positions": len(open_),
+        "max_open_positions": cfg.max_positions,
+        "real_orders_placed": real_orders,   # lifetime, informational/audit only
         "latest_venue_error": _latest_venue_error(db),
         "orders_this_executor": _order_count(db, cfg.executor),
         "auth": {  # L1 = private key (signs). L2 = manual API creds if all 3 set, else derived.
@@ -1185,14 +1186,14 @@ def status(db: Session) -> dict:
                        "max_positions": cfg.max_positions, "max_per_market": cfg.max_per_market,
                        "max_per_wallet": cfg.max_per_wallet, "daily_loss_stop": cfg.daily_loss_stop,
                        "total_loss_stop": cfg.total_loss_stop},
-        "max_orders": cfg.max_orders, "max_slippage_pct": cfg.max_slippage_pct,
+        "max_slippage_pct": cfg.max_slippage_pct,
         "execution": {  # limit-at-reference: never chase price; rest then cancel
             "order_mode": cfg.order_mode, "order_ttl_seconds": cfg.order_ttl_seconds,
             "cancel_if_unfilled": cfg.cancel_if_unfilled, "allow_partial_fill": cfg.allow_partial_fill,
             "effective_slippage": 0.0},
         "state": {"starting_bankroll": st.starting_bankroll, "bankroll": st.bankroll,
                   "halted": st.halted, "halt_reason": st.halt_reason},
-        "open_positions": len(open_), "open_exposure": round(sum(e.size_usd for e in open_), 2),
+        "open_exposure": round(sum(e.size_usd for e in open_), 2),
         "day_pnl": round(_realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0)), 2),
         "total_realized": round(_realized_total(db), 2),
         "max_possible_loss": cfg.total_loss_stop,

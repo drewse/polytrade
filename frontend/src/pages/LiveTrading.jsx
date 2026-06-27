@@ -16,7 +16,6 @@ const STATE_MAP = {
   running: { emoji: '🟢', label: 'Running', tone: 'pos' },
   paused: { emoji: '🟡', label: 'Paused', tone: 'warn' },
   halted: { emoji: '🔴', label: 'Halted', tone: 'neg' },
-  max_orders_reached: { emoji: '🟡', label: 'Max orders reached', tone: 'warn' },
   error: { emoji: '🔴', label: 'Error', tone: 'neg' },
 }
 function liveState(s) {
@@ -175,7 +174,7 @@ export default function LiveTrading() {
 
   const ls = liveState(s)
   const lim = s?.limits_usd || {}
-  const stopped = s?.trading_state !== 'running'   // halted | paused | max_orders_reached | error
+  const stopped = s?.trading_state !== 'running'   // halted | paused | error
 
   return (
     <div className="live-page">
@@ -184,9 +183,8 @@ export default function LiveTrading() {
         <div className="live-banner-title">⚠ LIVE REAL-MONEY EXECUTION</div>
         <div className="live-banner-row">
           <span>Position size: <b>{fmt.usd2(s?.sizing?.position_usd)}</b></span>
-          <span>Max orders: <b>{s?.max_orders}</b></span>
+          <span>Max open positions: <b>{s?.max_open_positions ?? s?.limits_usd?.max_positions}</b></span>
           <span>Max possible loss: <b>{fmt.usd2(s?.max_possible_loss)}</b></span>
-          {s?.max_orders === 1 && <span className="live-testmode">● Single-order test mode active</span>}
         </div>
       </div>
 
@@ -235,8 +233,8 @@ export default function LiveTrading() {
           <span className="muted small">{ls.detail}</span>
         </div>
         <div className="live-control-metrics">
-          <div><span>Real orders placed</span><b>{s?.real_orders_placed ?? 0} / {s?.max_real_orders ?? s?.max_orders}</b></div>
-          <div><span>Open positions</span><b>{s?.open_positions ?? 0}</b></div>
+          <div><span>Open positions</span><b>{s?.open_positions ?? 0} / {s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'}</b></div>
+          <div><span>Real orders placed</span><b title="lifetime count — informational only, not a cap">{s?.real_orders_placed ?? 0}</b></div>
           <div><span>Cash / bankroll</span><b>{fmt.usd2((s?.state?.bankroll ?? 0) - (s?.open_exposure ?? 0))} / {fmt.usd2(s?.state?.bankroll)}</b></div>
           <div><span>Latest venue error</span><b className={s?.latest_venue_error ? 'neg' : 'pos'} title={s?.latest_venue_error || ''}>
             {s?.latest_venue_error ? String(s.latest_venue_error).slice(0, 60) + '…' : 'none'}</b></div>
@@ -249,12 +247,12 @@ export default function LiveTrading() {
         <StatusCard label="Executor" value={s?.executor} sub={s?.live_trading_enabled ? 'live enabled' : 'disabled'} />
         <StatusCard label="Bankroll" value={fmt.usd2(s?.state?.bankroll)} sub={`start ${fmt.usd2(s?.state?.starting_bankroll)}`} />
         <StatusCard label="Open exposure" value={fmt.usd2(s?.open_exposure)} />
-        <StatusCard label="Open positions" value={s?.open_positions ?? 0} />
+        <StatusCard label="Open positions" value={`${s?.open_positions ?? 0} / ${s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'}`} sub="concurrent limit" />
         <StatusCard label="Day P/L" value={fmt.usd2(s?.day_pnl)} tone={s?.day_pnl > 0 ? 'pos' : s?.day_pnl < 0 ? 'neg' : ''} />
         <StatusCard label="Total realized P/L" value={fmt.usd2(s?.total_realized)} tone={s?.total_realized > 0 ? 'pos' : s?.total_realized < 0 ? 'neg' : ''} />
         <StatusCard label="Position size" value={fmt.usd2(s?.sizing?.position_usd)} sub={s?.sizing?.method} />
-        <StatusCard label="Max orders" value={s?.max_orders} sub={s?.max_orders === 1 ? 'single-order test' : ''} />
-        <StatusCard label="Real orders placed" value={s?.real_orders_placed ?? 0} />
+        <StatusCard label="Max open positions" value={s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'} sub="concurrent exposure cap" />
+        <StatusCard label="Real orders placed" value={s?.real_orders_placed ?? 0} sub="lifetime — not a cap" />
         <StatusCard label="Max possible loss" value={fmt.usd2(s?.max_possible_loss)} tone="neg" />
         <StatusCard label="Wallet config" value={<YesNo ok={s?.wallet_check?.configuration_valid} yes="Valid" no="Invalid" />} sub={s?.wallet_check?.addresses_match ? 'addresses match' : 'proxy/mismatch'} />
         <StatusCard label="py-clob-client" value={<YesNo ok={s?.auth?.py_clob_client_installed} yes="Installed" no="Missing" />} sub={`sig type ${s?.auth?.signature_type}`} />

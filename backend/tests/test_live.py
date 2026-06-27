@@ -97,26 +97,23 @@ def test_duplicate_signal_not_ordered_twice(in_memory_db, cfg_enabled):
     assert len(in_memory_db.scalars(select(LiveExecution)).all()) == 1
 
 
-# --- one-order test mode ----------------------------------------------------
-def test_one_order_mode_halts_after_first(in_memory_db, monkeypatch):
+# --- NO lifetime order cap: trading is bounded by concurrent open positions --
+def test_lifetime_orders_do_not_halt(in_memory_db, monkeypatch):
+    """Placing multiple orders over a session must NOT auto-halt — the retired
+    validation cap is gone; concurrent open positions are the only bound."""
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
     monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
     monkeypatch.setenv("LIVE_STARTING_BANKROLL", "40.0")
-    monkeypatch.setenv("LIVE_MAX_ORDERS", "1")
-    m1 = _market(in_memory_db, "ma")
-    m2 = _market(in_memory_db, "mb")
-    first = live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=1,
-                                market=m1, outcome="Yes", price=0.5, entry_reason="t")
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "10")
+    # distinct wallets so per-wallet exposure never gates ($2 each, cap $8)
+    first = live.process_signal(in_memory_db, strategy_key="s", wallet="0xa", signal_id=1,
+                                market=_market(in_memory_db, "ma"), outcome="Yes", price=0.5, entry_reason="t")
     assert first is not None and first.status == "open"
-    assert live.get_state(in_memory_db).halted          # auto-halted after one order
-    # a second attempt is blocked
-    second = live.process_signal(in_memory_db, strategy_key="s", wallet="0xw", signal_id=2,
-                                 market=m2, outcome="Yes", price=0.5, entry_reason="t")
-    assert second is None
-    rej = in_memory_db.scalars(select(LiveExecution).where(LiveExecution.status == "rejected")).all()
-    assert rej and "halt" in (rej[0].exit_reason or "").lower()
-    live.resume(in_memory_db)
-    assert not live.get_state(in_memory_db).halted      # manual resume clears it
+    assert not live.get_state(in_memory_db).halted      # NO lifetime-cap halt
+    second = live.process_signal(in_memory_db, strategy_key="s", wallet="0xb", signal_id=2,
+                                 market=_market(in_memory_db, "mb"), outcome="Yes", price=0.5, entry_reason="t")
+    assert second is not None and second.status == "open"   # second order placed fine
+    assert not live.get_state(in_memory_db).halted
 
 
 # --- hard limits ------------------------------------------------------------
@@ -128,6 +125,42 @@ def test_max_open_positions(in_memory_db, cfg_enabled):
     in_memory_db.commit()
     ok, reason = live.check_can_open(in_memory_db, cfg_enabled, wallet="0xn", market_id="mn")
     assert not ok and "max open positions" in reason
+
+
+def test_open_position_limit_blocks_without_halt_then_reopens_after_close(in_memory_db, monkeypatch):
+    """At the concurrent-open-positions limit: refuse a NEW entry WITHOUT halting;
+    as soon as one position closes, a new entry is allowed again automatically."""
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
+    monkeypatch.setenv("LIVE_STARTING_BANKROLL", "40.0")
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "2")
+    cfg = live.get_config()
+    assert cfg.max_positions == 2
+    for i in range(2):
+        in_memory_db.add(LiveExecution(idempotency_key=f"k{i}", strategy_key="s",
+                                       wallet_address=f"0x{i}", market_id=f"m{i}", outcome="Yes",
+                                       expected_price=0.5, size_usd=2.0, status="open", bankroll_before=40))
+    in_memory_db.commit()
+    # at the limit -> blocked, but NOT halted (existing positions keep running)
+    ok, reason = live.check_can_open(in_memory_db, cfg, wallet="0xn", market_id="mn")
+    assert not ok and "max open positions" in reason
+    assert not live.get_state(in_memory_db).halted
+    # one position settles/closes -> a slot frees up -> next entry allowed again
+    pos = in_memory_db.scalars(select(LiveExecution).where(LiveExecution.status == "open")).first()
+    pos.status = "closed"; pos.closed_at = datetime.utcnow(); in_memory_db.commit()
+    ok2, _ = live.check_can_open(in_memory_db, cfg, wallet="0xn", market_id="mn")
+    assert ok2     # automatically resumes opening new positions, no manual resume needed
+
+
+def test_legacy_max_positions_env_still_honored(in_memory_db, monkeypatch):
+    """Backwards compatibility: the old LIVE_MAX_POSITIONS still sets the limit
+    when the new LIVE_MAX_OPEN_POSITIONS is unset."""
+    monkeypatch.delenv("LIVE_MAX_OPEN_POSITIONS", raising=False)
+    monkeypatch.setenv("LIVE_MAX_POSITIONS", "3")
+    assert live.get_config().max_positions == 3
+    # the new var takes precedence when both are set
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "7")
+    assert live.get_config().max_positions == 7
 
 
 def test_daily_loss_stop_halts(in_memory_db, cfg_enabled):
@@ -421,17 +454,22 @@ def test_run_once_diagnoses_without_side_effects(in_memory_db, live_env):
     assert live.run_pipeline(db, place=True)["placed"] == 1   # worker then executes it
 
 
-def test_one_order_mode_stops_after_one(in_memory_db, live_env, monkeypatch):
-    monkeypatch.setenv("LIVE_MAX_ORDERS", "1")
+def test_pipeline_fills_up_to_open_position_limit_no_halt(in_memory_db, live_env, monkeypatch):
+    """The pipeline keeps opening qualifying signals up to the concurrent limit,
+    then simply stops opening NEW ones — it does NOT halt (no lifetime cap)."""
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "1")
     db = in_memory_db
     w = _eligible_wallet(db)
     m1 = _market(db, "m1"); m2 = _market(db, "m2")
     _signal(db, w, m1); _signal(db, w, m2)        # two qualifying signals
     db.commit()
+    from sqlalchemy import func
     rep = live.run_pipeline(db, place=True)
-    assert rep["placed"] == 1                      # exactly one, despite two qualifying
-    assert live.get_state(db).halted is True       # auto-halt after one-order test
-    assert _count(db) == 1                          # only one execution exists
+    assert rep["placed"] == 1                      # one slot only, despite two qualifying
+    assert live.get_state(db).halted is False      # NOT halted — limit just refuses new entries
+    open_n = db.scalar(select(func.count()).select_from(LiveExecution).where(LiveExecution.status == "open"))
+    assert open_n == 1                              # exactly one OPEN position (the cap)
+    assert rep["filtered"].get("risk_blocked", 0) == 1   # 2nd blocked by the open-position limit
 
 
 # ===========================================================================
