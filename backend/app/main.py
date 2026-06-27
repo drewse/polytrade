@@ -372,8 +372,16 @@ def live_wallet_ranking(limit: int = 20, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/live/reconcile", response_model=MessageOut)
 def live_reconcile(balance: float, db: Session = Depends(get_db)) -> MessageOut:
-    """Reconcile computed bankroll against the venue-reported balance."""
+    """Reconcile computed bankroll against a manually-reported venue balance."""
     return MessageOut(message="reconciliation", detail=live.reconcile(db, balance))
+
+
+@app.post("/api/live/reconcile-account", response_model=MessageOut)
+def live_reconcile_account(db: Session = Depends(get_db)) -> MessageOut:
+    """Refresh market resolution for open positions, settle any ended markets, and
+    fetch the live venue balance — returns venue cash vs local bankroll, open
+    exposure, realized/unrealized P/L. Read-only against the venue (no orders)."""
+    return MessageOut(message="account reconciled", detail=live.reconcile_account(db))
 
 
 @app.post("/api/live/reset-test-state", response_model=MessageOut)

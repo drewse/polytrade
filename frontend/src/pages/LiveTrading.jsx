@@ -105,6 +105,8 @@ export default function LiveTrading() {
   const [toast, setToast] = useState(null)
   const [diag, setDiag] = useState(null)
   const [balance, setBalance] = useState('')
+  const [account, setAccount] = useState(null)        // reconciled venue+local account snapshot
+  const [reconciling, setReconciling] = useState(false)
   const [tab, setTab] = useState('dashboard')   // dashboard | promotion
   const timer = useRef(null)
 
@@ -168,6 +170,24 @@ export default function LiveTrading() {
     await act('reconcile', () => api.liveReconcile(bal), `Reconcile bankroll against reported balance $${bal}?`)
   }
 
+  // Account reconciliation runs SEPARATELY from the 10s status poll (it hits the
+  // venue, so it's slower) — async, never blocking the dashboard UI.
+  const reconcileAccount = useCallback(async () => {
+    setReconciling(true)
+    try {
+      const res = await api.liveReconcileAccount()
+      if (res?.detail) setAccount(res.detail)
+      flash('Account reconciled')
+      load()                                  // refresh counts after settling ended markets
+    } catch (e) {
+      flash(e.message, true)
+    } finally {
+      setReconciling(false)
+    }
+  }, [load])
+
+  useEffect(() => { reconcileAccount() }, [reconcileAccount])  // one async fetch on mount
+
   if (loading) return <Loading />
   const s = data.status
   if (error && !s) return <Empty>Live status unavailable: {error}</Empty>
@@ -183,7 +203,7 @@ export default function LiveTrading() {
         <div className="live-banner-title">⚠ LIVE REAL-MONEY EXECUTION</div>
         <div className="live-banner-row">
           <span>Position size: <b>{fmt.usd2(s?.sizing?.position_usd)}</b></span>
-          <span>Max open positions: <b>{s?.max_open_positions ?? s?.limits_usd?.max_positions}</b></span>
+          <span>Max total risk: <b>{fmt.usd2(lim.max_total_risk)}</b></span>
           <span>Max possible loss: <b>{fmt.usd2(s?.max_possible_loss)}</b></span>
         </div>
       </div>
@@ -205,10 +225,13 @@ export default function LiveTrading() {
           <button className="secondary" onClick={onRunOnce} disabled={busy === 'runonce'}>
             {busy === 'runonce' ? 'Running…' : 'Run once (diagnostic)'}
           </button>
+          <button onClick={reconcileAccount} disabled={reconciling}>
+            {reconciling ? 'Reconciling…' : '⟳ Reconcile Account'}
+          </button>
           <div className="reconcile-box">
             <input type="number" step="0.01" placeholder="venue $balance" value={balance}
               onChange={(e) => setBalance(e.target.value)} style={{ width: 120 }} />
-            <button className="secondary" onClick={onReconcile} disabled={busy === 'reconcile'}>Reconcile</button>
+            <button className="secondary" onClick={onReconcile} disabled={busy === 'reconcile'}>Manual reconcile</button>
           </div>
         </div>
       </div>
@@ -233,12 +256,42 @@ export default function LiveTrading() {
           <span className="muted small">{ls.detail}</span>
         </div>
         <div className="live-control-metrics">
-          <div><span>Open positions</span><b>{s?.open_positions ?? 0} / {s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'}</b></div>
+          <div><span>Open positions</span><b>{s?.open_positions ?? 0}{s?.ended_unsettled ? <span className="muted small"> (+{s.ended_unsettled} ended, unsettled)</span> : null}</b></div>
+          <div><span>Open exposure</span><b>{fmt.usd2(s?.open_exposure)}</b></div>
           <div><span>Real orders placed</span><b title="lifetime count — informational only, not a cap">{s?.real_orders_placed ?? 0}</b></div>
-          <div><span>Cash / bankroll</span><b>{fmt.usd2((s?.state?.bankroll ?? 0) - (s?.open_exposure ?? 0))} / {fmt.usd2(s?.state?.bankroll)}</b></div>
           <div><span>Latest venue error</span><b className={s?.latest_venue_error ? 'neg' : 'pos'} title={s?.latest_venue_error || ''}>
             {s?.latest_venue_error ? String(s.latest_venue_error).slice(0, 60) + '…' : 'none'}</b></div>
         </div>
+      </div>
+
+      {/* ---- account reconciliation (venue vs local, async) ---- */}
+      <div className="panel">
+        <div className="page-head" style={{ marginBottom: 8 }}>
+          <h2 style={{ margin: 0 }}>Account {reconciling && <span className="muted small">· reconciling…</span>}</h2>
+          <button onClick={reconcileAccount} disabled={reconciling}>
+            {reconciling ? 'Reconciling…' : '⟳ Reconcile Account'}
+          </button>
+        </div>
+        <div className="cards">
+          <StatusCard label="Venue cash (live)" value={account?.venue_cash == null ? '—' : fmt.usd2(account.venue_cash)}
+            sub={account?.venue_balance_error ? 'unavailable' : (account?.venue_balance_source || 'on-venue USDC')} tone="pos" />
+          <StatusCard label="Local bankroll" value={fmt.usd2(account?.local_bankroll ?? s?.state?.bankroll)} sub="accounting (start + realized)" />
+          <StatusCard label="Open exposure" value={fmt.usd2(account?.open_exposure ?? s?.open_exposure)} sub={`${account?.open_positions ?? s?.open_positions ?? 0} open`} />
+          <StatusCard label="Realized P/L" value={fmt.usd2(account?.realized_pnl ?? s?.total_realized)}
+            tone={(account?.realized_pnl ?? s?.total_realized) > 0 ? 'pos' : (account?.realized_pnl ?? s?.total_realized) < 0 ? 'neg' : ''} />
+          <StatusCard label="Unrealized P/L" value={account?.unrealized_pnl == null ? '—' : fmt.usd2(account.unrealized_pnl)}
+            tone={account?.unrealized_pnl > 0 ? 'pos' : account?.unrealized_pnl < 0 ? 'neg' : ''} sub="open mark-to-market" />
+          <StatusCard label="Drift (venue − expected)" value={account?.drift == null ? '—' : fmt.usd2(account.drift)}
+            tone={account?.reconciled ? 'pos' : account?.drift == null ? '' : 'warn'}
+            sub={account?.reconciled == null ? 'reconcile to check' : account.reconciled ? '✓ reconciled' : 'review drift'} />
+        </div>
+        {account && (
+          <p className="muted small" style={{ marginTop: 6 }}>
+            Last reconciled {fmt.ago(account.reconciled_at)} · settled {account.positions_settled ?? 0} ended position(s)
+            {account.markets_newly_resolved ? `, resolved ${account.markets_newly_resolved} market(s)` : ''}
+            {account.venue_balance_error ? ` · venue balance: ${account.venue_balance_error}` : ''}.
+          </p>
+        )}
       </div>
 
       {/* ---- 1. status cards ---- */}
@@ -247,11 +300,11 @@ export default function LiveTrading() {
         <StatusCard label="Executor" value={s?.executor} sub={s?.live_trading_enabled ? 'live enabled' : 'disabled'} />
         <StatusCard label="Bankroll" value={fmt.usd2(s?.state?.bankroll)} sub={`start ${fmt.usd2(s?.state?.starting_bankroll)}`} />
         <StatusCard label="Open exposure" value={fmt.usd2(s?.open_exposure)} />
-        <StatusCard label="Open positions" value={`${s?.open_positions ?? 0} / ${s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'}`} sub="concurrent limit" />
+        <StatusCard label="Open positions" value={s?.open_positions ?? 0} sub={s?.ended_unsettled ? `${s.ended_unsettled} ended, unsettled` : 'active markets'} />
         <StatusCard label="Day P/L" value={fmt.usd2(s?.day_pnl)} tone={s?.day_pnl > 0 ? 'pos' : s?.day_pnl < 0 ? 'neg' : ''} />
         <StatusCard label="Total realized P/L" value={fmt.usd2(s?.total_realized)} tone={s?.total_realized > 0 ? 'pos' : s?.total_realized < 0 ? 'neg' : ''} />
         <StatusCard label="Position size" value={fmt.usd2(s?.sizing?.position_usd)} sub={s?.sizing?.method} />
-        <StatusCard label="Max open positions" value={s?.max_open_positions ?? s?.limits_usd?.max_positions ?? '—'} sub="concurrent exposure cap" />
+        <StatusCard label="Max total risk" value={fmt.usd2(lim.max_total_risk)} sub="open-exposure cap ($)" />
         <StatusCard label="Real orders placed" value={s?.real_orders_placed ?? 0} sub="lifetime — not a cap" />
         <StatusCard label="Max possible loss" value={fmt.usd2(s?.max_possible_loss)} tone="neg" />
         <StatusCard label="Wallet config" value={<YesNo ok={s?.wallet_check?.configuration_valid} yes="Valid" no="Invalid" />} sub={s?.wallet_check?.addresses_match ? 'addresses match' : 'proxy/mismatch'} />
@@ -265,7 +318,6 @@ export default function LiveTrading() {
           {[
             ['Max position', fmt.usd2(lim.max_position)],
             ['Max total risk', fmt.usd2(lim.max_total_risk)],
-            ['Max positions', lim.max_positions],
             ['Max per market', fmt.usd2(lim.max_per_market)],
             ['Max per wallet', fmt.usd2(lim.max_per_wallet)],
             ['Daily loss stop', fmt.usd2(lim.daily_loss_stop)],

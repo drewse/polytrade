@@ -116,51 +116,46 @@ def test_lifetime_orders_do_not_halt(in_memory_db, monkeypatch):
     assert not live.get_state(in_memory_db).halted
 
 
-# --- hard limits ------------------------------------------------------------
-def test_max_open_positions(in_memory_db, cfg_enabled):
-    for i in range(10):
+# --- NO position-count / order-count cap blocks entry -----------------------
+def test_position_count_never_blocks_entry(in_memory_db, cfg_enabled, monkeypatch):
+    """Many open positions must NOT block a new entry — there is no count cap.
+    Even LIVE_MAX_OPEN_POSITIONS / LIVE_MAX_POSITIONS are ignored as blockers."""
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "2")   # deliberately tiny — must be ignored
+    monkeypatch.setenv("LIVE_MAX_POSITIONS", "2")
+    in_memory_db.add(Market(id="mn", question="Q", outcomes=["Yes", "No"],
+                            token_ids=["t1", "t2"], prices=[0.5, 0.5]))
+    for i in range(25):                                  # far over any historic cap
         in_memory_db.add(LiveExecution(idempotency_key=f"k{i}", strategy_key="s",
                                        wallet_address=f"0x{i}", market_id=f"m{i}", outcome="Yes",
-                                       expected_price=0.5, size_usd=2.0, status="open", bankroll_before=40))
+                                       expected_price=0.5, size_usd=0.2, status="open", bankroll_before=40))
+        in_memory_db.add(Market(id=f"m{i}", question="Q", outcomes=["Yes", "No"],
+                                token_ids=["t1", "t2"], prices=[0.5, 0.5]))
     in_memory_db.commit()
     ok, reason = live.check_can_open(in_memory_db, cfg_enabled, wallet="0xn", market_id="mn")
-    assert not ok and "max open positions" in reason
+    assert ok, reason                                    # cash/risk has room -> allowed regardless of count
 
 
-def test_open_position_limit_blocks_without_halt_then_reopens_after_close(in_memory_db, monkeypatch):
-    """At the concurrent-open-positions limit: refuse a NEW entry WITHOUT halting;
-    as soon as one position closes, a new entry is allowed again automatically."""
-    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
-    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
-    monkeypatch.setenv("LIVE_STARTING_BANKROLL", "40.0")
-    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "2")
-    cfg = live.get_config()
-    assert cfg.max_positions == 2
-    for i in range(2):
-        in_memory_db.add(LiveExecution(idempotency_key=f"k{i}", strategy_key="s",
-                                       wallet_address=f"0x{i}", market_id=f"m{i}", outcome="Yes",
-                                       expected_price=0.5, size_usd=2.0, status="open", bankroll_before=40))
+def test_ended_market_not_counted_as_open(in_memory_db, cfg_enabled):
+    """A position whose market has resolved is NOT counted as open / open exposure."""
+    in_memory_db.add(Market(id="mlive", question="Q", outcomes=["Yes", "No"],
+                            token_ids=["t1", "t2"], prices=[0.5, 0.5], resolved=False))
+    in_memory_db.add(Market(id="mended", question="Q", outcomes=["Yes", "No"],
+                            token_ids=["t1", "t2"], prices=[1.0, 0.0], resolved=True,
+                            resolved_outcome="Yes"))
+    in_memory_db.add(LiveExecution(idempotency_key="a", strategy_key="s", wallet_address="0xa",
+                                   market_id="mlive", outcome="Yes", expected_price=0.5,
+                                   size_usd=2.0, shares=4.0, status="open", bankroll_before=40))
+    in_memory_db.add(LiveExecution(idempotency_key="b", strategy_key="s", wallet_address="0xb",
+                                   market_id="mended", outcome="Yes", expected_price=0.5,
+                                   size_usd=2.0, shares=4.0, status="open", bankroll_before=40))
     in_memory_db.commit()
-    # at the limit -> blocked, but NOT halted (existing positions keep running)
-    ok, reason = live.check_can_open(in_memory_db, cfg, wallet="0xn", market_id="mn")
-    assert not ok and "max open positions" in reason
-    assert not live.get_state(in_memory_db).halted
-    # one position settles/closes -> a slot frees up -> next entry allowed again
-    pos = in_memory_db.scalars(select(LiveExecution).where(LiveExecution.status == "open")).first()
-    pos.status = "closed"; pos.closed_at = datetime.utcnow(); in_memory_db.commit()
-    ok2, _ = live.check_can_open(in_memory_db, cfg, wallet="0xn", market_id="mn")
-    assert ok2     # automatically resumes opening new positions, no manual resume needed
-
-
-def test_legacy_max_positions_env_still_honored(in_memory_db, monkeypatch):
-    """Backwards compatibility: the old LIVE_MAX_POSITIONS still sets the limit
-    when the new LIVE_MAX_OPEN_POSITIONS is unset."""
-    monkeypatch.delenv("LIVE_MAX_OPEN_POSITIONS", raising=False)
-    monkeypatch.setenv("LIVE_MAX_POSITIONS", "3")
-    assert live.get_config().max_positions == 3
-    # the new var takes precedence when both are set
-    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "7")
-    assert live.get_config().max_positions == 7
+    assert len(live._open(in_memory_db)) == 2            # both still status=open in the DB
+    assert len(live._open_active(in_memory_db)) == 1     # but only the unresolved one is "open"
+    assert len(live._ended_unsettled(in_memory_db)) == 1
+    s = live.status(in_memory_db)
+    assert s["open_positions"] == 1 and s["open_exposure"] == 2.0
+    assert s["ended_unsettled"] == 1
+    assert "max_open_positions" not in s and "max_positions" not in s.get("limits_usd", {})
 
 
 def test_daily_loss_stop_halts(in_memory_db, cfg_enabled):
@@ -454,10 +449,10 @@ def test_run_once_diagnoses_without_side_effects(in_memory_db, live_env):
     assert live.run_pipeline(db, place=True)["placed"] == 1   # worker then executes it
 
 
-def test_pipeline_fills_up_to_open_position_limit_no_halt(in_memory_db, live_env, monkeypatch):
-    """The pipeline keeps opening qualifying signals up to the concurrent limit,
-    then simply stops opening NEW ones — it does NOT halt (no lifetime cap)."""
-    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "1")
+def test_pipeline_has_no_position_count_cap(in_memory_db, live_env, monkeypatch):
+    """No count cap: the pipeline opens EVERY qualifying signal that has cash/risk
+    room, even with a tiny LIVE_MAX_OPEN_POSITIONS set (which is ignored)."""
+    monkeypatch.setenv("LIVE_MAX_OPEN_POSITIONS", "1")   # ignored — must not block
     db = in_memory_db
     w = _eligible_wallet(db)
     m1 = _market(db, "m1"); m2 = _market(db, "m2")
@@ -465,11 +460,89 @@ def test_pipeline_fills_up_to_open_position_limit_no_halt(in_memory_db, live_env
     db.commit()
     from sqlalchemy import func
     rep = live.run_pipeline(db, place=True)
-    assert rep["placed"] == 1                      # one slot only, despite two qualifying
-    assert live.get_state(db).halted is False      # NOT halted — limit just refuses new entries
+    assert rep["placed"] == 2                      # BOTH placed — count is not a blocker
+    assert live.get_state(db).halted is False
     open_n = db.scalar(select(func.count()).select_from(LiveExecution).where(LiveExecution.status == "open"))
-    assert open_n == 1                              # exactly one OPEN position (the cap)
-    assert rep["filtered"].get("risk_blocked", 0) == 1   # 2nd blocked by the open-position limit
+    assert open_n == 2
+    assert rep["filtered"].get("risk_blocked", 0) == 0
+
+
+# ===========================================================================
+# Account reconciliation: settle ended markets + venue-vs-local balance
+# ===========================================================================
+class _FakeMarketClient:
+    """Stand-in for LivePolymarketClient.get_markets_by_conditions — returns the
+    given markets as resolved DTOs so reconcile can settle them."""
+    def __init__(self, resolved_ids):
+        self._resolved = resolved_ids
+
+    def get_markets_by_conditions(self, ids, chunk=40):
+        from app.polymarket_client import MarketDTO
+        return [MarketDTO(id=i, question="Q", outcomes=["Yes", "No"], prices=[1.0, 0.0],
+                          token_ids=["t1", "t2"], resolved=True, resolved_outcome="Yes")
+                for i in ids if i in self._resolved]
+
+
+def test_reconcile_settles_ended_positions_and_separates_balances(in_memory_db, cfg_enabled):
+    db = in_memory_db
+    live.get_state(db)  # init bankroll = 40
+    db.add(Market(id="mlive", question="Q", outcomes=["Yes", "No"], token_ids=["t1", "t2"],
+                  prices=[0.5, 0.5], resolved=False))
+    db.add(Market(id="mended", question="Q", outcomes=["Yes", "No"], token_ids=["t1", "t2"],
+                  prices=[0.5, 0.5], resolved=False))   # not yet known-resolved locally
+    db.add(LiveExecution(idempotency_key="a", strategy_key="s", wallet_address="0xa",
+                         market_id="mlive", outcome="Yes", expected_price=0.5, fill_price=0.5,
+                         size_usd=2.0, shares=4.0, status="open", bankroll_before=40))
+    db.add(LiveExecution(idempotency_key="b", strategy_key="s", wallet_address="0xb",
+                         market_id="mended", outcome="Yes", expected_price=0.5, fill_price=0.5,
+                         size_usd=2.0, shares=4.0, status="open", bankroll_before=40))
+    db.commit()
+
+    out = live.reconcile_account(
+        db,
+        client=_FakeMarketClient({"mended"}),                       # venue says mended resolved
+        balance_fn=lambda **_: {"available_usdc": 41.0, "source": "test", "error": None},
+    )
+    # the ended market was refreshed -> settled; the live one remains open
+    assert out["markets_newly_resolved"] == 1
+    assert out["positions_settled"] == 1
+    assert out["open_positions"] == 1 and out["open_exposure"] == 2.0
+    # mended won (Yes): 4 shares * $1 - $2 stake = +$2 realized
+    assert out["realized_pnl"] == 2.0
+    assert out["local_bankroll"] == 42.0                            # 40 + 2 realized
+    # venue cash is reported SEPARATELY from local bankroll
+    assert out["venue_cash"] == 41.0 and out["venue_cash"] != out["local_bankroll"]
+    assert db.get(LiveExecution, 2).status == "closed"             # ended position is closed
+
+
+def test_reconcile_handles_no_venue_balance(in_memory_db, cfg_enabled):
+    """Venue balance unavailable -> venue_cash None, drift None, local accounting still returned."""
+    live.get_state(in_memory_db)
+    out = live.reconcile_account(
+        in_memory_db, client=_FakeMarketClient(set()),
+        balance_fn=lambda **_: {"available_usdc": None, "source": None, "error": "sdk down"})
+    assert out["venue_cash"] is None and out["drift"] is None and out["reconciled"] is None
+    assert out["local_bankroll"] == 40.0 and out["venue_balance_error"] == "sdk down"
+
+
+def test_insufficient_balance_blocks_safely(in_memory_db, cfg_enabled):
+    """Bankroll fully deployed -> no cash room -> entry rejected (not a crash/halt)."""
+    db = in_memory_db
+    db.add(Market(id="mn", question="Q", outcomes=["Yes", "No"], token_ids=["t1", "t2"],
+                  prices=[0.5, 0.5], resolved=False))
+    # one big open position consuming the whole $40 bankroll
+    db.add(LiveExecution(idempotency_key="big", strategy_key="s", wallet_address="0xz",
+                         market_id="mbig", outcome="Yes", expected_price=0.5, size_usd=40.0,
+                         shares=80.0, status="open", bankroll_before=40))
+    db.add(Market(id="mbig", question="Q", outcomes=["Yes", "No"], token_ids=["t1", "t2"],
+                  prices=[0.5, 0.5], resolved=False))
+    db.commit()
+    out = live.process_signal(db, strategy_key="s", wallet="0xn", signal_id=99,
+                              market=db.get(Market, "mn"), outcome="Yes", price=0.5, entry_reason="t")
+    assert out is None                                              # blocked
+    rej = db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == "s:99"))
+    assert rej.status == "rejected" and "capital" in (rej.exit_reason or "")
+    assert not live.get_state(db).halted                           # safe block, no halt
 
 
 # ===========================================================================

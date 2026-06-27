@@ -128,6 +128,7 @@ export const api = {
   liveResume: () => request('/api/live/resume', { method: 'POST' }),
   liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
   liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),
+  liveReconcileAccount: () => request('/api/live/reconcile-account', { method: 'POST' }),
 }
 
 export const COPY_CLASS = {

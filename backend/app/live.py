@@ -196,8 +196,7 @@ class LiveConfig:
     strategy: str            # which paper strategy's signals to copy
     position_usd: float      # fixed $ per position
     min_stake: float         # venue minimum / dust floor
-    max_total_risk: float    # cap on total open exposure
-    max_positions: int       # MAX CONCURRENT open positions (refuse-without-halt at the gate)
+    max_total_risk: float    # cap on total open exposure (absolute $)
     max_per_market: float
     max_per_wallet: float
     daily_loss_stop: float   # absolute $
@@ -221,10 +220,10 @@ def get_config() -> LiveConfig:
         position_usd=float(os.getenv("LIVE_POSITION_USD", "2.0")),
         min_stake=float(os.getenv("LIVE_MIN_STAKE", "1.0")),
         max_total_risk=float(os.getenv("LIVE_MAX_TOTAL_RISK", "40.0")),
-        # MAX CONCURRENT open positions. Canonical env LIVE_MAX_OPEN_POSITIONS;
-        # falls back to the legacy LIVE_MAX_POSITIONS for backwards compatibility.
-        max_positions=int(os.getenv("LIVE_MAX_OPEN_POSITIONS",
-                                    os.getenv("LIVE_MAX_POSITIONS", "10"))),
+        # NOTE: there is intentionally NO position-COUNT cap. Trading is bounded
+        # only by available cash + the absolute-$ risk caps below and the loss
+        # stops. LIVE_MAX_ORDERS / LIVE_MAX_OPEN_POSITIONS / LIVE_MAX_POSITIONS are
+        # deliberately ignored — they never block a new entry.
         max_per_market=float(os.getenv("LIVE_MAX_PER_MARKET", "4.0")),
         max_per_wallet=float(os.getenv("LIVE_MAX_PER_WALLET", "8.0")),
         daily_loss_stop=float(os.getenv("LIVE_DAILY_LOSS_STOP", "10.0")),
@@ -276,6 +275,30 @@ def _open(db: Session) -> list[LiveExecution]:
     return list(db.scalars(select(LiveExecution).where(LiveExecution.status == "open")).all())
 
 
+def _open_active(db: Session) -> list[LiveExecution]:
+    """Open executions whose market is NOT resolved/ended — the only positions
+    that count as real live exposure. A position whose market has already resolved
+    is awaiting settlement, not open risk, so it is excluded from open-position
+    counts and open exposure (and gets settled by settle_live / reconcile)."""
+    out = []
+    for e in _open(db):
+        m = db.get(Market, e.market_id)
+        if m is None or not m.resolved:
+            out.append(e)
+    return out
+
+
+def _ended_unsettled(db: Session) -> list[LiveExecution]:
+    """Open executions whose market HAS resolved but which haven't been settled
+    locally yet — the backlog that reconcile/settle should clear."""
+    out = []
+    for e in _open(db):
+        m = db.get(Market, e.market_id)
+        if m is not None and m.resolved:
+            out.append(e)
+    return out
+
+
 def _realized_since(db: Session, since: datetime) -> float:
     val = db.scalar(select(func.coalesce(func.sum(LiveExecution.realized_pnl), 0.0)).where(
         LiveExecution.status == "closed", LiveExecution.closed_at >= since))
@@ -313,12 +336,9 @@ def check_can_open(db: Session, cfg: LiveConfig, *, wallet: str, market_id: str)
         wc = wallet_check()
         if not wc["configuration_valid"]:
             return False, f"wallet config invalid: {wc.get('note') or 'see /api/live/status.wallet_check'}"
-    open_ = _open(db)
-    # MAX CONCURRENT positions: refuse a NEW entry without halting — existing
-    # positions keep running and the next qualifying signal opens automatically
-    # as soon as one settles/closes and frees a slot. NOT a lifetime cap.
-    if len(open_) >= cfg.max_positions:
-        return False, f"max open positions ({cfg.max_positions}) reached"
+    # NO position-count / order-count cap. New entries are bounded ONLY by
+    # available cash + the absolute-$ risk caps (applied in conservative_stake)
+    # and the loss stops below. The bot keeps trading until cash/risk gates say no.
     now = datetime.utcnow()
     day_pnl = _realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0))
     if day_pnl <= -cfg.daily_loss_stop:
@@ -390,9 +410,9 @@ def pause(db: Session) -> dict:
 
 def _trading_state(cfg: LiveConfig, st: LiveState) -> str:
     """Single derived state for the dashboard: running | paused | halted | error.
-    There is NO lifetime-order cap — concurrent exposure is bounded at the open
-    gate by cfg.max_positions (refuse-without-halt), so reaching the open-position
-    limit is normal 'running', not a halted state."""
+    There is NO order-count or position-count cap — trading is bounded only by
+    available cash + the absolute-$ risk caps and loss stops, so being fully
+    deployed is still normal 'running', not a halted state."""
     if st.halted:
         r = (st.halt_reason or "").lower()
         if "error" in r:
@@ -743,7 +763,9 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
     if not ok:
         _reject(reason, fill_outcome="rejected")
         return None
-    open_ = _open(db)
+    # Only ACTIVE (unresolved-market) positions are real exposure — a position
+    # whose market already resolved is awaiting settlement, not tying up cash.
+    open_ = _open_active(db)
     available_cash = round(st.bankroll - sum(e.size_usd for e in open_), 2)
     stake = conservative_stake(cfg, available_cash=available_cash,
                                total_open=sum(e.size_usd for e in open_),
@@ -1141,7 +1163,7 @@ def signal_decisions(db: Session, limit: int = 100) -> list[dict]:
 def reconcile(db: Session, reported_balance: float, tolerance: float = 0.50) -> dict:
     st = get_state(db)
     computed = round(st.starting_bankroll + _realized_total(db), 2)
-    open_exposure = round(sum(e.size_usd for e in _open(db)), 2)
+    open_exposure = round(sum(e.size_usd for e in _open_active(db)), 2)
     expected_cash = round(computed - open_exposure, 2)
     drift = round(reported_balance - expected_cash, 2)
     return {"starting_bankroll": st.starting_bankroll, "computed_equity": computed,
@@ -1150,10 +1172,120 @@ def reconcile(db: Session, reported_balance: float, tolerance: float = 0.50) -> 
             "reconciled": abs(drift) <= tolerance}
 
 
+def venue_balance(*, executor: str | None = None) -> dict:
+    """Best-effort READ-ONLY fetch of the live venue's USDC collateral balance.
+    Never raises — returns {available_usdc, source, error}. Only attempts the
+    network call for the polymarket executor with a configured key; otherwise
+    reports None so the dashboard falls back to local accounting."""
+    out: dict = {"available_usdc": None, "source": None, "error": None}
+    ex = executor or os.getenv("LIVE_EXECUTOR", "dry_run").strip().lower()
+    if ex != "polymarket":
+        out["source"] = "n/a (dry_run)"
+        return out
+    key = os.getenv("POLYMARKET_PRIVATE_KEY")
+    if not key:
+        out["error"] = "POLYMARKET_PRIVATE_KEY not set"
+        return out
+    try:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+        client = PolymarketExecutor()._build_client(key)
+        ba = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        raw = ba.get("balance") if isinstance(ba, dict) else getattr(ba, "balance", None)
+        if raw is not None:
+            # USDC collateral is reported in 6-decimal base units.
+            out["available_usdc"] = round(float(raw) / 1_000_000.0, 2)
+            out["source"] = "clob.get_balance_allowance"
+        else:
+            out["error"] = f"unexpected balance shape: {type(ba).__name__}"
+    except Exception as exc:  # noqa: BLE001  (read-only; never break the dashboard)
+        out["error"] = _full_err(exc)
+    return out
+
+
+def _refresh_open_market_resolution(db: Session, *, client=None) -> int:
+    """Best-effort: refresh resolution status from Polymarket for the markets that
+    currently back OPEN live positions, so ended markets get marked resolved (and
+    are then settled). Read-only metadata fetch; fail-soft (returns 0 on any
+    error). `client` is injectable for tests."""
+    ids = sorted({e.market_id for e in _open(db)})
+    if not ids:
+        return 0
+    try:
+        from . import services
+        if client is None:
+            from .polymarket_client import LivePolymarketClient
+            client = LivePolymarketClient()
+        dtos = client.get_markets_by_conditions(ids)
+        updated = 0
+        for dto in dtos or []:
+            before = db.get(Market, dto.id)
+            was_resolved = bool(before.resolved) if before else False
+            services.upsert_market(db, dto)
+            after = db.get(Market, dto.id)
+            if after is not None and after.resolved and not was_resolved:
+                updated += 1
+        db.commit()
+        return updated
+    except Exception as exc:  # noqa: BLE001
+        print(f"[live] market resolution refresh failed: {exc}")
+        db.rollback()
+        return 0
+
+
+def reconcile_account(db: Session, *, client=None, balance_fn=None) -> dict:
+    """Reconcile the live account: (1) refresh resolution for open positions'
+    markets, (2) settle any whose market has ended, (3) fetch the venue cash
+    balance, and (4) report venue cash vs local bankroll, open exposure, realized
+    and unrealized P/L. Reads the venue read-only; never places or cancels orders.
+    `client`/`balance_fn` are injectable for tests."""
+    cfg = get_config()
+    refreshed = _refresh_open_market_resolution(db, client=client)
+    settled = settle_live(db)                       # books realized P/L for ended markets
+    st = get_state(db)
+
+    active = _open_active(db)
+    open_exposure = round(sum(e.size_usd for e in active), 2)
+    # unrealized: mark active positions to the current market price when available
+    unrealized = 0.0
+    have_marks = False
+    for e in active:
+        m = db.get(Market, e.market_id)
+        cur = m.price_for(e.outcome) if (m and hasattr(m, "price_for")) else None
+        if cur is not None and e.shares:
+            unrealized += e.shares * float(cur) - e.size_usd
+            have_marks = True
+    realized = round(_realized_total(db), 2)
+    computed_equity = round(st.starting_bankroll + realized, 2)
+    expected_cash = round(computed_equity - open_exposure, 2)
+
+    bal = (balance_fn or venue_balance)(executor=cfg.executor)
+    venue_cash = bal.get("available_usdc")
+    drift = round(venue_cash - expected_cash, 2) if venue_cash is not None else None
+
+    return {
+        "reconciled_at": datetime.utcnow().isoformat(),
+        "markets_newly_resolved": refreshed,
+        "positions_settled": settled.get("closed", 0),
+        "venue_cash": venue_cash,                   # live venue USDC (None if unavailable)
+        "venue_balance_source": bal.get("source"),
+        "venue_balance_error": bal.get("error"),
+        "local_bankroll": round(st.bankroll, 2),    # local accounting (starting + realized)
+        "open_positions": len(active),
+        "open_exposure": open_exposure,
+        "realized_pnl": realized,
+        "unrealized_pnl": round(unrealized, 2) if have_marks else None,
+        "computed_equity": computed_equity,
+        "expected_cash": expected_cash,
+        "drift": drift,                              # venue_cash - expected_cash (None if no venue balance)
+        "reconciled": (abs(drift) <= 0.50) if drift is not None else None,
+    }
+
+
 def status(db: Session) -> dict:
     cfg = get_config()
     st = get_state(db)
-    open_ = _open(db)
+    active = _open_active(db)                    # open positions whose market is NOT resolved
+    ended_unsettled = _ended_unsettled(db)       # market ended but not yet settled locally
     now = datetime.utcnow()
     real_orders = _order_count(db, "polymarket")
     return {
@@ -1161,10 +1293,10 @@ def status(db: Session) -> dict:
         "live_trading_enabled": cfg.enabled,
         "executor": cfg.executor,
         "trading_state": _trading_state(cfg, st),   # running | paused | halted | error
-        # Concurrent-exposure limit (the live cap). Lifetime order count is kept
-        # below as audit-only info — it no longer caps or halts anything.
-        "open_positions": len(open_),
-        "max_open_positions": cfg.max_positions,
+        # Open positions = ACTIVE only (resolved/ended markets excluded). There is
+        # NO position-count cap; trading is bounded by cash + $ risk caps below.
+        "open_positions": len(active),
+        "ended_unsettled": len(ended_unsettled),    # awaiting settlement (use Reconcile Account)
         "real_orders_placed": real_orders,   # lifetime, informational/audit only
         "latest_venue_error": _latest_venue_error(db),
         "orders_this_executor": _order_count(db, cfg.executor),
@@ -1183,7 +1315,7 @@ def status(db: Session) -> dict:
         "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
                    "min_stake": cfg.min_stake, "no_compounding": True, "no_leverage": True},
         "limits_usd": {"max_position": cfg.position_usd, "max_total_risk": cfg.max_total_risk,
-                       "max_positions": cfg.max_positions, "max_per_market": cfg.max_per_market,
+                       "max_per_market": cfg.max_per_market,
                        "max_per_wallet": cfg.max_per_wallet, "daily_loss_stop": cfg.daily_loss_stop,
                        "total_loss_stop": cfg.total_loss_stop},
         "max_slippage_pct": cfg.max_slippage_pct,
@@ -1193,7 +1325,7 @@ def status(db: Session) -> dict:
             "effective_slippage": 0.0},
         "state": {"starting_bankroll": st.starting_bankroll, "bankroll": st.bankroll,
                   "halted": st.halted, "halt_reason": st.halt_reason},
-        "open_exposure": round(sum(e.size_usd for e in open_), 2),
+        "open_exposure": round(sum(e.size_usd for e in active), 2),
         "day_pnl": round(_realized_since(db, now.replace(hour=0, minute=0, second=0, microsecond=0)), 2),
         "total_realized": round(_realized_total(db), 2),
         "max_possible_loss": cfg.total_loss_stop,
