@@ -110,12 +110,14 @@ def _configured_funder() -> str | None:
     return os.getenv("POLYMARKET_FUNDER") or os.getenv("RELAYER_API_KEY_ADDRESS") or _DEFAULT_FUNDER
 
 
-def _manual_l2_creds_present() -> bool:
-    """Whether all three L2 API creds are configured (so we use the account's own
-    creds instead of deriving from the key). Returns a BOOLEAN only — the secret
-    and passphrase values are never read into any output/log."""
-    return all(os.getenv(k) for k in
-               ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE"))
+def _create_or_derive_api_creds(client):
+    """v2 create-or-derive: return EXISTING CLOB L2 creds (derive_api_key), or
+    create them on first use (create_api_key). Derived from the private key — the
+    Builders-page key/secret/passphrase are NOT CLOB trading creds."""
+    try:
+        return client.derive_api_key()
+    except Exception:  # noqa: BLE001  (no creds yet -> create them)
+        return client.create_api_key()
 
 
 def wallet_check() -> dict:
@@ -503,30 +505,24 @@ class PolymarketExecutor:
         derive_api_key() (existing) / create_api_key() (first time) — there is no
         create_or_derive_api_creds. Sig types are unchanged (0=EOA,1=PROXY,2=SAFE)."""
         try:
-            from py_clob_client_v2 import ClobClient, ApiCreds
+            from py_clob_client_v2 import ClobClient
         except Exception as exc:  # noqa: BLE001
             raise ExecutionRejected(f"py-clob-client-v2 not installed: {exc}", outcome="sdk_missing")
         host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
         chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         sig_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
         # funder = address holding USDC (the UI 'Address' for proxy wallets);
-        # defaults to the signer EOA when unset.
+        # defaults to the verified proxy / signer EOA. Configurable via env.
         funder = _configured_funder()
-        # Optional manual full-creds override; normally None -> we DERIVE from key.
-        ak, asec, apas = (os.getenv("POLYMARKET_API_KEY"), os.getenv("POLYMARKET_API_SECRET"),
-                          os.getenv("POLYMARKET_API_PASSPHRASE"))
-        manual = ApiCreds(api_key=ak, api_secret=asec, api_passphrase=apas) if (ak and asec and apas) else None
         try:
-            client = ClobClient(host, chain_id=chain_id, key=key, creds=manual,
+            client = ClobClient(host, chain_id=chain_id, key=key,
                                 signature_type=sig_type, funder=funder)
-            if manual is None:
-                # L2 creds derived from the private key (L1-signed): try existing,
-                # else create. py-clob-client-v2 has no create_or_derive helper.
-                try:
-                    creds = client.derive_api_key()
-                except Exception:  # noqa: BLE001  (no creds yet -> create them)
-                    creds = client.create_api_key()
-                client.set_api_creds(creds)
+            # CLOB L2 creds are ALWAYS DERIVED from the private key (create-or-derive).
+            # v2 split create_or_derive into derive_api_key (existing) / create_api_key
+            # (first time). The Builders-page api key/secret/passphrase are NOT CLOB
+            # trading creds and are intentionally ignored.
+            creds = _create_or_derive_api_creds(client)
+            client.set_api_creds(creds)
             client.assert_level_2_auth()               # fail now if L2 auth is incomplete
         except ExecutionRejected:
             raise
@@ -1036,28 +1032,50 @@ def run_pipeline(db: Session, place: bool = True) -> dict:
 
 
 def auth_check() -> dict:
-    """READ-ONLY L2 auth validation: build the client and make ONE benign
-    authenticated GET (list open orders) to confirm the API credentials work.
-    Never places an order; never exposes the secret/passphrase. Use after a creds
-    change to validate instantly instead of waiting for a venue order attempt."""
+    """READ-ONLY L2 auth validation. DERIVES CLOB L2 creds from the private key
+    (create-or-derive), then makes ONE benign authenticated GET (open orders) to
+    confirm they work. Never places an order; never exposes the secret/passphrase."""
+    key = os.getenv("POLYMARKET_PRIVATE_KEY")
     out = {
-        "l2_creds_source": "manual_api_creds" if _manual_l2_creds_present() else "derived_from_private_key",
-        "l2_manual_creds_present": _manual_l2_creds_present(),
-        "funder": _configured_funder(), "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
+        "signer_eoa": None,
+        "funder": _configured_funder(),
+        "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
+        "l2_creds_source": "derived_from_private_key",
+        "create_or_derive_succeeded": False,
+        "get_open_orders_succeeds": False,
+        "error": None,
     }
-    if not os.getenv("POLYMARKET_PRIVATE_KEY"):
-        return {**out, "ok": False, "stage": "key", "error": "POLYMARKET_PRIVATE_KEY not set"}
+    if not key:
+        out["error"] = "POLYMARKET_PRIVATE_KEY not set"
+        return out
     try:
-        client = PolymarketExecutor()._build_client(os.getenv("POLYMARKET_PRIVATE_KEY"))
-    except ExecutionRejected as exc:
-        return {**out, "ok": False, "stage": "build_auth", "error": str(exc), "venue_error": exc.venue_error}
-    try:
-        orders = client.get_open_orders(only_first_page=True)   # L2 GET — no order placed
-        n = len(orders) if isinstance(orders, list) else None
-        return {**out, "ok": True, "stage": "l2_auth", "open_orders": n,
-                "detail": "API credentials authenticate successfully"}
+        from eth_account import Account
+        out["signer_eoa"] = Account.from_key(key).address     # public address only
     except Exception as exc:  # noqa: BLE001
-        return {**out, "ok": False, "stage": "l2_auth", "error": _full_err(exc)}
+        out["error"] = f"could not derive EOA: {exc}"
+        return out
+    # build client + DERIVE creds (create-or-derive)
+    try:
+        from py_clob_client_v2 import ClobClient
+        host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
+        chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
+        client = ClobClient(host, chain_id=chain_id, key=key,
+                            signature_type=out["signature_type"], funder=out["funder"])
+        creds = _create_or_derive_api_creds(client)
+        client.set_api_creds(creds)
+        client.assert_level_2_auth()
+        out["create_or_derive_succeeded"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"create_or_derive/auth failed: {_full_err(exc)}"
+        return out
+    # validate with one benign L2 GET (no order placed)
+    try:
+        orders = client.get_open_orders(only_first_page=True)
+        out["get_open_orders_succeeds"] = True
+        out["open_orders"] = len(orders) if isinstance(orders, list) else None
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = _full_err(exc)
+    return out
 
 
 def signal_decisions(db: Session, limit: int = 100) -> list[dict]:
@@ -1113,9 +1131,7 @@ def status(db: Session) -> dict:
         "auth": {  # L1 = private key (signs). L2 = manual API creds if all 3 set, else derived.
             "py_clob_client_installed": py_clob_installed(),   # v2 SDK present
             "l1_private_key_present": bool(os.getenv("POLYMARKET_PRIVATE_KEY")),
-            # booleans only — NEVER expose the secret/passphrase values
-            "l2_manual_creds_present": _manual_l2_creds_present(),
-            "l2_creds_source": "manual_api_creds" if _manual_l2_creds_present() else "derived_from_private_key",
+            "l2_creds_source": "derived_from_private_key",  # Builders api keys ignored
             "funder": _configured_funder() or "(defaults to signer EOA)",
             "signature_type": int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
         },
