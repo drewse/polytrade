@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmt } from '../api'
 import { Loading, Empty, WalletLink } from '../components/common.jsx'
 import PromotionCandidates from './PromotionCandidates.jsx'
+import ShadowPortfolio from './ShadowPortfolio.jsx'
 
 const REFRESH_MS = 10000
 
@@ -217,9 +218,11 @@ export default function LiveTrading() {
       <div className="live-tabs">
         <button className={`tab ${tab === 'dashboard' ? 'active' : ''}`} onClick={() => setTab('dashboard')}>Dashboard</button>
         <button className={`tab ${tab === 'promotion' ? 'active' : ''}`} onClick={() => setTab('promotion')}>Promotion Candidates</button>
+        <button className={`tab ${tab === 'shadow' ? 'active' : ''}`} onClick={() => setTab('shadow')}>Shadow Portfolio</button>
       </div>
 
       {tab === 'promotion' && <PromotionCandidates />}
+      {tab === 'shadow' && <ShadowPortfolio />}
 
       {tab === 'dashboard' && <>
       {/* ---- trading control state ---- */}

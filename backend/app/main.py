@@ -435,6 +435,15 @@ def live_promotion_candidates(limit: int = 200, db: Session = Depends(get_db)) -
     return MessageOut(message="promotion candidates", detail=promotion.promotion_candidates(db, limit=limit))
 
 
+@app.get("/api/live/shadow-portfolio", response_model=MessageOut)
+def live_shadow_portfolio(limit: int = 200, db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY simulation: what a copy of the promotion-candidate wallets WOULD
+    have done. Places no orders, writes no executions/positions, changes no trading
+    logic — every value is simulated."""
+    from . import shadow
+    return MessageOut(message="shadow portfolio", detail=shadow.shadow_portfolio(db, limit=limit))
+
+
 @app.get("/api/live/auth-check", response_model=MessageOut)
 def live_auth_check() -> MessageOut:
     """READ-ONLY: validate the live API credentials with one authenticated GET

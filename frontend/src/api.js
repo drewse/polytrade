@@ -116,6 +116,7 @@ export const api = {
   liveDecisions: (limit = 100) => request(`/api/live/decisions?limit=${limit}`),
   liveRanking: (limit = 20) => request(`/api/live/wallet-ranking?limit=${limit}`),
   livePromotionCandidates: (limit = 200) => request(`/api/live/promotion-candidates?limit=${limit}`),
+  liveShadowPortfolio: (limit = 200) => request(`/api/live/shadow-portfolio?limit=${limit}`),
   liveHalt: (reason = 'manual') =>
     request(`/api/live/halt?reason=${encodeURIComponent(reason)}`, { method: 'POST' }),
   livePause: () => request('/api/live/pause', { method: 'POST' }),
