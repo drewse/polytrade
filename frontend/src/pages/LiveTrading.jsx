@@ -117,6 +117,42 @@ function GateTrail({ gates, reason, status }) {
 
 const DEC_TONE = { filled: 'yes', skipped: 'neutral', rejected: 'bad', expired: 'neutral', eligible: 'open' }
 
+// Shared decision/audit table — used by both the full feed and the
+// placed-orders-only feed so they render in the IDENTICAL format.
+export function DecisionTable({ rows, emptyText }) {
+  if (!rows?.length) return <Empty>{emptyText || 'No decisions recorded yet.'}</Empty>
+  return (
+    <div className="table-wrap">
+      <table data-testid="decision-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>Signal</th><th>Status</th><th>Category</th><th>Market</th>
+            <th>Wallet</th><th className="right">Edge</th><th className="right">Conf</th>
+            <th className="right">Prod</th><th>Reason</th><th>Gate trail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((d) => (
+            <tr key={d.id} data-testid="decision-row">
+              <td className="muted small">{fmt.ago(d.created_at)}</td>
+              <td className="mono">{d.signal_id}</td>
+              <td><span className={`badge ${DEC_TONE[d.status] || 'neutral'}`}>{d.status}</span></td>
+              <td className="small">{d.category}</td>
+              <td className="small" title={d.market || ''}>{(d.market || d.market_id || '—').slice(0, 40)}</td>
+              <td className="mono"><WalletLink address={d.wallet} /></td>
+              <td className="right">{num(d.edge, 3)}</td>
+              <td className="right">{num(d.confidence, 0)}</td>
+              <td className="right">{num(d.production_score, 1)}</td>
+              <td className="small">{d.reason}</td>
+              <td><GateTrail gates={d.gates} reason={d.reason} status={d.status} /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 // ===========================================================================
 export default function LiveTrading() {
   const [data, setData] = useState({ status: null, execs: [], decisions: [], ranking: null })
@@ -136,7 +172,7 @@ export default function LiveTrading() {
       const [status, execRes, decRes, ranking] = await Promise.all([
         api.liveStatus(),
         api.liveExecutions(50).catch(() => ({ executions: [] })),
-        api.liveDecisions(100).catch(() => ({ detail: { decisions: [] } })),
+        api.liveDecisions(400).catch(() => ({ detail: { decisions: [] } })),
         api.liveRanking(20).catch(() => null),
       ])
       setData({
@@ -394,7 +430,21 @@ export default function LiveTrading() {
         </div>
       </div>
 
-      {/* ---- 4. decision / audit feed (most important) ---- */}
+      {/* ---- 4a. PLACED ORDERS feed — only "★ order placed" decisions ---- */}
+      {(() => {
+        const placed = data.decisions.filter((d) => d.status === 'filled')
+        return (
+          <div className="panel">
+            <h2>Placed orders — every ★ order placed ({placed.length})</h2>
+            <p className="muted small" style={{ marginTop: -4 }}>
+              Same decision-feed format, filtered to signals that actually resulted in an order being placed.
+            </p>
+            <DecisionTable rows={placed} emptyText="No orders placed in the recent decision window yet." />
+          </div>
+        )
+      })()}
+
+      {/* ---- 4b. full decision / audit feed (most important) ---- */}
       <div className="panel">
         <h2>Decision feed — every signal, every reason ({data.decisions.length})</h2>
         {diag && (
@@ -403,38 +453,8 @@ export default function LiveTrading() {
             placed {diag.placed} · executor_called {String(diag.executor_called)} — {diag.reason}
           </div>
         )}
-        {!data.decisions.length ? (
-          <Empty>No decisions recorded yet. The worker logs one per evaluated signal.</Empty>
-        ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th><th>Signal</th><th>Status</th><th>Category</th><th>Market</th>
-                  <th>Wallet</th><th className="right">Edge</th><th className="right">Conf</th>
-                  <th className="right">Prod</th><th>Reason</th><th>Gate trail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.decisions.map((d) => (
-                  <tr key={d.id}>
-                    <td className="muted small">{fmt.ago(d.created_at)}</td>
-                    <td className="mono">{d.signal_id}</td>
-                    <td><span className={`badge ${DEC_TONE[d.status] || 'neutral'}`}>{d.status}</span></td>
-                    <td className="small">{d.category}</td>
-                    <td className="small" title={d.market || ''}>{(d.market || d.market_id || '—').slice(0, 40)}</td>
-                    <td className="mono"><WalletLink address={d.wallet} /></td>
-                    <td className="right">{num(d.edge, 3)}</td>
-                    <td className="right">{num(d.confidence, 0)}</td>
-                    <td className="right">{num(d.production_score, 1)}</td>
-                    <td className="small">{d.reason}</td>
-                    <td><GateTrail gates={d.gates} reason={d.reason} status={d.status} /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <DecisionTable rows={data.decisions}
+          emptyText="No decisions recorded yet. The worker logs one per evaluated signal." />
       </div>
 
       {/* ---- 3. recent executions ---- */}
