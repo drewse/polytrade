@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -490,6 +490,16 @@ def live_discovery_backfill_status(db: Session = Depends(get_db)) -> MessageOut:
     latest errors, last run time, recently completed wallets."""
     from . import discovery_backfill
     return MessageOut(message="backfill status", detail=discovery_backfill.backfill_status(db))
+
+
+@app.post("/api/live/rebaseline-bankroll", response_model=MessageOut)
+def live_rebaseline_bankroll(payload: dict = Body(default={}),
+                             db: Session = Depends(get_db)) -> MessageOut:
+    """Guarded re-baseline of the local bankroll to venue reality. Requires
+    {"confirm": true}. Writes ONLY bankroll + starting_bankroll (preserves realized
+    P/L, open positions, executions, fills, history). Never trades."""
+    return MessageOut(message="bankroll rebaseline",
+                      detail=live.rebaseline_bankroll(db, confirm=bool(payload.get("confirm"))))
 
 
 @app.post("/api/live/reconcile-fills", response_model=MessageOut)

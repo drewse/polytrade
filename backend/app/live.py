@@ -1477,6 +1477,22 @@ def reconcile_account(db: Session, *, client=None, balance_fn=None) -> dict:
     venue_cash = bal.get("available_usdc")
     drift = round(venue_cash - expected_cash, 2) if venue_cash is not None else None
 
+    # When the local bankroll baseline has drifted from venue reality, propose a
+    # re-baseline (no side effects here — applied only via rebaseline_bankroll()).
+    rebaseline = None
+    if venue_cash is not None and drift is not None and abs(drift) > 1.0:
+        proposed_bankroll = round(venue_cash + open_exposure, 2)
+        rebaseline = {
+            "old_bankroll": round(st.bankroll, 2),
+            "proposed_bankroll": proposed_bankroll,
+            "old_starting_bankroll": round(st.starting_bankroll, 2),
+            "proposed_starting_bankroll": round(proposed_bankroll - realized, 2),
+            "venue_cash": venue_cash,
+            "open_exposure": open_exposure,
+            "realized_pnl": realized,
+            "drift": drift,
+        }
+
     return {
         "reconciled_at": datetime.utcnow().isoformat(),
         "markets_newly_resolved": refreshed,
@@ -1493,6 +1509,51 @@ def reconcile_account(db: Session, *, client=None, balance_fn=None) -> dict:
         "expected_cash": expected_cash,
         "drift": drift,                              # venue_cash - expected_cash (None if no venue balance)
         "reconciled": (abs(drift) <= 0.50) if drift is not None else None,
+        "rebaseline_recommendation": rebaseline,    # set when |drift| > $1
+    }
+
+
+def rebaseline_bankroll(db: Session, *, confirm: bool, balance_fn=None) -> dict:
+    """Guarded re-baseline of the LOCAL bankroll to venue reality. Aligns accounting
+    only — writes ONLY bankroll + starting_bankroll. Preserves realized P/L, open
+    positions, executions, fill prices, and history. Never places/cancels orders or
+    touches sizing/ranking/eligibility/risk caps.
+
+      new_bankroll          = venue_available_cash + open_exposure (reconciled cost)
+      new_starting_bankroll = new_bankroll - total_realized_pnl   (invariant held)
+    """
+    if not confirm:
+        return {"ok": False, "error": "confirmation required ({\"confirm\": true})"}
+    cfg = get_config()
+    bal = (balance_fn or venue_balance)(executor=cfg.executor)
+    venue_cash = bal.get("available_usdc")
+    if venue_cash is None:
+        return {"ok": False, "error": f"venue balance unavailable: {bal.get('error') or 'unknown'}",
+                "venue_balance_source": bal.get("source")}
+    # open exposure from the RECONCILED actual cost basis (size_usd already fixed by
+    # fill reconciliation); excludes resolved-but-unsettled markets.
+    open_exposure = round(sum(e.size_usd for e in _open_active(db)), 2)
+    realized = round(_realized_total(db), 2)
+    st = get_state(db)
+    old_bankroll = round(st.bankroll, 2)
+    old_starting = round(st.starting_bankroll, 2)
+    new_bankroll = round(venue_cash + open_exposure, 2)
+    new_starting = round(new_bankroll - realized, 2)
+    # write ONLY the two baseline figures — nothing else is touched
+    st.bankroll = new_bankroll
+    st.starting_bankroll = new_starting
+    db.commit()
+    print(f"[live] bankroll re-baselined: bankroll {old_bankroll}->{new_bankroll}, "
+          f"starting {old_starting}->{new_starting} (venue={venue_cash} + open={open_exposure}, "
+          f"realized preserved={realized})")
+    return {
+        "ok": True,
+        "old_bankroll": old_bankroll, "new_bankroll": new_bankroll,
+        "old_starting_bankroll": old_starting, "new_starting_bankroll": new_starting,
+        "venue_cash": venue_cash, "open_exposure": open_exposure,
+        "realized_pnl_preserved": realized,
+        "venue_balance_source": bal.get("source"),
+        "note": "accounting only — realized P/L, open positions, executions and history unchanged",
     }
 
 

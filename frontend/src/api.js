@@ -129,6 +129,7 @@ export const api = {
   liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
   liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),
   liveReconcileAccount: () => request('/api/live/reconcile-account', { method: 'POST' }),
+  liveRebaselineBankroll: () => request('/api/live/rebaseline-bankroll', { method: 'POST', body: JSON.stringify({ confirm: true }) }),
   liveSizingSimulation: (limit = 1000) => request(`/api/live/sizing-simulation?limit=${limit}`),
   liveReconcileFills: (limit = 300) => request(`/api/live/reconcile-fills?limit=${limit}`, { method: 'POST' }),
   liveReconcilerStatus: () => request('/api/live/reconciler-status'),

@@ -214,6 +214,22 @@ export default function LiveTrading() {
 
   useEffect(() => { reconcileAccount() }, [reconcileAccount])  // one async fetch on mount
 
+  const rebaselineBankroll = async () => {
+    const r = account?.rebaseline_recommendation
+    const warn = r
+      ? `Re-baseline local bankroll to venue reality?\n\n  bankroll: ${fmt.usd2(r.old_bankroll)} → ${fmt.usd2(r.proposed_bankroll)}\n  starting: ${fmt.usd2(r.old_starting_bankroll)} → ${fmt.usd2(r.proposed_starting_bankroll)}\n\nAccounting only — realized P/L, open positions, executions and history are preserved. No orders are placed.`
+      : 'Re-baseline local bankroll to venue reality? (accounting only — no orders, history preserved)'
+    if (!window.confirm(warn)) return
+    setReconciling(true)
+    try {
+      const res = await api.liveRebaselineBankroll()
+      const d = res?.detail || {}
+      if (d.ok === false) { flash(d.error || 'rebaseline refused', true) }
+      else { flash(`Bankroll re-baselined: ${fmt.usd2(d.old_bankroll)} → ${fmt.usd2(d.new_bankroll)} (realized P/L preserved ${fmt.usd2(d.realized_pnl_preserved)})`) }
+      await reconcileAccount()                 // refresh account + status after
+    } catch (e) { flash(e.message, true) } finally { setReconciling(false) }
+  }
+
   if (loading) return <Loading />
   const s = data.status
   if (error && !s) return <Empty>Live status unavailable: {error}</Empty>
@@ -298,10 +314,28 @@ export default function LiveTrading() {
       <div className="panel">
         <div className="page-head" style={{ marginBottom: 8 }}>
           <h2 style={{ margin: 0 }}>Account {reconciling && <span className="muted small">· reconciling…</span>}</h2>
-          <button onClick={reconcileAccount} disabled={reconciling}>
-            {reconciling ? 'Reconciling…' : '⟳ Reconcile Account'}
-          </button>
+          <div className="toolbar">
+            <button onClick={reconcileAccount} disabled={reconciling}>
+              {reconciling ? 'Reconciling…' : '⟳ Reconcile Account'}
+            </button>
+            <button className="danger" onClick={rebaselineBankroll} disabled={reconciling}
+              title="Align local bankroll baseline with venue reality (accounting only)">
+              ⚖ Re-baseline Local Bankroll
+              {account?.rebaseline_recommendation && <span className="badge bad" style={{ marginLeft: 4 }}>drift</span>}
+            </button>
+          </div>
         </div>
+        {account?.rebaseline_recommendation && (
+          <div className="diag-strip neg" style={{ marginBottom: 8 }}>
+            ⚖ Baseline drift detected: bankroll {fmt.usd2(account.rebaseline_recommendation.old_bankroll)} →
+            <b> {fmt.usd2(account.rebaseline_recommendation.proposed_bankroll)}</b> · starting
+            {' '}{fmt.usd2(account.rebaseline_recommendation.old_starting_bankroll)} →
+            <b> {fmt.usd2(account.rebaseline_recommendation.proposed_starting_bankroll)}</b>
+            {' '}(venue cash {fmt.usd2(account.rebaseline_recommendation.venue_cash)} + open exposure
+            {' '}{fmt.usd2(account.rebaseline_recommendation.open_exposure)}; realized P/L
+            {' '}{fmt.usd2(account.rebaseline_recommendation.realized_pnl)} preserved).
+          </div>
+        )}
         <div className="cards">
           <StatusCard label="Venue cash (live)" value={account?.venue_cash == null ? '—' : fmt.usd2(account.venue_cash)}
             sub={account?.venue_balance_error ? 'unavailable' : (account?.venue_balance_source || 'on-venue USDC')} tone="pos" />
