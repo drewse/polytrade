@@ -183,6 +183,30 @@ def test_refresh_never_touches_live_trading_or_production(in_memory_db):
     assert db.get(Wallet, w.id).copy_enabled == copy_before              # copy flag unchanged
 
 
+def test_fingerprint_handles_unresolved_markets(in_memory_db):
+    """A wallet with more buys than settled (open/unresolved BTC5m markets) must
+    fingerprint without error (regression: sizing detection index alignment)."""
+    db = in_memory_db
+    w = Wallet(address="0xmix", last_active=datetime.utcnow())
+    db.add(w); db.flush()
+    for mi in range(12):
+        created = datetime.utcnow() - timedelta(hours=mi)
+        resolved = (mi % 2 == 0)                       # half open, half resolved
+        db.add(Market(id=f"btc5m-{mi}", question=f"Bitcoin Up or Down 5m #{mi}", slug=f"s-{mi}",
+                      outcomes=["Up", "Down"], token_ids=["t1", "t2"], prices=[0.5, 0.5],
+                      resolved=resolved, resolved_outcome="Up" if resolved else None,
+                      resolved_at=(created + timedelta(minutes=5)) if resolved else None,
+                      created_at=created, volume=500.0))
+        db.add(Trade(external_id=f"tx-{mi}", wallet_id=w.id, market_id=f"btc5m-{mi}", outcome="Up",
+                     side="buy", price=0.5, size=3.0 + mi, timestamp=created + timedelta(seconds=60)))
+    db.commit()
+    btc5m.index_dataset(db, limit_markets=None)
+    fp = btc5m.fingerprint_wallets(db)                 # must not raise
+    assert fp["profiles"] == 1
+    prof = db.scalars(select(bm.Btc5mWalletProfile)).first()
+    assert prof.metrics["buy_count"] == 12 and prof.settled_count == 6
+
+
 def test_dashboard_shape(in_memory_db):
     db = in_memory_db
     _seed(db, n_markets=8, n_wallets=6)

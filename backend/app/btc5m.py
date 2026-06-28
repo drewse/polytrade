@@ -399,8 +399,8 @@ def _fingerprint_one(trades: list[bm.Btc5mTrade], global_share: dict) -> dict:
         # direction
         "yes_pct": round(yes / len(buys), 4) if buys else 0.0,
         "no_pct": round(1 - yes / len(buys), 4) if buys else 0.0,
-        # sizing
-        "sizing_behavior": _detect_sizing(sizes, wins_seq),
+        # sizing (over SETTLED buys so sizes align with win/loss outcomes)
+        "sizing_behavior": _detect_sizing([t.usd_value for t in settled], wins_seq),
         # consistency
         "longest_win_streak": best_w,
         "longest_loss_streak": best_l,
@@ -516,11 +516,15 @@ def fingerprint_wallets(db: Session) -> dict:
     for addr, trs in by_wallet.items():
         if len(trs) < MIN_WALLET_TRADES:
             continue
-        share = _global_share(db, addr, market_ids)
-        metrics = _fingerprint_one(trs, share)
-        feat_means = _avg_features(trs)
-        cluster, conf = assign_cluster(metrics, feat_means)
-        iq = _wallet_iq(metrics, cluster, feat_means)
+        try:
+            share = _global_share(db, addr, market_ids)
+            metrics = _fingerprint_one(trs, share)
+            feat_means = _avg_features(trs)
+            cluster, conf = assign_cluster(metrics, feat_means)
+            iq = _wallet_iq(metrics, cluster, feat_means)
+        except Exception as exc:  # noqa: BLE001  (one messy wallet must not fail the batch)
+            print(f"[btc5m] fingerprint skipped {addr[:12]}: {type(exc).__name__}: {exc}")
+            continue
         profitable = metrics["roi"] > PROFITABLE_MIN_ROI and metrics["settled_count"] >= 5
 
         prof = db.get(bm.Btc5mWalletProfile, addr) or bm.Btc5mWalletProfile(wallet_address=addr)
