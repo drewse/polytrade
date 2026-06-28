@@ -5,6 +5,8 @@ import PromotionCandidates from './PromotionCandidates.jsx'
 import ShadowPortfolio from './ShadowPortfolio.jsx'
 import DiscoveryCandidates from './DiscoveryCandidates.jsx'
 import TopWalletsAudit from './TopWalletsAudit.jsx'
+import ApprovedWallets from './ApprovedWallets.jsx'
+import WalletApprovalQueue from './WalletApprovalQueue.jsx'
 
 const REFRESH_MS = 10000
 
@@ -325,12 +327,16 @@ export default function LiveTrading() {
         <button className={`tab ${tab === 'promotion' ? 'active' : ''}`} onClick={() => setTab('promotion')}>Promotion Candidates</button>
         <button className={`tab ${tab === 'shadow' ? 'active' : ''}`} onClick={() => setTab('shadow')}>Shadow Portfolio</button>
         <button className={`tab ${tab === 'discovery' ? 'active' : ''}`} onClick={() => setTab('discovery')}>Discovery Candidates</button>
+        <button className={`tab ${tab === 'approved' ? 'active' : ''}`} onClick={() => setTab('approved')}>Approved Wallets</button>
+        <button className={`tab ${tab === 'queue' ? 'active' : ''}`} onClick={() => setTab('queue')}>Approval Queue</button>
         <button className={`tab ${tab === 'audit' ? 'active' : ''}`} onClick={() => setTab('audit')}>Top 20 Audit</button>
       </div>
 
       {tab === 'promotion' && <PromotionCandidates />}
       {tab === 'shadow' && <ShadowPortfolio />}
       {tab === 'discovery' && <DiscoveryCandidates />}
+      {tab === 'approved' && <ApprovedWallets />}
+      {tab === 'queue' && <WalletApprovalQueue />}
       {tab === 'audit' && <TopWalletsAudit />}
 
       {tab === 'dashboard' && <>

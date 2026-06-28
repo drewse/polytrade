@@ -31,6 +31,8 @@ def config() -> dict:
         # 1. public all-time P/L gate
         "min_public_pnl": float(os.getenv("LIVE_MIN_PUBLIC_ALL_TIME_PNL", "0")),
         "require_public_stats": _truthy(os.getenv("LIVE_REQUIRE_PUBLIC_STATS", "false")),
+        # exclude wallets whose public all-time P/L is not strictly positive
+        "require_public_profitable": _truthy(os.getenv("LIVE_REQUIRE_PUBLIC_PROFITABLE", "false")),
         # 2. partial-history gate
         "allow_partial_history": _truthy(os.getenv("LIVE_ALLOW_PARTIAL_HISTORY", "false")),
         # 3. coverage gate
@@ -90,6 +92,9 @@ def evaluate(*, partial_history: bool | None, public: dict | None,
         if pnl is not None and pnl < cfg["min_public_pnl"]:
             exclusions.append({"code": "public_pnl_below_min",
                                "message": f"public all-time P/L {pnl:,.0f} < {cfg['min_public_pnl']:,.0f}"})
+        elif cfg["require_public_profitable"] and pnl is not None and pnl <= 0:
+            exclusions.append({"code": "public_not_profitable",
+                               "message": f"public all-time P/L {pnl:,.0f} is not positive"})
         # 4. whale / market-maker gate
         vol = public.get("volume_all")
         if vol is None:

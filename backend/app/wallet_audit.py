@@ -208,6 +208,8 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
     now = datetime.utcnow()
     wallets = {w.address.lower(): w for w in db.scalars(select(Wallet)).all()}
     stats = {s.wallet_id: s for s in db.scalars(select(WalletStat)).all()}
+    from .wallet_approval_models import WalletBackfillProgress
+    progress = {p.address.lower(): p for p in db.scalars(select(WalletBackfillProgress)).all()}
     out = []
     for i, r in enumerate(eligible_rows):
         w = wallets.get(r["address"].lower())
@@ -248,6 +250,13 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
             "would_be_excluded": (not hv["pass"]),
             "hardened_exclusions": hv["exclusions"],
             "hardened_unknowns": hv["unknowns"],
+            # manual controls + deep-backfill coverage grade (explainability)
+            "manual_status": r.get("manual_status", "none"),
+            "manually_approved": r.get("manually_approved", False),
+            "manually_disabled": r.get("manually_disabled", False),
+            "coverage_grade": (progress.get(r["address"].lower()).coverage_grade
+                               if progress.get(r["address"].lower()) else (coverage or {}).get("level", "unknown")),
+            "public_profitable": (None if not pub or pub.get("pnl_all") is None else (pub["pnl_all"] > 0)),
         })
     # --- hardening summary (what the hardened gates WOULD remove) ---
     def _excluded_by(code):

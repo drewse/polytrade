@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_audit, wallet_audit_models  # noqa: F401  (btc5m_models/research_models/market_intel_models/challenger_models/wallet_audit_models imports register tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -523,6 +523,42 @@ def live_reconciler_status(db: Session = Depends(get_db)) -> MessageOut:
     detail = fill_reconciler.status()
     detail["pending_count"] = live.pending_reconciliation_count(db)
     return MessageOut(message="reconciler status", detail=detail)
+
+
+@app.post("/api/live/deep-backfill/run-once", response_model=MessageOut)
+def live_deep_backfill_run_once(batch: int = 3, max_pages: int | None = None,
+                                db: Session = Depends(get_db)) -> MessageOut:
+    """Deep-backfill the highest-priority wallets to improve coverage (data quality
+    only). Resumable + idempotent. Never auto-approves or places orders."""
+    return MessageOut(message="deep backfill batch",
+                      detail=deep_backfill.run_deep_backfill(db, batch=batch, max_pages=max_pages))
+
+
+@app.get("/api/live/deep-backfill/status", response_model=MessageOut)
+def live_deep_backfill_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="deep backfill status", detail=deep_backfill.backfill_status(db))
+
+
+@app.get("/api/live/approved-wallets", response_model=MessageOut)
+def live_approved_wallets(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="approved wallets", detail=wallet_approval.approved_wallets(db))
+
+
+@app.post("/api/live/wallet-approval/{address}", response_model=MessageOut)
+def live_wallet_approval(address: str, action: str, note: str | None = None,
+                         by: str | None = None, db: Session = Depends(get_db)) -> MessageOut:
+    """Apply a manual control: disable | enable | approve | remove_approval | reject
+    | watchlist | reset | request_backfill. Manual disable is a HARD override; no
+    action makes a wallet copyable by itself (gates still apply)."""
+    result = wallet_approval.set_status(db, address, action, by=by, note=note)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return MessageOut(message="wallet approval updated", detail=result)
+
+
+@app.get("/api/live/wallet-approval-queue", response_model=MessageOut)
+def live_wallet_approval_queue(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="wallet approval queue", detail=wallet_approval.approval_queue(db))
 
 
 @app.get("/api/live/top-wallets-audit", response_model=MessageOut)

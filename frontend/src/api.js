@@ -134,6 +134,11 @@ export const api = {
   liveReconcileFills: (limit = 300) => request(`/api/live/reconcile-fills?limit=${limit}`, { method: 'POST' }),
   liveTopWalletsAudit: (refreshPublic = false) => request(`/api/live/top-wallets-audit${refreshPublic ? '?refresh_public=true' : ''}`),
   liveWalletAuditDetail: (address) => request(`/api/live/top-wallets-audit/${encodeURIComponent(address)}`),
+  liveDeepBackfillRunOnce: (batch = 3) => request(`/api/live/deep-backfill/run-once?batch=${batch}`, { method: 'POST' }),
+  liveDeepBackfillStatus: () => request('/api/live/deep-backfill/status'),
+  liveApprovedWallets: () => request('/api/live/approved-wallets'),
+  liveWalletApproval: (address, action, note) => request(`/api/live/wallet-approval/${encodeURIComponent(address)}?action=${encodeURIComponent(action)}${note ? `&note=${encodeURIComponent(note)}` : ''}`, { method: 'POST' }),
+  liveWalletApprovalQueue: () => request('/api/live/wallet-approval-queue'),
   liveReconcilerStatus: () => request('/api/live/reconciler-status'),
   // BTC 5M Reversal Lab — isolated read-only research
   btc5mDashboard: () => request('/api/btc5m/dashboard'),

@@ -28,6 +28,14 @@ from sqlalchemy.orm import Session
 from . import positions as positions_mod, ranking_hardening
 from .models import Market, Trade, Wallet, WalletCandidate, WalletStat
 from .top20 import reputation
+from .wallet_approval_models import WalletApproval
+
+
+def _require_manual_approval() -> bool:
+    """When true, a wallet must be manually approved (and still pass gates) to be
+    eligible. Default false -> manual approval is opt-in and current behaviour is
+    unchanged (only explicit disable/reject/watchlist hard-exclude)."""
+    return str(os.getenv("LIVE_REQUIRE_MANUAL_APPROVAL", "false")).strip().lower() in ("1", "true", "yes", "on")
 
 WEIGHTS = {"reputation": 0.40, "profit_factor": 0.30, "roi": 0.20, "recency": 0.10}
 
@@ -94,10 +102,12 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
     score (eligible first)."""
     cfg = _cfg()
     hcfg = ranking_hardening.config()
+    require_approval = _require_manual_approval()
     now = datetime.utcnow()
     stats = {s.wallet_id: s for s in db.scalars(select(WalletStat)).all()}
     cands = {c.wallet_id: c for c in db.scalars(select(WalletCandidate)).all()}
     wallets = {w.id: w for w in db.scalars(select(Wallet)).all()}
+    approvals = {a.address.lower(): a for a in db.scalars(select(WalletApproval)).all()}
     rows = []
     for wid, stat in stats.items():
         w = wallets.get(wid)
@@ -106,6 +116,18 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
         cand = cands.get(wid)
         copyability = float(cand.copyability_score) if cand else 0.0
         passed, reason = passes_filters(stat, w, now, cfg)
+        ap = approvals.get(w.address.lower())
+        # MANUAL controls (operator actions) — ALWAYS enforced, independent of the
+        # audit-only flag. Manual disable/reject/watchlist hard-exclude.
+        manual_block = None
+        if ap and ap.manually_disabled:
+            manual_block = "manually disabled (hard override)"
+        elif ap and ap.status == "rejected":
+            manual_block = "manually rejected"
+        elif ap and ap.status == "watchlist":
+            manual_block = "watchlist (monitored only)"
+        elif require_approval and not (ap and ap.manually_approved):
+            manual_block = "awaiting manual approval"
         row = {
             "address": w.address, "copyability": round(copyability, 1),
             "production_rank_score": 0.0, "eligible": passed, "base_eligible": passed,
@@ -117,6 +139,10 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
             "classification": cand.classification if cand else None,
             # hardened gates (audit-only by default — does NOT change eligibility)
             "hardened_pass": None, "hardened_exclusions": [], "hardened_unknowns": [], "coverage_ratio": None,
+            # manual controls (always enforced)
+            "manual_status": (ap.status if ap else "none"),
+            "manually_approved": bool(ap and ap.manually_approved),
+            "manually_disabled": bool(ap and ap.manually_disabled),
         }
         if passed:
             rep = _reputation_score(db, w)
@@ -134,6 +160,10 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
             if not hcfg["audit_only"] and not verdict["pass"]:
                 row["eligible"] = False
                 row["filter_reason"] = "hardened: " + ", ".join(e["code"] for e in verdict["exclusions"])
+        # MANUAL override takes top precedence — always wins (even if base passes).
+        if manual_block:
+            row["eligible"] = False
+            row["filter_reason"] = manual_block
         if passed or include_failed:
             rows.append(row)
     rows.sort(key=lambda r: (r["eligible"], r["production_rank_score"]), reverse=True)

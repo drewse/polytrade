@@ -75,6 +75,14 @@ export function HardeningSummary({ hardening }) {
   )
 }
 
+function ApprovalCell({ w }) {
+  if (w.manually_disabled) return <td data-testid="approval-cell"><span className="badge bad" title="manually disabled (hard override) — never copied">⛔ disabled</span></td>
+  if (w.manually_approved) return <td data-testid="approval-cell"><span className="badge yes" title="manually approved — still must pass gates">✓ approved</span></td>
+  if (w.manual_status === 'rejected') return <td data-testid="approval-cell"><span className="badge bad">rejected</span></td>
+  if (w.manual_status === 'watchlist') return <td data-testid="approval-cell"><span className="badge open">👁 watch</span></td>
+  return <td data-testid="approval-cell"><span className="muted small">—</span></td>
+}
+
 function HardenedCell({ w }) {
   if (w.hardened_pass == null) return <td className="muted">—</td>
   if (w.hardened_pass) return <td><span className="badge yes">pass</span></td>
@@ -97,7 +105,7 @@ export function AuditTable({ rows, onSelect }) {
           <th className="right">Int ROI</th><th className="right">PF</th><th className="right">Win%</th><th className="right">Settled</th>
           <th className="right">Int P/L</th><th className="right">Public all-time</th><th className="right">Pos value</th><th className="right">Preds</th>
           <th className="right">1D</th><th className="right">7D</th><th className="right">30D</th><th className="right">90D</th>
-          <th>Coverage</th><th>Hardened</th><th>Warnings</th>
+          <th>Coverage</th><th>Approval</th><th>Pub✓</th><th>Hardened</th><th>Warnings</th>
         </tr></thead>
         <tbody>
           {rows.map((w) => (
@@ -117,7 +125,9 @@ export function AuditTable({ rows, onSelect }) {
               {['1d', '7d', '30d', '90d'].map((k) => (
                 <td key={k} className={`right small ${(w.rolling?.[k]?.pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{w.rolling?.[k] ? num(w.rolling[k].pnl, 0) : '—'}</td>
               ))}
-              <td><span className={`badge ${w.internal?.backfill_coverage?.level === 'low' ? 'bad' : w.internal?.backfill_coverage?.level === 'high' ? 'yes' : 'neutral'}`}>{w.internal?.backfill_coverage?.level || '—'}</span></td>
+              <td><span className={`badge ${(w.coverage_grade || w.internal?.backfill_coverage?.level) === 'low' || (w.coverage_grade || w.internal?.backfill_coverage?.level) === 'unknown' ? 'bad' : ['high', 'complete'].includes(w.coverage_grade || w.internal?.backfill_coverage?.level) ? 'yes' : 'neutral'}`}>{w.coverage_grade || w.internal?.backfill_coverage?.level || '—'}</span></td>
+              <ApprovalCell w={w} />
+              <td className="right">{w.public_profitable == null ? <span className="muted">—</span> : <span className={w.public_profitable ? 'pos' : 'neg'}>{w.public_profitable ? '✓' : '✗'}</span>}</td>
               <HardenedCell w={w} />
               <td><WarningChips warnings={w.warnings} /></td>
             </tr>
