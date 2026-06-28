@@ -1501,13 +1501,50 @@ def reconcile_account(db: Session, *, client=None, balance_fn=None) -> dict:
 # ACTUAL executed fills (data-api wallet trades) and corrects the recorded fill
 # price / cost-basis / exposure / realized-P&L / bankroll. ACCOUNTING ONLY.
 # ---------------------------------------------------------------------------
+def _naive(dt):
+    """Normalize to naive UTC so venue (tz-aware) and DB (tz-naive) times compare."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def _match_fills(ex, trades, *, window_s: float) -> list[dict]:
+    """PURE matcher: pick the venue trades that belong to one execution and return
+    [{price,size,fee}]. Matches on market + side + outcome + a time window AND the
+    filled SHARE COUNT (== what we ordered) so repeated orders on the same market
+    are disambiguated. tz-safe. Returns [] when nothing matches (-> stays pending,
+    never fabricated)."""
+    ec = _naive(getattr(ex, "created_at", None))
+    out = []
+    for t in trades:
+        if getattr(t, "market_id", None) != ex.market_id:
+            continue
+        if (getattr(t, "side", None) or "").lower() != (ex.side or "buy").lower():
+            continue
+        if ex.outcome and getattr(t, "outcome", None) and str(t.outcome).lower() != str(ex.outcome).lower():
+            continue
+        ts = _naive(getattr(t, "timestamp", None))
+        if ec and ts and abs((ts - ec).total_seconds()) > window_s:
+            continue
+        price = _num(getattr(t, "price", None))
+        shares = _num(getattr(t, "shares", None))
+        if shares is None and price:
+            shares = (_num(getattr(t, "size", None)) or 0.0) / price     # data-api size = USD notional
+        if price is None or not shares:
+            continue
+        # precise per-order match: the executed quantity equals what we ordered
+        if ex.shares and abs(shares - ex.shares) > max(0.05, 0.02 * ex.shares):
+            continue
+        out.append({"price": price, "size": shares, "fee": 0.0})
+    return out
+
+
 def _default_fills_fetcher():
-    """Build a fetcher that returns an execution's ACTUAL fills [{price,size,fee}]
-    from the venue's own records (data-api wallet trades), matched by market + side
-    + outcome + a time window around the order. Returns [] on any failure (caller
-    then leaves the row pending — we never fabricate a fill)."""
+    """Build a fetcher returning an execution's ACTUAL fills [{price,size,fee}] from
+    the venue's own records (data-api wallet trades). Returns [] on any failure
+    (caller then leaves the row pending — we never fabricate a fill)."""
     funder = _configured_funder()
-    window_s = float(os.getenv("LIVE_FILL_RECON_WINDOW_MIN", "30")) * 60.0
+    window_s = float(os.getenv("LIVE_FILL_RECON_WINDOW_MIN", "15")) * 60.0
 
     def fetch(ex) -> list[dict]:
         if not funder:
@@ -1518,22 +1555,7 @@ def _default_fills_fetcher():
         except Exception as exc:  # noqa: BLE001
             print(f"[live] fills fetch failed for exec {getattr(ex, 'id', '?')}: {exc}")
             return []
-        out = []
-        for t in trades:
-            if t.market_id != ex.market_id or (t.side or "").lower() != (ex.side or "buy").lower():
-                continue
-            if ex.outcome and t.outcome and str(t.outcome).lower() != str(ex.outcome).lower():
-                continue
-            if ex.created_at and t.timestamp and abs((t.timestamp - ex.created_at).total_seconds()) > window_s:
-                continue
-            price = _num(t.price)
-            shares = _num(getattr(t, "shares", None))
-            if shares is None and price:
-                shares = _num(t.size) / price if price else None     # size is USD notional
-            if price is None or not shares:
-                continue
-            out.append({"price": price, "size": shares, "fee": 0.0})
-        return out
+        return _match_fills(ex, trades, window_s=window_s)
 
     return fetch
 

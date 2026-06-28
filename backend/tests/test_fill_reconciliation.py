@@ -4,12 +4,35 @@ with bankroll adjustment), no-venue-data -> pending (never fabricated), and
 delayed reconciliation by the worker pass."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
 from app import live
 from app.models import LiveExecution, LiveState, Market
+
+
+def _vt(market_id, side, outcome, price, shares, ts):
+    return SimpleNamespace(market_id=market_id, side=side, outcome=outcome, price=price,
+                           shares=shares, size=round(price * shares, 4), timestamp=ts)
+
+
+def test_match_fills_is_tz_safe_and_share_precise():
+    # ex.created_at is tz-NAIVE (DB); venue timestamps are tz-AWARE — must not raise
+    ex = SimpleNamespace(market_id="cond1", side="buy", outcome="Under", shares=9.52,
+                         created_at=datetime(2026, 6, 28, 1, 33, 45))
+    aware = datetime(2026, 6, 28, 1, 33, 50, tzinfo=timezone.utc)
+    trades = [
+        _vt("cond1", "BUY", "Under", 0.01, 9.52, aware),                 # the real fill
+        _vt("cond1", "BUY", "Under", 0.30, 3.00, aware),                 # same mkt, WRONG shares
+        _vt("condX", "BUY", "Under", 0.01, 9.52, aware),                 # wrong market
+        _vt("cond1", "SELL", "Under", 0.01, 9.52, aware),                # wrong side
+        _vt("cond1", "BUY", "Under", 0.01, 9.52, datetime(2026, 6, 28, 5, 0, tzinfo=timezone.utc)),  # out of window
+    ]
+    fills = live._match_fills(ex, trades, window_s=900)
+    assert len(fills) == 1 and fills[0]["price"] == 0.01 and fills[0]["size"] == 9.52
+    assert live._vwap_fills(fills)["cost"] == round(0.01 * 9.52, 6)      # ~$0.095, not $4.00
 
 
 # --- VWAP + parsing ---------------------------------------------------------
