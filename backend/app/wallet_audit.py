@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import live_ranking, positions as positions_mod, public_profile
+from . import live_ranking, positions as positions_mod, public_profile, ranking_hardening
 from .models import DiscoverySource, Market, Trade, Wallet, WalletStat
 
 WHALE_VOLUME = 1_000_000.0          # public lifetime volume above this => likely MM/whale
@@ -194,9 +194,12 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
     """Audit the current production Top-N (the wallets the executor may copy).
     READ-ONLY — never changes ranking/eligibility/execution."""
     cfg = live_ranking._cfg()
+    hcfg = ranking_hardening.config()
     ranked = live_ranking.rank_wallets(db, include_failed=True)       # READ ONLY
-    eligible_set = live_ranking.eligible_addresses(db)               # READ ONLY (top-N)
-    eligible_rows = [r for r in ranked if r["eligible"]][: cfg["top_n"]]
+    eligible_set = live_ranking.eligible_addresses(db)               # READ ONLY (current copied top-N)
+    # audit the BASE-eligible top-N (the candidate pool) in BOTH modes so the
+    # dashboard always shows the full current set + what hardening would remove.
+    eligible_rows = [r for r in ranked if r.get("base_eligible")][: cfg["top_n"]]
     addrs = [r["address"] for r in eligible_rows]
     refresh_info = None
     if refresh_public:
@@ -217,6 +220,10 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
         internal["backfill_coverage"] = coverage
         warnings = _warnings(r, internal, rolling, pub, coverage)
         strengths, weaknesses = _strengths_weaknesses(internal, rolling, pub)
+        # hardened verdict computed with the FRESH public stats just fetched
+        hv = ranking_hardening.evaluate(
+            partial_history=internal.get("partial_history"), public=pub,
+            internal_volume=internal.get("volume"), internal_settled=internal.get("num_settled"), cfg=hcfg)
         out.append({
             "rank": i + 1,
             "address": r["address"],
@@ -236,7 +243,40 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
             "weaknesses": weaknesses,
             "warnings": warnings,
             "warning_count": len(warnings),
+            # hardened-rules verdict (display; enforcement only when audit_only=false)
+            "hardened_pass": hv["pass"],
+            "would_be_excluded": (not hv["pass"]),
+            "hardened_exclusions": hv["exclusions"],
+            "hardened_unknowns": hv["unknowns"],
         })
+    # --- hardening summary (what the hardened gates WOULD remove) ---
+    def _excluded_by(code):
+        return [w["address"] for w in out if any(e["code"] == code for e in w["hardened_exclusions"])]
+
+    would_pass = [w for w in out if w["hardened_pass"]]
+    removed = [w["address"] for w in out if w["copied"] and not w["hardened_pass"]]
+    hardening = {
+        "audit_only": hcfg["audit_only"],
+        "mode": "AUDIT-ONLY (no eligibility change)" if hcfg["audit_only"] else "ENFORCED",
+        "thresholds": {
+            "min_public_all_time_pnl": hcfg["min_public_pnl"],
+            "require_public_stats": hcfg["require_public_stats"],
+            "allow_partial_history": hcfg["allow_partial_history"],
+            "min_coverage_ratio": hcfg["min_coverage_ratio"],
+            "max_public_volume": hcfg["max_public_volume"],
+            "max_position_size": hcfg["max_position_size"],
+        },
+        "current_eligible_count": len(out),
+        "would_pass_hardened_count": len(would_pass),
+        "would_pass_addresses": [w["address"] for w in would_pass],
+        "excluded_by_public_pnl": _excluded_by("public_pnl_below_min"),
+        "excluded_by_partial_history": _excluded_by("partial_history"),
+        "excluded_by_coverage": _excluded_by("low_coverage"),
+        "excluded_by_whale": _excluded_by("whale_volume"),
+        "excluded_by_missing_public": _excluded_by("missing_public_stats"),
+        "excluded_by_large_position": _excluded_by("large_position"),
+        "currently_copied_would_be_removed": removed,
+    }
     return {
         "generated_at": now.isoformat(),
         "top_n": cfg["top_n"],
@@ -246,6 +286,7 @@ def top_wallets_audit(db: Session, *, refresh_public: bool = False, force_refres
                     "min_settled": cfg["min_settled"], "active_days": cfg["active_days"]},
         "weights": live_ranking.WEIGHTS,
         "public_refresh": refresh_info,
+        "hardening": hardening,
         "wallets": out,
         "safety": "READ-ONLY audit — public stats are never used to alter ranking/eligibility/execution",
     }

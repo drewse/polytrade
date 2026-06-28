@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, fmt } from '../api'
-import { Loading, Empty, WalletLink } from '../components/common.jsx'
+import { Loading, Empty, WalletLink, Stat } from '../components/common.jsx'
 
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
@@ -15,6 +15,7 @@ const FILTERS = [
   { key: 'recent_good', label: 'Strong recent / bad lifetime', fn: (w) => hasWarn(w, 'recent_good_lifetime_bad') },
   { key: 'drawdown', label: 'High drawdown', fn: (w) => hasWarn(w, 'high_drawdown') },
   { key: 'whale', label: 'Likely market maker / whale', fn: (w) => hasWarn(w, 'likely_market_maker_whale') },
+  { key: 'would_exclude', label: 'Would be excluded (hardened)', fn: (w) => w.would_be_excluded },
 ]
 const SORTS = [
   { key: 'rank', label: 'Rank', val: (w) => w.rank, dir: 1 },
@@ -42,6 +43,50 @@ export function WarningChips({ warnings }) {
   )
 }
 
+export function HardeningSummary({ hardening }) {
+  if (!hardening) return null
+  const h = hardening
+  const t = h.thresholds || {}
+  return (
+    <div className="panel" data-testid="hardening-summary" style={{ borderLeft: `3px solid ${h.audit_only ? '#e0a73a' : '#ff5d6c'}` }}>
+      <div className="page-head" style={{ marginBottom: 6 }}>
+        <h3 style={{ margin: 0 }}>Hardened eligibility rules
+          <span className={`badge ${h.audit_only ? 'warn' : 'bad'}`} style={{ marginLeft: 8 }}>{h.mode}</span>
+        </h3>
+        <span className="muted small">{h.current_eligible_count} eligible → <b>{h.would_pass_hardened_count}</b> would pass hardened</span>
+      </div>
+      {h.audit_only && <div className="diag-strip">AUDIT-ONLY: these rules are computed but do NOT change which wallets are copied. Set LIVE_RANKING_AUDIT_ONLY=false to enforce.</div>}
+      <div className="cards">
+        <Stat label="Would pass" value={h.would_pass_hardened_count} sub={`of ${h.current_eligible_count}`} tone="pos" />
+        <Stat label="Excl: public P/L" value={(h.excluded_by_public_pnl || []).length} tone="neg" />
+        <Stat label="Excl: partial history" value={(h.excluded_by_partial_history || []).length} tone="neg" />
+        <Stat label="Excl: low coverage" value={(h.excluded_by_coverage || []).length} tone="neg" />
+        <Stat label="Excl: whale/MM" value={(h.excluded_by_whale || []).length} tone="neg" />
+        <Stat label="Copied → removed" value={(h.currently_copied_would_be_removed || []).length} tone="warn" />
+      </div>
+      {h.currently_copied_would_be_removed?.length > 0 && (
+        <p className="small" style={{ marginTop: 6 }}>Currently-copied wallets that WOULD be removed: {h.currently_copied_would_be_removed.map((a) => (
+          <span key={a} style={{ marginRight: 8 }}><WalletLink address={a} /></span>
+        ))}</p>
+      )}
+      <p className="muted small">Thresholds — min public all-time P/L {usd(t.min_public_all_time_pnl)} · allow partial history {String(t.allow_partial_history)} ·
+        min coverage {t.min_coverage_ratio} · max public volume {usd(t.max_public_volume)} · require public stats {String(t.require_public_stats)}</p>
+    </div>
+  )
+}
+
+function HardenedCell({ w }) {
+  if (w.hardened_pass == null) return <td className="muted">—</td>
+  if (w.hardened_pass) return <td><span className="badge yes">pass</span></td>
+  return (
+    <td data-testid="hardened-excluded">
+      {(w.hardened_exclusions || []).map((e, i) => (
+        <span key={i} className="badge bad" title={e.message} style={{ marginRight: 3 }}>{e.code.replace(/_/g, ' ')}</span>
+      ))}
+    </td>
+  )
+}
+
 export function AuditTable({ rows, onSelect }) {
   if (!rows?.length) return <Empty>No audited wallets.</Empty>
   return (
@@ -52,7 +97,7 @@ export function AuditTable({ rows, onSelect }) {
           <th className="right">Int ROI</th><th className="right">PF</th><th className="right">Win%</th><th className="right">Settled</th>
           <th className="right">Int P/L</th><th className="right">Public all-time</th><th className="right">Pos value</th><th className="right">Preds</th>
           <th className="right">1D</th><th className="right">7D</th><th className="right">30D</th><th className="right">90D</th>
-          <th>Coverage</th><th>Warnings</th>
+          <th>Coverage</th><th>Hardened</th><th>Warnings</th>
         </tr></thead>
         <tbody>
           {rows.map((w) => (
@@ -73,6 +118,7 @@ export function AuditTable({ rows, onSelect }) {
                 <td key={k} className={`right small ${(w.rolling?.[k]?.pnl ?? 0) >= 0 ? 'pos' : 'neg'}`}>{w.rolling?.[k] ? num(w.rolling[k].pnl, 0) : '—'}</td>
               ))}
               <td><span className={`badge ${w.internal?.backfill_coverage?.level === 'low' ? 'bad' : w.internal?.backfill_coverage?.level === 'high' ? 'yes' : 'neutral'}`}>{w.internal?.backfill_coverage?.level || '—'}</span></td>
+              <HardenedCell w={w} />
               <td><WarningChips warnings={w.warnings} /></td>
             </tr>
           ))}
@@ -199,6 +245,8 @@ export default function TopWalletsAudit() {
       </div>
       {msg && <div className="diag-strip neg">{msg}</div>}
       <div className="diag-strip">{data?.safety}</div>
+
+      <HardeningSummary hardening={data?.hardening} />
 
       <div className="promo-controls">
         <div className="promo-filters" role="group" aria-label="audit filter">

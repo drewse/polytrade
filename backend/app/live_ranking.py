@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import positions as positions_mod
+from . import positions as positions_mod, ranking_hardening
 from .models import Market, Trade, Wallet, WalletCandidate, WalletStat
 from .top20 import reputation
 
@@ -93,6 +93,7 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
     BOTH copyability (legacy) and production_rank_score (new), sorted by the new
     score (eligible first)."""
     cfg = _cfg()
+    hcfg = ranking_hardening.config()
     now = datetime.utcnow()
     stats = {s.wallet_id: s for s in db.scalars(select(WalletStat)).all()}
     cands = {c.wallet_id: c for c in db.scalars(select(WalletCandidate)).all()}
@@ -107,12 +108,15 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
         passed, reason = passes_filters(stat, w, now, cfg)
         row = {
             "address": w.address, "copyability": round(copyability, 1),
-            "production_rank_score": 0.0, "eligible": passed, "filter_reason": reason,
+            "production_rank_score": 0.0, "eligible": passed, "base_eligible": passed,
+            "filter_reason": reason,
             "roi": round(stat.realized_roi or 0, 4), "profit_factor": round(stat.profit_factor or 0, 4),
             "win_rate": round(stat.win_rate or 0, 4), "num_settled": int(stat.num_settled or 0),
             "recency": round(stat.recency_score or 0, 4), "reputation_score": None,
             "partial_history": bool(stat.partial_history),
             "classification": cand.classification if cand else None,
+            # hardened gates (audit-only by default — does NOT change eligibility)
+            "hardened_pass": None, "hardened_exclusions": [], "hardened_unknowns": [], "coverage_ratio": None,
         }
         if passed:
             rep = _reputation_score(db, w)
@@ -120,6 +124,16 @@ def rank_wallets(db: Session, include_failed: bool = False) -> list[dict]:
             row["production_rank_score"] = production_score(
                 reputation_score=rep, profit_factor=stat.profit_factor or 0,
                 roi=stat.realized_roi or 0, recency=stat.recency_score or 0)
+            verdict = ranking_hardening.verdict_for_wallet(db, w, stat, cfg=hcfg)
+            row["hardened_pass"] = verdict["pass"]
+            row["hardened_exclusions"] = verdict["exclusions"]
+            row["hardened_unknowns"] = verdict["unknowns"]
+            row["coverage_ratio"] = verdict["coverage"]
+            # ENFORCEMENT ONLY: when not audit-only, a hardened-excluded wallet
+            # becomes ineligible. In audit-only mode eligibility is UNCHANGED.
+            if not hcfg["audit_only"] and not verdict["pass"]:
+                row["eligible"] = False
+                row["filter_reason"] = "hardened: " + ", ".join(e["code"] for e in verdict["exclusions"])
         if passed or include_failed:
             rows.append(row)
     rows.sort(key=lambda r: (r["eligible"], r["production_rank_score"]), reverse=True)
