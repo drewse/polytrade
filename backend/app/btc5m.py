@@ -589,10 +589,13 @@ def _persist_leaderboard(db: Session, scope: str, result: dict) -> dict:
     champ_name = result["champion"]
     champ_f1 = next(m["f1"] for m in result["models"] if m["name"] == champ_name)
     promoted = champ_f1 > prior_f1 + 0.02
-    note = (f"champion {champ_name} F1={champ_f1:.3f} "
-            + (f"beat prior {prior.name} F1={prior_f1:.3f} (+{champ_f1 - prior_f1:.3f})"
+    base_f1 = result.get("baseline_f1", 0.0)
+    vs_base = (f"beats baseline floor ({base_f1:.3f})" if result.get("beats_baseline")
+               else f"does NOT beat baseline floor ({base_f1:.3f}) — direction looks ~efficient")
+    note = (f"champion {champ_name} F1={champ_f1:.3f}; {vs_base}. "
+            + (f"Beat prior {prior.name} F1={prior_f1:.3f} (+{champ_f1 - prior_f1:.3f})"
                if prior and promoted else
-               ("first champion" if not prior else f"kept (prior F1={prior_f1:.3f})")))
+               ("First champion." if not prior else f"Kept (prior F1={prior_f1:.3f}).")))
     for m in result["models"]:
         db.add(bm.Btc5mModel(
             name=m["name"], scope=scope, accuracy=m["accuracy"], precision=m["precision"],

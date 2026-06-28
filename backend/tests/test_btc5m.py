@@ -117,11 +117,10 @@ def test_train_models_persists_leaderboard_and_champion(in_memory_db):
     btc5m.fingerprint_wallets(db)
     out = btc5m.train_models(db)
     lb = btc5m.leaderboard(db, scope="global")
-    assert len(lb) == 5                                         # all families
+    assert len(lb) == 5                                         # all families on the leaderboard
     champs = [r for r in lb if r["is_champion"]]
     assert len(champs) == 1                                     # exactly one champion
-    base = next(r for r in lb if r["name"] == "baseline_majority")
-    assert champs[0]["f1"] >= base["f1"]                        # champion is not worse than baseline
+    assert champs[0]["name"] != "baseline_majority"            # champion is a LEARNED model, not the floor
     assert out["global"]["champion"] == champs[0]["name"]
 
 

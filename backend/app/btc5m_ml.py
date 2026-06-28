@@ -516,6 +516,12 @@ def train_and_compare(X: Matrix, y: list[int], *, feature_names: list[str] | Non
             # overfit gap: a big train-minus-test accuracy gap is a red flag
             "overfit_gap": round(m_train["accuracy"] - m_test["accuracy"], 4),
         })
-    champ = max(results, key=lambda r: (r["f1"], r["accuracy"], r["cv_f1"]))
+    # The champion is the best LEARNED model (baseline is kept on the leaderboard
+    # purely as a floor to beat — it never drives research/shadow predictions).
+    base_f1 = next((r["f1"] for r in results if r["name"] == "baseline_majority"), 0.0)
+    learned = [r for r in results if r["name"] != "baseline_majority"]
+    champ = max(learned or results, key=lambda r: (r["f1"], r["accuracy"], r["cv_f1"]))
     return {"trainable": True, "models": results, "champion": champ["name"],
+            "baseline_f1": base_f1, "champion_f1": champ["f1"],
+            "beats_baseline": champ["f1"] > base_f1,
             "n_rows": len(X), "n_rows_full": n_full, "n_features": len(X[0])}
