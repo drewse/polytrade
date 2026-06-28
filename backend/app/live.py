@@ -525,6 +525,8 @@ class OrderResult:
     venue_error: str | None = None
     tick_size: float | None = None        # venue book tick used (or fallback)
     min_order_size: float | None = None   # venue book min order size (shares) used
+    fill_source: str = "exact"            # exact|venue|pending|simulated|estimate
+    fill_pending: bool = False            # actual fills not yet retrieved -> reconcile later
 
 
 def _full_err(exc: Exception) -> str:
@@ -563,6 +565,123 @@ def _extract_order_id(resp) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Execution reconciliation — record the venue's ACTUAL executed fills (VWAP),
+# never the limit price. Pure helpers (parsing + VWAP) + best-effort fetchers.
+# This is ACCOUNTING ONLY: it changes what we RECORD, not how orders are placed.
+# ---------------------------------------------------------------------------
+def _num(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_venue_trades(raw, *, token_id: str | None = None, order_id: str | None = None) -> list[dict]:
+    """Normalize a venue trades payload into [{price, size, fee}]. Accepts a list,
+    or a dict wrapping the list under data/trades/history; tolerates field-name
+    variants. Filters to the order's token/id when the trade carries one."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raw = raw.get("data") or raw.get("trades") or raw.get("history") or raw.get("matches") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for t in raw:
+        if not isinstance(t, dict):
+            continue
+        # filter by token/order when those fields are present on the trade
+        tok = t.get("asset_id") or t.get("assetId") or t.get("token_id") or t.get("tokenId")
+        oid = t.get("order_id") or t.get("orderID") or t.get("orderHash") or t.get("takerOrderId")
+        if token_id and tok and str(tok) != str(token_id):
+            continue
+        if order_id and oid and str(oid) != str(order_id):
+            continue
+        price = _num(t.get("price") or t.get("matched_price") or t.get("avgPrice") or t.get("fill_price"))
+        size = _num(t.get("size") or t.get("matched_amount") or t.get("amount")
+                    or t.get("size_matched") or t.get("shares"))
+        if price is None or size is None or size <= 0:
+            continue
+        fee = _num(t.get("fee") or t.get("fee_paid") or t.get("feeUsd"), 0.0) or 0.0
+        out.append({"price": price, "size": size, "fee": fee})
+    return out
+
+
+def _vwap_fills(fills: list[dict]) -> dict | None:
+    """Size-weighted average execution: avg_price = Σ(price·qty)/Σqty. Returns the
+    actual executed quantity + cost (NEVER limit×shares). None if no fills."""
+    if not fills:
+        return None
+    qty = sum(f["size"] for f in fills)
+    if qty <= 0:
+        return None
+    cost = sum(f["price"] * f["size"] for f in fills)
+    fees = sum(f.get("fee", 0.0) for f in fills)
+    return {"avg_price": round(cost / qty, 6), "quantity": round(qty, 6),
+            "cost": round(cost, 6), "fees": round(fees, 6), "n_fills": len(fills)}
+
+
+def _clob_trades(client, *, order_id, token_id):
+    """Best-effort fetch of THIS order's fills from the authenticated CLOB client
+    (used in the hot place() path — same client, no extra auth). Returns parsed
+    fills or None when the client exposes no trades API (immediate -> pending)."""
+    getter = getattr(client, "get_trades", None)
+    if getter is None:
+        return None
+    for args in ((), ({"market": token_id},), ({"asset_id": token_id},)):
+        try:
+            raw = getter(*args)
+        except TypeError:
+            continue
+        except Exception:  # noqa: BLE001  (transient venue error -> caller may retry)
+            raise
+        fills = _parse_venue_trades(raw, token_id=token_id, order_id=order_id)
+        if fills:
+            return fills
+    return []
+
+
+def _fetch_clob_fills(client, *, order_id, token_id, retries: int, sleep_s: float):
+    """Bounded-retry wrapper around _clob_trades for the place() path. Returns
+    fills, or None when no trades API exists / nothing matched after retries."""
+    import time
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            last = _clob_trades(client, order_id=order_id, token_id=token_id)
+        except Exception:  # noqa: BLE001  (transient -> retry)
+            last = []
+        if last:                      # got fills
+            return last
+        if last is None:              # no trades API at all -> don't spin
+            return None
+        if attempt < retries - 1 and sleep_s > 0:
+            time.sleep(sleep_s)
+    return None
+
+
+def _resolve_fill(client, *, order_id, token_id, filled_shares, limit_price):
+    """Decide the recorded fill from the venue's ACTUAL executions. Returns
+    (fill_price, filled_usd, filled_shares, fees, fill_source, pending).
+    When the real fills can't be retrieved, marks PENDING and uses the conservative
+    limit-price upper bound for exposure — it never fabricates a real fill price;
+    the background reconciler corrects it once the venue confirms."""
+    retries = int(os.getenv("LIVE_FILL_RECON_RETRIES", "2"))
+    sleep_s = float(os.getenv("LIVE_FILL_RECON_SLEEP_S", "0.4"))
+    fills = _fetch_clob_fills(client, order_id=order_id, token_id=token_id,
+                             retries=retries, sleep_s=sleep_s)
+    recon = _vwap_fills(fills) if fills else None
+    if recon:
+        qty = round(recon["quantity"] or filled_shares, 4)
+        return (round(recon["avg_price"], 6), round(recon["cost"], 2), qty,
+                round(recon["fees"], 4), "venue", False)
+    return (round(limit_price, 6), round(filled_shares * limit_price, 2),
+            round(filled_shares, 4), 0.0, "pending", True)
+
+
 def _ask_price(a) -> float:
     """Best-ask price from a book level (v2 dict {price,size} OR a v1-style object)."""
     return float(a["price"] if isinstance(a, dict) else a.price)
@@ -586,7 +705,8 @@ class DryRunExecutor:
         shares = round(size_usd / max(0.01, price), 4)
         return OrderResult(outcome="simulated", fill_price=price, limit_price=price,
                            filled_usd=size_usd, filled_shares=shares, fees=0.0,
-                           order_id="dryrun", order_latency_ms=0.0, confirm_latency_ms=0.0)
+                           order_id="dryrun", order_latency_ms=0.0, confirm_latency_ms=0.0,
+                           fill_source="simulated", fill_pending=False)
 
 
 class PolymarketExecutor:
@@ -765,10 +885,15 @@ class PolymarketExecutor:
                 cancel_err = _full_err(exc)
 
         if fully:
-            return OrderResult(outcome="filled", fill_price=limit_price, limit_price=limit_price,
-                               filled_usd=round(shares * limit_price, 2), filled_shares=shares,
-                               fees=0.0, order_id=order_id, order_latency_ms=latency,
-                               confirm_latency_ms=latency, tick_size=tick, min_order_size=min_shares)
+            # ACCOUNTING: record the venue's ACTUAL executed fills (VWAP), not the
+            # limit. Execution above is unchanged; this only sets fill_price/cost.
+            fp, fusd, fsh, fee, src, pend = _resolve_fill(
+                client, order_id=order_id, token_id=token_id, filled_shares=shares, limit_price=limit_price)
+            return OrderResult(outcome="filled", fill_price=fp, limit_price=limit_price,
+                               filled_usd=fusd, filled_shares=fsh, fees=fee,
+                               order_id=order_id, order_latency_ms=latency,
+                               confirm_latency_ms=latency, tick_size=tick, min_order_size=min_shares,
+                               fill_source=src, fill_pending=pend)
         if none_:
             if cancel_err:
                 raise ExecutionRejected(f"cancel_error: {cancel_err}", outcome="cancel_error",
@@ -778,11 +903,13 @@ class PolymarketExecutor:
                 outcome="unfilled_cancelled")
         # PARTIAL fill: keep the filled portion, remainder already cancelled above
         filled = round(min(filled, shares), 2)
-        return OrderResult(outcome="partially_filled_cancelled", fill_price=limit_price,
-                           limit_price=limit_price, filled_usd=round(filled * limit_price, 2),
-                           filled_shares=filled, fees=0.0, order_id=order_id,
-                           order_latency_ms=latency, confirm_latency_ms=latency,
-                           venue_error=cancel_err, tick_size=tick, min_order_size=min_shares)
+        fp, fusd, fsh, fee, src, pend = _resolve_fill(
+            client, order_id=order_id, token_id=token_id, filled_shares=filled, limit_price=limit_price)
+        return OrderResult(outcome="partially_filled_cancelled", fill_price=fp,
+                           limit_price=limit_price, filled_usd=fusd, filled_shares=fsh, fees=fee,
+                           order_id=order_id, order_latency_ms=latency, confirm_latency_ms=latency,
+                           venue_error=cancel_err, tick_size=tick, min_order_size=min_shares,
+                           fill_source=src, fill_pending=pend)
 
 
 def _token_id_for(market: Market, outcome: str) -> str | None:
@@ -889,7 +1016,9 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         venue_error=result.venue_error, order_id=result.order_id,
         order_latency_ms=result.order_latency_ms, confirm_latency_ms=result.confirm_latency_ms,
         status="open", entry_reason=entry_reason, bankroll_before=st.bankroll,
-        sizing_detail=sizing)
+        sizing_detail=sizing, fill_source=result.fill_source,
+        fill_pending_reconciliation=result.fill_pending,
+        reconciled_at=(None if result.fill_pending else datetime.utcnow()))
     db.add(ex)
     db.commit()
     # No lifetime-order cap: trading is bounded by MAX CONCURRENT open positions
@@ -1367,6 +1496,160 @@ def reconcile_account(db: Session, *, client=None, balance_fn=None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Fill reconciliation — historical repair + background worker. Reads the venue's
+# ACTUAL executed fills (data-api wallet trades) and corrects the recorded fill
+# price / cost-basis / exposure / realized-P&L / bankroll. ACCOUNTING ONLY.
+# ---------------------------------------------------------------------------
+def _default_fills_fetcher():
+    """Build a fetcher that returns an execution's ACTUAL fills [{price,size,fee}]
+    from the venue's own records (data-api wallet trades), matched by market + side
+    + outcome + a time window around the order. Returns [] on any failure (caller
+    then leaves the row pending — we never fabricate a fill)."""
+    funder = _configured_funder()
+    window_s = float(os.getenv("LIVE_FILL_RECON_WINDOW_MIN", "30")) * 60.0
+
+    def fetch(ex) -> list[dict]:
+        if not funder:
+            return []
+        try:
+            from .polymarket_client import LivePolymarketClient
+            trades = LivePolymarketClient().get_wallet_trades(funder, limit=500)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] fills fetch failed for exec {getattr(ex, 'id', '?')}: {exc}")
+            return []
+        out = []
+        for t in trades:
+            if t.market_id != ex.market_id or (t.side or "").lower() != (ex.side or "buy").lower():
+                continue
+            if ex.outcome and t.outcome and str(t.outcome).lower() != str(ex.outcome).lower():
+                continue
+            if ex.created_at and t.timestamp and abs((t.timestamp - ex.created_at).total_seconds()) > window_s:
+                continue
+            price = _num(t.price)
+            shares = _num(getattr(t, "shares", None))
+            if shares is None and price:
+                shares = _num(t.size) / price if price else None     # size is USD notional
+            if price is None or not shares:
+                continue
+            out.append({"price": price, "size": shares, "fee": 0.0})
+        return out
+
+    return fetch
+
+
+def _apply_fill_correction(db: Session, ex: LiveExecution, recon: dict, *, fix_bankroll: bool) -> dict:
+    """Correct one execution to the venue VWAP. For CLOSED rows it recomputes
+    realized P/L from the true cost and adjusts bankroll by the delta. Logs + returns
+    the before/after correction record."""
+    old = {"fill_price": ex.fill_price, "size_usd": ex.size_usd, "shares": ex.shares,
+           "realized_pnl": ex.realized_pnl}
+    new_price = round(recon["avg_price"], 6)
+    new_shares = round(recon["quantity"], 4) if recon.get("quantity") else ex.shares
+    new_cost = round(recon["cost"], 2)
+    new_fees = round(recon.get("fees", 0.0), 4)
+    ex.fill_price = new_price
+    ex.shares = new_shares
+    ex.size_usd = new_cost
+    ex.fees = new_fees
+    ex.slippage = round((new_price - ex.expected_price) / ex.expected_price, 4) if ex.expected_price else 0.0
+    ex.fill_source = "venue"
+    ex.fill_pending_reconciliation = False
+    ex.reconciled_at = datetime.utcnow()
+    bankroll_delta = 0.0
+    if ex.status == "closed":
+        m = db.get(Market, ex.market_id)
+        won = bool(m and m.resolved and m.resolved_outcome is not None and m.resolved_outcome == ex.outcome)
+        new_pnl = round(new_shares * (1.0 if won else 0.0) - new_cost - new_fees, 2)
+        bankroll_delta = round(new_pnl - (old["realized_pnl"] or 0.0), 2)
+        ex.realized_pnl = new_pnl
+        if fix_bankroll and bankroll_delta:
+            st = get_state(db)
+            st.bankroll = round(st.bankroll + bankroll_delta, 2)
+            ex.bankroll_after = st.bankroll
+            db.add(st)
+    db.add(ex)
+    corr = {"execution_id": ex.id, "market": ex.market_question, "order_id": ex.order_id,
+            "old_fill_price": old["fill_price"], "new_fill_price": new_price,
+            "old_size_usd": old["size_usd"], "new_size_usd": new_cost,
+            "old_realized_pnl": old["realized_pnl"], "new_realized_pnl": ex.realized_pnl,
+            "bankroll_delta": bankroll_delta, "n_fills": recon.get("n_fills")}
+    print(f"[live] fill reconciled exec={ex.id} price {old['fill_price']}->{new_price} "
+          f"cost {old['size_usd']}->{new_cost} pnl {old['realized_pnl']}->{ex.realized_pnl} "
+          f"bankroll_delta={bankroll_delta}")
+    return corr
+
+
+def _unreconciled(ex: LiveExecution) -> bool:
+    """A filled row whose fill looks like the limit-price assumption (or flagged
+    pending) — i.e. not yet reconciled against the venue."""
+    if ex.fill_source == "venue":
+        return False
+    if ex.fill_pending_reconciliation:
+        return True
+    if ex.fill_source in (None, "pending", "estimate"):
+        return True
+    return (ex.limit_price is not None and ex.fill_price is not None
+            and abs(ex.fill_price - ex.limit_price) < 1e-9)
+
+
+def reconcile_fills(db: Session, *, fetch_fn=None, limit: int = 300, fix_bankroll: bool = True) -> dict:
+    """HISTORICAL REPAIR: for filled executions still recorded at the limit price
+    (or flagged pending), fetch the venue's actual fills and correct fill price,
+    cost basis, exposure, realized P/L and bankroll. Logs every correction. Real
+    orders only; never places or cancels anything."""
+    fetch_fn = fetch_fn or _default_fills_fetcher()
+    rows = db.scalars(select(LiveExecution).where(
+        LiveExecution.executor == "polymarket",
+        LiveExecution.status.in_(("open", "closed")),
+        LiveExecution.order_id.isnot(None)).order_by(LiveExecution.created_at.desc()).limit(limit)).all()
+    targets = [e for e in rows if _unreconciled(e)]
+    corrections, marked_pending = [], 0
+    for ex in targets:
+        try:
+            fills = fetch_fn(ex)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] reconcile fetch error exec {ex.id}: {exc}")
+            fills = None
+        recon = _vwap_fills(fills) if fills else None
+        if recon:
+            corrections.append(_apply_fill_correction(db, ex, recon, fix_bankroll=fix_bankroll))
+        elif not ex.fill_pending_reconciliation:
+            ex.fill_pending_reconciliation = True            # no venue data yet -> worker retries
+            ex.fill_source = ex.fill_source or "pending"
+            db.add(ex)
+            marked_pending += 1
+    db.commit()
+    return {"scanned": len(targets), "corrected": len(corrections),
+            "marked_pending": marked_pending, "corrections": corrections}
+
+
+def reconcile_pending(db: Session, *, fetch_fn=None, limit: int = 300) -> dict:
+    """BACKGROUND WORKER pass: reconcile only executions flagged
+    fill_pending_reconciliation once their venue fills become available."""
+    fetch_fn = fetch_fn or _default_fills_fetcher()
+    rows = db.scalars(select(LiveExecution).where(
+        LiveExecution.fill_pending_reconciliation.is_(True),
+        LiveExecution.order_id.isnot(None)).order_by(LiveExecution.created_at.desc()).limit(limit)).all()
+    corrections = []
+    for ex in rows:
+        try:
+            fills = fetch_fn(ex)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] pending reconcile error exec {ex.id}: {exc}")
+            continue
+        recon = _vwap_fills(fills) if fills else None
+        if recon:
+            corrections.append(_apply_fill_correction(db, ex, recon, fix_bankroll=True))
+    db.commit()
+    return {"pending_scanned": len(rows), "reconciled": len(corrections), "corrections": corrections}
+
+
+def pending_reconciliation_count(db: Session) -> int:
+    return int(db.scalar(select(func.count()).select_from(LiveExecution).where(
+        LiveExecution.fill_pending_reconciliation.is_(True))) or 0)
+
+
 def status(db: Session) -> dict:
     cfg = get_config()
     st = get_state(db)
@@ -1383,6 +1666,7 @@ def status(db: Session) -> dict:
         # NO position-count cap; trading is bounded by cash + $ risk caps below.
         "open_positions": len(active),
         "ended_unsettled": len(ended_unsettled),    # awaiting settlement (use Reconcile Account)
+        "fills_pending_reconciliation": pending_reconciliation_count(db),
         "real_orders_placed": real_orders,   # lifetime, informational/audit only
         "latest_venue_error": _latest_venue_error(db),
         "orders_this_executor": _order_count(db, cfg.executor),
@@ -1440,6 +1724,9 @@ def list_executions(db: Session, limit: int = 100) -> list[dict]:
         "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
         "realized_pnl": e.realized_pnl, "bankroll_before": e.bankroll_before,
         "bankroll_after": e.bankroll_after, "sizing_detail": e.sizing_detail,
+        "fill_source": e.fill_source,
+        "fill_pending_reconciliation": e.fill_pending_reconciliation,
+        "reconciled_at": e.reconciled_at.isoformat() if e.reconciled_at else None,
     } for e in rows]
 
 

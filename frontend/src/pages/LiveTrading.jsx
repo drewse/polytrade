@@ -190,6 +190,11 @@ export default function LiveTrading() {
     if (Number.isNaN(bal)) return flash('Enter the venue balance to reconcile against', true)
     await act('reconcile', () => api.liveReconcile(bal), `Reconcile bankroll against reported balance $${bal}?`)
   }
+  const onReconcileFills = async () => {
+    const res = await act('reconcilefills', () => api.liveReconcileFills(300),
+      'Reconcile recorded fills against the venue’s actual executions? (accounting only — no orders)')
+    if (res?.detail) flash(`Fills reconciled: ${res.detail.corrected} corrected, ${res.detail.marked_pending || 0} pending.`)
+  }
 
   // Account reconciliation runs SEPARATELY from the 10s status poll (it hits the
   // venue, so it's slower) — async, never blocking the dashboard UI.
@@ -248,6 +253,10 @@ export default function LiveTrading() {
           </button>
           <button onClick={reconcileAccount} disabled={reconciling}>
             {reconciling ? 'Reconciling…' : '⟳ Reconcile Account'}
+          </button>
+          <button className="secondary" onClick={onReconcileFills} disabled={busy === 'reconcilefills'}>
+            {busy === 'reconcilefills' ? 'Reconciling…' : '⟳ Reconcile Fills'}
+            {s?.fills_pending_reconciliation > 0 && <span className="badge bad" style={{ marginLeft: 4 }}>{s.fills_pending_reconciliation}</span>}
           </button>
           <div className="reconcile-box">
             <input type="number" step="0.01" placeholder="venue $balance" value={balance}
@@ -406,7 +415,7 @@ export default function LiveTrading() {
                 <tr>
                   <th>Time</th><th>Status</th><th>Market</th><th>Outcome</th><th>Side</th>
                   <th className="right">Stake</th><th className="right">Exp</th><th className="right">Limit</th>
-                  <th className="right">Fill</th><th className="right">Shares</th><th className="right">Slip</th>
+                  <th className="right">Fill</th><th>Src</th><th className="right">Shares</th><th className="right">Slip</th>
                   <th>Sizing</th><th>Order id</th><th>Wallet copied</th><th>Reason / error</th>
                 </tr>
               </thead>
@@ -422,6 +431,10 @@ export default function LiveTrading() {
                     <td className="right">{num(e.expected_price, 3)}</td>
                     <td className="right">{num(e.limit_price, 3)}</td>
                     <td className="right">{num(e.fill_price, 3)}</td>
+                    <td title={e.reconciled_at ? `reconciled ${fmt.ago(e.reconciled_at)}` : ''}>
+                      {e.fill_pending_reconciliation
+                        ? <span className="badge open" title="awaiting venue fill reconciliation">⏳ pending</span>
+                        : e.fill_source ? <span className={`badge ${e.fill_source === 'venue' ? 'yes' : 'neutral'}`}>{e.fill_source}</span> : '—'}</td>
                     <td className="right">{num(e.shares, 2)}</td>
                     <td className="right">{e.slippage == null ? '—' : pct(e.slippage)}</td>
                     <td><SizingCell sizing={e.sizing_detail} /></td>

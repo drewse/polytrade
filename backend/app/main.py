@@ -95,6 +95,10 @@ def _startup() -> None:
     # Start the in-process auto-ingest worker so live data refreshes itself
     # (guarded: one loop only; paper-trading only).
     auto_worker.start()
+    # Start the background fill-reconciliation worker (accounting only — corrects
+    # recorded fill prices/cost basis from the venue's actual fills; never trades).
+    from . import fill_reconciler
+    fill_reconciler.start()
 
 
 @app.get("/api/health")
@@ -486,6 +490,29 @@ def live_discovery_backfill_status(db: Session = Depends(get_db)) -> MessageOut:
     latest errors, last run time, recently completed wallets."""
     from . import discovery_backfill
     return MessageOut(message="backfill status", detail=discovery_backfill.backfill_status(db))
+
+
+@app.post("/api/live/reconcile-fills", response_model=MessageOut)
+def live_reconcile_fills(limit: int = 300, db: Session = Depends(get_db)) -> MessageOut:
+    """HISTORICAL REPAIR: correct executions still recorded at the limit price using
+    the venue's ACTUAL fills (fill price, cost basis, exposure, realized P/L,
+    bankroll). Accounting only — never places or cancels orders."""
+    return MessageOut(message="fill reconciliation", detail=live.reconcile_fills(db, limit=limit))
+
+
+@app.post("/api/live/reconcile-pending", response_model=MessageOut)
+def live_reconcile_pending(db: Session = Depends(get_db)) -> MessageOut:
+    """Background-worker pass: reconcile executions flagged pending once their venue
+    fills are available."""
+    return MessageOut(message="pending fill reconciliation", detail=live.reconcile_pending(db))
+
+
+@app.get("/api/live/reconciler-status", response_model=MessageOut)
+def live_reconciler_status(db: Session = Depends(get_db)) -> MessageOut:
+    from . import fill_reconciler
+    detail = fill_reconciler.status()
+    detail["pending_count"] = live.pending_reconciliation_count(db)
+    return MessageOut(message="reconciler status", detail=detail)
 
 
 @app.get("/api/live/sizing-simulation", response_model=MessageOut)

@@ -88,6 +88,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "tick_size": "FLOAT",               # venue book tick_size used for the decision
         "min_order_size": "FLOAT",          # venue book min_order_size (shares) used
         "sizing_detail": "JSON",            # dynamic risk-aware sizing breakdown
+        "fill_source": "VARCHAR",           # exact|venue|pending|simulated|estimate
+        "fill_pending_reconciliation": "BOOLEAN DEFAULT 0",
+        "reconciled_at": "DATETIME",
     },
     "discovery_sources": {
         "backfill_status": "VARCHAR DEFAULT 'pending'",

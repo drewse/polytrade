@@ -449,6 +449,13 @@ class LiveExecution(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # dynamic risk-aware sizing breakdown (fully explains the chosen stake)
     sizing_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # execution reconciliation: fill_price/size_usd reflect the venue's ACTUAL
+    # executed fills (VWAP), not the limit price. fill_source: exact|venue|pending|
+    # simulated|estimate. pending => actual fills not yet retrieved; a background
+    # worker reconciles later (we never fabricate a fill price).
+    fill_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fill_pending_reconciliation: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class LiveState(Base):
