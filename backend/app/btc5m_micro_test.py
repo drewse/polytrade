@@ -62,6 +62,9 @@ def _cfg() -> dict:
         "min_confidence": float(os.getenv("BTC5M_MICRO_TEST_MIN_CONFIDENCE", "0.85")),
         "max_trades": int(os.getenv("BTC5M_MICRO_TEST_MAX_TRADES", "20")),
         "signal_max_age_min": float(os.getenv("BTC5M_MICRO_TEST_SIGNAL_MAX_AGE_MIN", "10")),
+        # low-latency wallet-poll source (default on); kill-switch to fall back to
+        # the research index. Tests set false to avoid network + stay deterministic.
+        "wallet_poll": _truthy(os.getenv("BTC5M_MICRO_TEST_WALLET_POLL", "true")),
     }
 
 
@@ -136,6 +139,67 @@ def _accounting(db: Session) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# latency + price-drift analytics
+# ---------------------------------------------------------------------------
+def _avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 3) if xs else None
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return round((xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2), 3)
+
+
+_LAT_BUCKETS = [(0, 2, "<2s"), (2, 5, "2-5s"), (5, 10, "5-10s"),
+                (10, 30, "10-30s"), (30, 1e9, ">30s")]
+
+
+def latency_stats(db: Session) -> dict:
+    """Latency + price-drift aggregates over all recorded micro-test signals
+    (paper + live), for the dashboard Latency Panel."""
+    rows = [t for t in _trades(db) if t.signal_source]      # only V2-instrumented rows
+    det = [t.detection_latency_s for t in rows]
+    hist = {label: 0 for _, _, label in _LAT_BUCKETS}
+    for v in det:
+        if v is None:
+            continue
+        for lo, hi, label in _LAT_BUCKETS:
+            if lo <= v < hi:
+                hist[label] += 1
+                break
+    closed = [t for t in rows if t.status == "closed"]
+    live_pnl = round(sum(t.realized_pnl or 0.0 for t in closed), 4)
+    perfect_pnl = round(sum(t.paper_realized_pnl or 0.0 for t in closed), 4)
+    by_source: dict[str, int] = {}
+    for t in rows:
+        by_source[t.signal_source] = by_source.get(t.signal_source, 0) + 1
+    return {
+        "n_signals": len(rows),
+        "by_source": by_source,
+        "avg_detection_latency_s": _avg(det),
+        "median_detection_latency_s": _median(det),
+        "worst_detection_latency_s": max([v for v in det if v is not None], default=None),
+        "avg_execution_latency_s": _avg([t.execution_latency_s for t in rows]),
+        "avg_fill_latency_s": _avg([t.fill_latency_s for t in rows]),
+        "avg_total_latency_s": _avg([t.total_latency_s for t in rows]),
+        "median_total_latency_s": _median([t.total_latency_s for t in rows]),
+        "worst_total_latency_s": max([t.total_latency_s for t in rows if t.total_latency_s is not None], default=None),
+        "avg_missed_edge": _avg([t.missed_edge for t in rows]),
+        "avg_price_drift": _avg([abs(t.latency_cost) for t in rows if t.latency_cost is not None]),
+        "avg_latency_cost": _avg([t.latency_cost for t in rows]),
+        "detection_histogram": [{"bucket": label, "count": hist[label]} for _, _, label in _LAT_BUCKETS],
+        "paper_perfect_pnl": perfect_pnl,
+        "live_pnl": live_pnl,
+        "paper_vs_live_delta": round(perfect_pnl - live_pnl, 4),
+        "edge_lost_to_latency": round(perfect_pnl - live_pnl, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
 # signal source — most recent qualifying primary/backup BUY in an OPEN BTC5M
 # market that we have not already mirrored. Read-only over the indexed btc5m
 # trades; never creates a signal on its own.
@@ -152,12 +216,81 @@ def _seconds_remaining(db: Session, market_id: str, now: datetime) -> float | No
     return (expiry - now).total_seconds()
 
 
-def _candidate_signals(db: Session, cfg: dict, now: datetime) -> list[dict]:
-    """Build the ordered candidate list (primary first, then backups, newest
-    first). Each candidate carries everything the gates + executor need."""
-    watch = {cfg["primary_wallet"]: "primary"}
+def _watch(cfg: dict) -> dict[str, str]:
+    watch = {cfg["primary_wallet"]: "primary"} if cfg["primary_wallet"] else {}
     for b in cfg["backup_wallets"]:
         watch.setdefault(b, "backup")
+    return watch
+
+
+def _order_candidates(out: list[dict], now: datetime) -> list[dict]:
+    """primary before backup, then newest wallet-trade first."""
+    out.sort(key=lambda c: (0 if c["role"] == "primary" else 1,
+                            -(c["wallet_trade_at"] or now).timestamp()))
+    return out
+
+
+# --- source #1 (LOW LATENCY): per-wallet trade polling -----------------------
+# Polls data-api /trades?user=<wallet> directly for each watched wallet. This is
+# the lowest-latency source available without a websocket: detection latency ≈
+# poll interval + API round-trip + Polymarket data-api indexing lag (measured in
+# validation). `fetch_fn(address)->list[TradeDTO-like]` is injectable for tests.
+_LIVE_CLIENT = None
+
+
+def _client():
+    global _LIVE_CLIENT
+    if _LIVE_CLIENT is None:
+        from .polymarket_client import LivePolymarketClient
+        _LIVE_CLIENT = LivePolymarketClient()
+    return _LIVE_CLIENT
+
+
+def _poll_wallet_signals(db: Session, cfg: dict, now: datetime, *, fetch_fn=None) -> list[dict]:
+    if fetch_fn is None and not cfg.get("wallet_poll", True):
+        return []                                         # poll disabled -> research fallback
+    watch = _watch(cfg)
+    if not watch:
+        return []
+    age_cut = now - timedelta(minutes=cfg["signal_max_age_min"])
+    fetch = fetch_fn or (lambda addr: _client().get_wallet_trades(addr, limit=40))
+    seen_markets: set[str] = set()
+    out: list[dict] = []
+    for addr, role in watch.items():
+        try:
+            dtos = fetch(addr) or []
+        except Exception:  # noqa: BLE001  (one wallet's API hiccup must not break the rest)
+            continue
+        for d in sorted(dtos, key=lambda x: getattr(x, "timestamp", None) or now, reverse=True):
+            if str(getattr(d, "side", "buy")).lower() != "buy":
+                continue
+            ts = getattr(d, "timestamp", None)
+            if ts and ts < age_cut:
+                continue
+            mid = getattr(d, "market_id", None)
+            if not mid or mid in seen_markets:
+                continue
+            m = db.get(Market, mid)
+            if m is None or m.resolved:                   # need indexed metadata + OPEN market
+                continue
+            if not btc5m.is_btc5m_market(m.question, getattr(m, "slug", None), getattr(m, "category", None)):
+                continue
+            seen_markets.add(mid)
+            direction = btc5m._yes_no(getattr(d, "outcome", None))
+            outcome = getattr(d, "outcome", None) or _outcome_for_direction(m, direction)
+            out.append({
+                "market_id": mid, "market": m, "outcome": outcome, "direction": direction,
+                "reference_price": float(getattr(d, "price", 0.0) or 0.0),
+                "wallet": addr, "role": role, "wallet_trade_at": ts, "source": "wallet_poll",
+            })
+    return _order_candidates(out, now)
+
+
+# --- source #4 (FALLBACK): research-index trades -----------------------------
+def _research_candidates(db: Session, cfg: dict, now: datetime) -> list[dict]:
+    """Fallback to the BTC 5M Lab's indexed trades when the low-latency poll
+    yields nothing (e.g. data-api unavailable). Higher latency by design."""
+    watch = _watch(cfg)
     if not watch:
         return []
     age_cut = now - timedelta(minutes=cfg["signal_max_age_min"])
@@ -178,7 +311,6 @@ def _candidate_signals(db: Session, cfg: dict, now: datetime) -> list[dict]:
         m = db.get(Market, mid)
         if m is None or m.resolved:                       # only OPEN markets
             continue
-        # exact market outcome string from the source production trade
         outcome = None
         if bt.source_trade_id is not None:
             src = db.get(Trade, bt.source_trade_id)
@@ -187,13 +319,19 @@ def _candidate_signals(db: Session, cfg: dict, now: datetime) -> list[dict]:
             outcome = _outcome_for_direction(m, bt.direction)
         role = watch.get((bt.wallet_address or "").lower(), "backup")
         out.append({
-            "btc5m_trade_id": bt.id, "market_id": mid, "market": m, "outcome": outcome,
-            "direction": bt.direction, "reference_price": float(bt.price),
-            "wallet": bt.wallet_address, "role": role, "timestamp": bt.timestamp,
+            "market_id": mid, "market": m, "outcome": outcome, "direction": bt.direction,
+            "reference_price": float(bt.price), "wallet": bt.wallet_address, "role": role,
+            "wallet_trade_at": bt.timestamp, "source": "research_index",
         })
-    # primary before backup, then newest first
-    out.sort(key=lambda c: (0 if c["role"] == "primary" else 1, -(c["timestamp"] or now).timestamp()))
-    return out
+    return _order_candidates(out, now)
+
+
+def _gather_candidates(db: Session, cfg: dict, now: datetime, *, fetch_fn=None) -> list[dict]:
+    """Low-latency wallet poll first; research index only as a fallback."""
+    cands = _poll_wallet_signals(db, cfg, now, fetch_fn=fetch_fn)
+    if cands:
+        return cands
+    return _research_candidates(db, cfg, now)
 
 
 def _outcome_for_direction(market: Market, direction: str) -> str | None:
@@ -202,6 +340,20 @@ def _outcome_for_direction(market: Market, direction: str) -> str | None:
             return o
     outs = list(market.outcomes or [])
     return outs[0] if outs else direction
+
+
+def _detected_price(market: Market, outcome: str, price_fn=None) -> float | None:
+    """Current market price of the bought token at detection (for price-drift /
+    latency-cost). Best-effort: midpoint via the CLOB. Never raises."""
+    token_id = live._token_id_for(market, outcome)
+    if not token_id:
+        return None
+    try:
+        if price_fn is not None:
+            return float(price_fn(token_id))
+        return float(_client().get_token_midpoint(token_id))
+    except Exception:  # noqa: BLE001  (price is advisory; never break the test)
+        return None
 
 
 def _confidence_for(db: Session, market_id: str) -> float | None:
@@ -276,11 +428,27 @@ def _record_rejection(db: Session, st: mt.Btc5mMicroTestState, reason: str) -> N
     db.commit()
 
 
+def _drift_block(direction: str, wallet_entry: float, detected: float | None,
+                 fill: float | None) -> dict:
+    """Price-drift / missed-edge math. For a BUY, paying a HIGHER price is worse,
+    so cost = price − wallet_entry. (Direction YES/NO both enter via a BUY of the
+    chosen token, so the sign convention is uniform.)"""
+    det = detected if detected is not None else wallet_entry
+    fil = fill if fill is not None else det
+    return {
+        "wallet_entry_price": round(wallet_entry, 4),
+        "detected_price": round(det, 4) if det is not None else None,
+        "latency_cost": round(det - wallet_entry, 4) if det is not None else None,
+        "missed_edge": round(fil - wallet_entry, 4) if fil is not None else None,
+    }
+
+
 def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
-             executor=None) -> dict:
+             executor=None, fetch_fn=None, price_fn=None) -> dict:
     """One micro-test cycle. place=False => PAPER simulation (records a paper
     trade, no venue call). place=True => real execution via the shared safe path
-    (DryRunExecutor or PolymarketExecutor per LIVE_EXECUTOR). Returns a summary."""
+    (DryRunExecutor or PolymarketExecutor per LIVE_EXECUTOR). Returns a summary.
+    `fetch_fn(addr)` / `price_fn(token_id)` are injectable for tests."""
     now = now or datetime.utcnow()
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -313,10 +481,10 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
     if acct["open_positions"] >= cfg["max_concurrent"]:
         return {"ran": False, "reason": f"max concurrent test positions ({cfg['max_concurrent']}) open"}
 
-    # find the first qualifying, not-yet-mirrored signal
+    # find the first qualifying, not-yet-mirrored signal (low-latency poll first)
     chosen = None
     last_reason = "no qualifying primary/backup signal in an open BTC 5M market"
-    for cand in _candidate_signals(db, cfg, now):
+    for cand in _gather_candidates(db, cfg, now, fetch_fn=fetch_fn):
         if _already_mirrored(db, cand["market_id"]):
             continue
         ok, reason, extras = _evaluate_gates(db, cfg, cand, now)
@@ -330,16 +498,26 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
         return {"ran": False, "reason": last_reason}
 
     cand, extras = chosen
-    st.last_signal = (f"{now.isoformat()} — {cand['role']} {cand['wallet'][:10]}… "
-                      f"{cand['direction']} @ {cand['reference_price']:.3f} ({cand['market_id'][:10]}…)")
+    detected_at = now                                   # we just saw it this cycle
+    wallet_trade_at = cand.get("wallet_trade_at")
+    detection_latency = ((detected_at - wallet_trade_at).total_seconds()
+                         if wallet_trade_at else None)
+    st.last_signal = (f"{detected_at.isoformat()} — {cand['role']} {cand['wallet'][:10]}… "
+                      f"{cand['direction']} @ {cand['reference_price']:.3f} "
+                      f"[{cand['source']}, detect {detection_latency:.1f}s]" if detection_latency is not None
+                      else f"{detected_at.isoformat()} — {cand['role']} {cand['wallet'][:10]}… {cand['direction']}")
     db.commit()
 
     # FIXED 5-share sizing — never scaled, never dynamic. stake = price * shares.
     shares = cfg["fixed_shares"]
-    ref = cand["reference_price"]
+    ref = cand["reference_price"]                        # wallet entry == perfect-copy price
     stake = round(ref * shares, 2)
     idem = f"{mt.STRATEGY_MODE}:{cand['market_id']}"
     expected_max_loss = stake
+
+    # detected market price (for latency-cost / price-drift). Best-effort: current
+    # midpoint of the bought token at detection. Never blocks the test.
+    detected_price = _detected_price(cand["market"], cand["outcome"], price_fn)
 
     # account safety: respect available venue cash (best-effort, real path only)
     if place:
@@ -356,33 +534,49 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
                 direction=cand["direction"], wallet_triggered=cand["wallet"],
                 wallet_role=cand["role"], regime=extras.get("regime"),
                 confidence=extras.get("confidence"), reference_price=round(ref, 4),
-                shares=shares, size_usd=stake,
+                shares=shares, size_usd=stake, signal_source=cand["source"],
+                wallet_trade_at=wallet_trade_at, detected_at=detected_at,
+                detection_latency_s=round(detection_latency, 3) if detection_latency is not None else None,
                 entry_reason=(f"copy {cand['role']} {cand['wallet'][:10]}… {cand['direction']} "
-                              f"@ {ref:.3f}; 5-share micro-test"))
+                              f"@ {ref:.3f}; 5-share micro-test [{cand['source']}]"))
 
     if not place:
-        # PAPER simulation — no venue call. Paper fill at the reference price.
+        # PAPER simulation — no venue call. Paper fill at the DETECTED price (what
+        # we could actually get now); perfect-copy twin recorded as wallet_entry.
+        paper_fill = detected_price if detected_price is not None else ref
+        drift = _drift_block(cand["direction"], ref, detected_price, paper_fill)
         row = mt.Btc5mMicroTestTrade(**base, executor="paper", limit_price=round(ref, 4),
-                                     fill_price=round(ref, 4), status="open",
-                                     fill_outcome="paper", paper_fill_price=round(ref, 4))
+                                     fill_price=round(paper_fill, 4), status="open",
+                                     fill_outcome="paper", paper_fill_price=round(ref, 4),
+                                     slippage=round((paper_fill - ref) / ref, 4) if ref else 0.0,
+                                     submitted_at=detected_at, venue_ack_at=detected_at,
+                                     filled_at=detected_at, execution_latency_s=0.0, fill_latency_s=0.0,
+                                     total_latency_s=round(detection_latency, 3) if detection_latency is not None else None,
+                                     **drift)
         db.add(row)
         db.commit()
         return {"ran": True, "mode": "paper", "trade_id": row.id, "market_id": cand["market_id"],
                 "direction": cand["direction"], "wallet": cand["wallet"], "role": cand["role"],
+                "source": cand["source"], "detection_latency_s": row.detection_latency_s,
                 "stake": stake, "shares": shares, "expected_max_loss": expected_max_loss}
 
     # REAL path — reuse the shared safe execution primitive only.
     lcfg = live.get_config()
     ex = executor or live.get_executor(lcfg)
+    submitted_at = datetime.utcnow()
     try:
         result = ex.place(db=db, market=cand["market"], outcome=cand["outcome"],
                           price=ref, size_usd=stake, cfg=lcfg)
     except live.ExecutionRejected as exc:
         outcome = exc.outcome or "rejected"
         is_error = bool(exc.venue_error) or outcome in _ERROR_OUTCOMES
+        drift = _drift_block(cand["direction"], ref, detected_price, None)
         row = mt.Btc5mMicroTestTrade(**base, executor=lcfg.executor, status="rejected",
                                      fill_outcome=outcome, venue_error=exc.venue_error,
-                                     rejection_reason=str(exc)[:200], paper_fill_price=round(ref, 4))
+                                     rejection_reason=str(exc)[:200], paper_fill_price=round(ref, 4),
+                                     submitted_at=submitted_at,
+                                     execution_latency_s=round((submitted_at - detected_at).total_seconds(), 3),
+                                     **drift)
         db.add(row)
         db.commit()
         if is_error:                                   # any execution/venue error stops the test
@@ -394,7 +588,7 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
     except Exception as exc:  # noqa: BLE001  (unexpected -> record + stop, fail closed)
         row = mt.Btc5mMicroTestTrade(**base, executor=lcfg.executor, status="rejected",
                                      fill_outcome="error", venue_error=live._full_err(exc),
-                                     rejection_reason=str(exc)[:200])
+                                     rejection_reason=str(exc)[:200], submitted_at=submitted_at)
         db.add(row)
         _stop(db, st, f"unexpected execution error: {str(exc)[:80]}")
         db.commit()
@@ -402,7 +596,12 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
                 "reason": "unexpected execution error", "trade_id": row.id}
 
     # filled / partially filled -> open a micro-test position for the actual fill
+    filled_at = datetime.utcnow()
     filled_usd = round(result.filled_usd, 2)
+    drift = _drift_block(cand["direction"], ref, detected_price, result.fill_price)
+    exec_lat = round((submitted_at - detected_at).total_seconds(), 3)
+    fill_lat = round((filled_at - submitted_at).total_seconds(), 3)
+    total_lat = round((filled_at - wallet_trade_at).total_seconds(), 3) if wallet_trade_at else None
     row = mt.Btc5mMicroTestTrade(
         **{**base, "size_usd": filled_usd, "shares": round(result.filled_shares, 4)},
         executor=lcfg.executor, limit_price=round(result.limit_price, 4),
@@ -410,13 +609,16 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
         slippage=round((result.fill_price - ref) / ref, 4) if ref else 0.0,
         status="open", fill_outcome=result.outcome, order_id=result.order_id,
         tick_size=result.tick_size, min_order_size=result.min_order_size,
-        venue_error=result.venue_error, paper_fill_price=round(ref, 4))
+        venue_error=result.venue_error, paper_fill_price=round(ref, 4),
+        submitted_at=submitted_at, venue_ack_at=filled_at, filled_at=filled_at,
+        execution_latency_s=exec_lat, fill_latency_s=fill_lat, total_latency_s=total_lat, **drift)
     db.add(row)
     db.commit()
     return {"ran": True, "mode": "live", "placed": True, "trade_id": row.id,
-            "market_id": cand["market_id"], "direction": cand["direction"],
+            "market_id": cand["market_id"], "direction": cand["direction"], "source": cand["source"],
+            "detection_latency_s": row.detection_latency_s, "total_latency_s": total_lat,
             "fill_price": result.fill_price, "shares": result.filled_shares,
-            "stake": filled_usd, "expected_max_loss": filled_usd}
+            "missed_edge": row.missed_edge, "stake": filled_usd, "expected_max_loss": filled_usd}
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +671,12 @@ def _trade_dict(t: mt.Btc5mMicroTestTrade) -> dict:
             "slippage": t.slippage, "status": t.status, "fill_outcome": t.fill_outcome,
             "order_id": t.order_id, "venue_error": t.venue_error,
             "rejection_reason": t.rejection_reason, "realized_pnl": t.realized_pnl,
-            "paper_realized_pnl": t.paper_realized_pnl, "won": t.won, "executor": t.executor}
+            "paper_realized_pnl": t.paper_realized_pnl, "won": t.won, "executor": t.executor,
+            "signal_source": t.signal_source,
+            "wallet_entry_price": t.wallet_entry_price, "detected_price": t.detected_price,
+            "missed_edge": t.missed_edge, "latency_cost": t.latency_cost,
+            "detection_latency_s": t.detection_latency_s, "execution_latency_s": t.execution_latency_s,
+            "fill_latency_s": t.fill_latency_s, "total_latency_s": t.total_latency_s}
 
 
 def status(db: Session) -> dict:
@@ -516,9 +723,19 @@ def status(db: Session) -> dict:
         "last_signal": st.last_signal,
         "last_rejection": st.last_rejection,
         "recent_trades": [_trade_dict(t) for t in rows[:25]],
+        "latency": latency_stats(db),
+        "worker": _worker_status(),
         "safety": ("isolated micro-test — separate table + accounting; reuses only the safe "
                    "execution path; never affects production copy, ranking, sizing, or bankroll"),
     }
+
+
+def _worker_status() -> dict:
+    try:
+        from . import btc5m_micro_test_worker as w
+        return w.status()
+    except Exception:  # noqa: BLE001  (worker module optional)
+        return {"worker_running": False}
 
 
 def _unrealized(db: Session, active: list[mt.Btc5mMicroTestTrade]) -> float:

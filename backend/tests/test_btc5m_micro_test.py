@@ -31,6 +31,9 @@ def _enable(monkeypatch, **over):
     monkeypatch.setenv("BTC5M_MICRO_TEST_MIN_SECONDS_REMAINING", "30")
     monkeypatch.setenv("BTC5M_MICRO_TEST_ALLOWED_REGIMES", "Hybrid,Liquidity Spike")
     monkeypatch.setenv("BTC5M_MICRO_TEST_REQUIRE_CONFIDENCE", over.get("require_conf", "false"))
+    # default: exercise the deterministic research-index path (no network). V2
+    # poll-path tests inject fetch_fn explicitly instead.
+    monkeypatch.setenv("BTC5M_MICRO_TEST_WALLET_POLL", over.get("wallet_poll", "false"))
 
 
 def _seed_signal(db, *, wallet=PRIMARY, mid="0xbtcm1", price=0.50, direction="YES",
@@ -287,3 +290,100 @@ def test_status_payload_shape(in_memory_db, monkeypatch):
     assert s["config"]["primary_wallet"] == PRIMARY
     assert s["config"]["expected_max_loss_per_trade"] == 3.0   # 5 × $0.60
     assert s["config"]["fixed_shares"] == 5
+    assert "latency" in s and "worker" in s                    # V2 blocks present
+
+
+# ===========================================================================
+# V2 — low-latency wallet-poll source, latency instrumentation, price drift
+# ===========================================================================
+from app.polymarket_client import TradeDTO   # noqa: E402
+
+
+def _open_btc5m_market(db, mid="0xpollm1", question="Bitcoin Up or Down — 5 minute",
+                       secs_remaining=200, outcomes=("Up", "Down")):
+    now = datetime.utcnow()
+    m = db.get(Market, mid) or Market(id=mid)
+    m.question = question; m.outcomes = list(outcomes); m.token_ids = ["tokUp", "tokDown"]
+    m.resolved = False; m.created_at = now - timedelta(seconds=max(0, 300 - secs_remaining))
+    db.add(m)
+    db.add(bm.Btc5mMarket(market_id=mid, question=question,
+                          expiry=now + timedelta(seconds=secs_remaining), resolved=False,
+                          outcomes=list(outcomes)))
+    db.commit()
+    return m
+
+
+def _dto(mid, *, price=0.50, outcome="Up", side="buy", wallet=PRIMARY, age_s=3):
+    return TradeDTO(external_id=f"x-{mid}", wallet_address=wallet, market_id=mid, outcome=outcome,
+                    side=side, price=price, size=price * 5, shares=5,
+                    timestamp=datetime.utcnow() - timedelta(seconds=age_s))
+
+
+def test_wallet_poll_source_detects_with_latency(in_memory_db, monkeypatch):
+    db = in_memory_db
+    _enable(monkeypatch); umt.arm(db)
+    _open_btc5m_market(db, mid="0xpollm1")
+    fetch = {PRIMARY: [_dto("0xpollm1", price=0.50, age_s=3)], BACKUP: []}
+    out = umt.run_once(db, place=False, fetch_fn=lambda a: fetch.get(a, []))
+    assert out["ran"] is True and out["source"] == "wallet_poll"
+    t = db.scalar(select(mt.Btc5mMicroTestTrade))
+    assert t.signal_source == "wallet_poll"
+    assert t.wallet_trade_at is not None and t.detected_at is not None
+    assert 2.0 <= t.detection_latency_s <= 6.0          # ~3s wallet-trade age
+
+
+def test_price_drift_and_missed_edge_recorded(in_memory_db, monkeypatch):
+    db = in_memory_db
+    _enable(monkeypatch); umt.arm(db)
+    _open_btc5m_market(db, mid="0xpollm2")
+    fetch = lambda a: [_dto("0xpollm2", price=0.50)] if a == PRIMARY else []
+    # market moved 0.50 -> 0.55 by the time we detected (price_fn = current mid)
+    out = umt.run_once(db, place=False, fetch_fn=fetch, price_fn=lambda tok: 0.55)
+    assert out["ran"] is True
+    t = db.scalar(select(mt.Btc5mMicroTestTrade))
+    assert t.wallet_entry_price == 0.5 and t.detected_price == 0.55
+    assert t.latency_cost == 0.05                       # detected - wallet entry
+    assert t.missed_edge == 0.05                        # paper fill (detected) - perfect copy
+
+
+def test_poll_falls_back_to_research_when_empty(in_memory_db, monkeypatch):
+    db = in_memory_db
+    _enable(monkeypatch); umt.arm(db)
+    _seed_signal(db, mid="0xresearch1", price=0.40)     # research-index row exists
+    out = umt.run_once(db, place=False, fetch_fn=lambda a: [])   # poll yields nothing
+    assert out["ran"] is True and out["source"] == "research_index"
+
+
+def test_latency_stats_aggregate(in_memory_db, monkeypatch):
+    db = in_memory_db
+    _enable(monkeypatch)
+    monkeypatch.setenv("BTC5M_MICRO_TEST_MAX_CONCURRENT", "5")   # measure 3 signals at once
+    umt.arm(db)
+    for i, age in enumerate((2, 4, 8)):
+        _open_btc5m_market(db, mid=f"0xlat{i}")
+        umt.run_once(db, place=False,
+                     fetch_fn=(lambda mid: (lambda a: [_dto(mid, age_s={2: 2, 4: 4, 8: 8}[age])] if a == PRIMARY else []))(f"0xlat{i}"),
+                     price_fn=lambda tok: 0.50)
+    ls = umt.latency_stats(db)
+    assert ls["n_signals"] == 3
+    assert ls["by_source"] == {"wallet_poll": 3}
+    assert ls["median_detection_latency_s"] is not None
+    buckets = {b["bucket"]: b["count"] for b in ls["detection_histogram"]}
+    assert buckets["2-5s"] >= 1 and buckets["5-10s"] >= 1
+
+
+def test_worker_inert_by_default_and_status(monkeypatch):
+    from app import btc5m_micro_test_worker as w
+    monkeypatch.delenv("BTC5M_MICRO_TEST_ENABLED", raising=False)
+    assert w.get_config()["enabled"] is False
+    assert w.start() is False                            # disabled -> never starts
+    s = w.status()
+    assert s["worker_running"] is False and s["place_live"] is False   # paper by default
+
+
+def test_worker_defaults_to_paper(monkeypatch):
+    from app import btc5m_micro_test_worker as w
+    monkeypatch.setenv("BTC5M_MICRO_TEST_ENABLED", "true")
+    assert w.get_config()["place_live"] is False         # never live unless explicit opt-in
+    monkeypatch.setenv("BTC5M_MICRO_TEST_WORKER_PLACE_LIVE", "true")
+    assert w.get_config()["place_live"] is True

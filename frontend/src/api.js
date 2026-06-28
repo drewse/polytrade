@@ -159,6 +159,7 @@ export const api = {
   btc5mMicroTestArm: (by) => request(`/api/btc5m/micro-test/arm${by ? `?by=${encodeURIComponent(by)}` : ''}`, { method: 'POST' }),
   btc5mMicroTestDisarm: () => request('/api/btc5m/micro-test/disarm', { method: 'POST' }),
   btc5mMicroTestSettle: () => request('/api/btc5m/micro-test/settle', { method: 'POST' }),
+  btc5mMicroTestLatency: () => request('/api/btc5m/micro-test/latency'),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

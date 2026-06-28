@@ -7,6 +7,65 @@ const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%
 const usd = (n) => (n == null ? '—' : `$${Number(n).toFixed(2)}`)
 const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '—')
 
+const secs = (n) => (n == null ? '—' : `${Number(n).toFixed(1)}s`)
+
+// Latency + price-drift panel (V2). Pure presentational — exported for tests.
+export function LatencyPanel({ latency, worker }) {
+  const l = latency || {}
+  const hist = l.detection_histogram || []
+  const maxH = Math.max(1, ...hist.map((b) => b.count))
+  const med = l.median_detection_latency_s
+  // verdict on whether the source is fast enough for a durable BTC 5M edge
+  const verdict = med == null ? null : med <= 5 ? { t: 'pos', m: `median detection ${secs(med)} — within target (<5s)` }
+    : med <= 10 ? { t: 'warn', m: `median detection ${secs(med)} — borderline (5–10s); edge likely degraded` }
+      : { t: 'neg', m: `median detection ${secs(med)} — too slow (>10s) for a durable BTC 5M edge` }
+  return (
+    <div data-testid="latency-panel">
+      <div className="page-head" style={{ marginBottom: 6 }}>
+        <h4 style={{ margin: 0 }}>Latency &amp; price drift</h4>
+        <span className="muted small">
+          {l.n_signals ?? 0} signals · sources {JSON.stringify(l.by_source || {})} ·
+          worker {worker?.worker_running ? '● running' : 'stopped'} ({worker?.place_live ? 'live' : 'paper'})
+        </span>
+      </div>
+      {verdict && <div className={`diag-strip ${verdict.t === 'pos' ? '' : 'neg'}`} data-testid="latency-verdict"
+        style={{ marginBottom: 8 }}>⏱ {verdict.m}</div>}
+      <div className="cards">
+        <div className="card"><div className="label">Detection latency</div>
+          <div className="value">{secs(l.avg_detection_latency_s)}</div>
+          <div className="sub">median {secs(l.median_detection_latency_s)} · worst {secs(l.worst_detection_latency_s)}</div></div>
+        <div className="card"><div className="label">Execution latency</div><div className="value">{secs(l.avg_execution_latency_s)}</div>
+          <div className="sub">detect → submit</div></div>
+        <div className="card"><div className="label">Fill latency</div><div className="value">{secs(l.avg_fill_latency_s)}</div>
+          <div className="sub">submit → fill</div></div>
+        <div className="card"><div className="label">Total latency</div><div className="value">{secs(l.avg_total_latency_s)}</div>
+          <div className="sub">median {secs(l.median_total_latency_s)} · worst {secs(l.worst_total_latency_s)}</div></div>
+        <div className="card"><div className="label">Avg price drift</div><div className="value">{l.avg_price_drift == null ? '—' : l.avg_price_drift}</div>
+          <div className="sub">|detected − wallet entry|</div></div>
+        <div className="card"><div className="label">Avg missed edge</div><div className={`value ${(l.avg_missed_edge ?? 0) > 0 ? 'neg' : ''}`}>{l.avg_missed_edge == null ? '—' : l.avg_missed_edge}</div>
+          <div className="sub">fill − perfect copy</div></div>
+        <div className="card"><div className="label">Edge lost to latency</div><div className={`value ${(l.edge_lost_to_latency ?? 0) > 0 ? 'neg' : ''}`}>{usd(l.edge_lost_to_latency)}</div>
+          <div className="sub">perfect − live (settled)</div></div>
+        <div className="card"><div className="label">Paper vs live Δ</div><div className="value">{usd(l.paper_vs_live_delta)}</div>
+          <div className="sub">perfect {usd(l.paper_perfect_pnl)} · live {usd(l.live_pnl)}</div></div>
+      </div>
+      <h5 style={{ margin: '10px 0 4px' }}>Detection-latency histogram</h5>
+      <div data-testid="latency-histogram">
+        {hist.map((b) => (
+          <div key={b.bucket} className="risk-cell" style={{ alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 70, display: 'inline-block' }} className="small">{b.bucket}</span>
+            <span style={{ flex: 1, background: '#1b2433', borderRadius: 4, height: 12, display: 'inline-block' }}>
+              <span style={{ display: 'block', height: 12, borderRadius: 4, background: '#4ea1ff',
+                width: `${Math.max(2, (b.count / maxH) * 100)}%` }} />
+            </span>
+            <b style={{ width: 32, textAlign: 'right' }}>{b.count}</b>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function StateBadge({ s }) {
   if (!s?.enabled) return <span className="badge neutral" data-testid="mt-state">disabled (env)</span>
   if (s.stopped) return <span className="badge bad" data-testid="mt-state">stopped — re-arm required</span>
@@ -81,6 +140,8 @@ export function MicroTestPanel({ status, onArm, onDisarm, onRunPaper, onRunLive,
           <div className="small neg">{s.last_rejection || '— none —'}</div>
         </div>
       </div>
+
+      <div style={{ marginTop: 14 }}><LatencyPanel latency={s.latency} worker={s.worker} /></div>
 
       <h4 style={{ margin: '12px 0 4px' }}>Active test position</h4>
       {!active ? <Empty>No active BTC 5M micro-test position.</Empty> : (

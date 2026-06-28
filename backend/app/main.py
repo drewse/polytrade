@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_micro_test_worker, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -99,6 +99,10 @@ def _startup() -> None:
     # recorded fill prices/cost basis from the venue's actual fills; never trades).
     from . import fill_reconciler
     fill_reconciler.start()
+    # Start the BTC 5M micro-test worker (separate daemon; inert unless ENABLED +
+    # armed; paper-only unless an explicit live-place opt-in is set). Never starts
+    # real trading by itself and never touches the production workers above.
+    btc5m_micro_test_worker.start()
 
 
 @app.get("/api/health")
@@ -715,6 +719,11 @@ def btc5m_micro_test_disarm(db: Session = Depends(get_db)) -> MessageOut:
 @app.post("/api/btc5m/micro-test/settle", response_model=MessageOut)
 def btc5m_micro_test_settle(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m micro-test settle", detail=btc5m_micro_test.settle(db))
+
+
+@app.get("/api/btc5m/micro-test/latency", response_model=MessageOut)
+def btc5m_micro_test_latency(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m micro-test latency", detail=btc5m_micro_test.latency_stats(db))
 
 
 # ===========================================================================

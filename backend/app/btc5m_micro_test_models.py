@@ -75,6 +75,24 @@ class Btc5mMicroTestTrade(Base):
     paper_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     paper_realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # --- V2: latency instrumentation (UTC timestamps + derived seconds) ------
+    signal_source: Mapped[str | None] = mapped_column(String(20), nullable=True)  # wallet_poll | research_index
+    wallet_trade_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)   # wallet's on-venue trade time
+    detected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)       # when our poll saw it
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)      # just before order submit
+    venue_ack_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)      # venue acknowledged the order
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)         # fill confirmed
+    detection_latency_s: Mapped[float | None] = mapped_column(Float, nullable=True)     # detected - wallet_trade
+    execution_latency_s: Mapped[float | None] = mapped_column(Float, nullable=True)     # submitted - detected
+    fill_latency_s: Mapped[float | None] = mapped_column(Float, nullable=True)          # filled - submitted
+    total_latency_s: Mapped[float | None] = mapped_column(Float, nullable=True)         # filled - wallet_trade
+
+    # --- V2: price-drift / missed-edge analysis -----------------------------
+    wallet_entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)      # perfect-copy price
+    detected_price: Mapped[float | None] = mapped_column(Float, nullable=True)          # market price at detection
+    missed_edge: Mapped[float | None] = mapped_column(Float, nullable=True)             # fill - wallet_entry (cost of copying late)
+    latency_cost: Mapped[float | None] = mapped_column(Float, nullable=True)            # detected - wallet_entry (price moved before we saw it)
+
 
 class Btc5mMicroTestState(Base):
     """Singleton arm/stop latch for the micro-test (id=1). Default disarmed.

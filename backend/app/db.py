@@ -101,6 +101,24 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "stats_updated": "BOOLEAN DEFAULT 0",
     },
     "ingest_status": {"last_discovery_at": "DATETIME"},
+    # BTC 5M Micro-Test V2 — latency instrumentation + price-drift columns added
+    # after the V1 table shipped (ALTER preserves the existing empty table).
+    "btc5m_micro_test_trades": {
+        "signal_source": "VARCHAR",
+        "wallet_trade_at": "DATETIME",
+        "detected_at": "DATETIME",
+        "submitted_at": "DATETIME",
+        "venue_ack_at": "DATETIME",
+        "filled_at": "DATETIME",
+        "detection_latency_s": "FLOAT",
+        "execution_latency_s": "FLOAT",
+        "fill_latency_s": "FLOAT",
+        "total_latency_s": "FLOAT",
+        "wallet_entry_price": "FLOAT",
+        "detected_price": "FLOAT",
+        "missed_edge": "FLOAT",
+        "latency_cost": "FLOAT",
+    },
     "paper_signals": {
         "edge_estimate": "FLOAT DEFAULT 0.0",
         "move_5m": "FLOAT", "move_30m": "FLOAT", "move_2h": "FLOAT",
