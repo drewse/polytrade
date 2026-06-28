@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models/market_intel_models/challenger_models imports register research tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_audit, wallet_audit_models  # noqa: F401  (btc5m_models/research_models/market_intel_models/challenger_models/wallet_audit_models imports register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -523,6 +523,26 @@ def live_reconciler_status(db: Session = Depends(get_db)) -> MessageOut:
     detail = fill_reconciler.status()
     detail["pending_count"] = live.pending_reconciliation_count(db)
     return MessageOut(message="reconciler status", detail=detail)
+
+
+@app.get("/api/live/top-wallets-audit", response_model=MessageOut)
+def live_top_wallets_audit(refresh_public: bool = False, force_refresh: bool = False,
+                           db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY audit of the production Top-N copied wallets: internal stats,
+    rolling windows, cached PUBLIC Polymarket stats, score breakdown, and warnings.
+    Never changes ranking/eligibility/execution. `refresh_public=true` re-fetches
+    stale public profiles (bounded + rate-limited)."""
+    return MessageOut(message="top wallets audit",
+                      detail=wallet_audit.top_wallets_audit(db, refresh_public=refresh_public,
+                                                            force_refresh=force_refresh))
+
+
+@app.get("/api/live/top-wallets-audit/{address}", response_model=MessageOut)
+def live_wallet_audit_detail(address: str, db: Session = Depends(get_db)) -> MessageOut:
+    detail = wallet_audit.wallet_audit_detail(db, address)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="wallet not found in ranking")
+    return MessageOut(message="wallet audit detail", detail=detail)
 
 
 @app.get("/api/live/sizing-simulation", response_model=MessageOut)

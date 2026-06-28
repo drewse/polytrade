@@ -132,6 +132,8 @@ export const api = {
   liveRebaselineBankroll: () => request('/api/live/rebaseline-bankroll', { method: 'POST', body: JSON.stringify({ confirm: true }) }),
   liveSizingSimulation: (limit = 1000) => request(`/api/live/sizing-simulation?limit=${limit}`),
   liveReconcileFills: (limit = 300) => request(`/api/live/reconcile-fills?limit=${limit}`, { method: 'POST' }),
+  liveTopWalletsAudit: (refreshPublic = false) => request(`/api/live/top-wallets-audit${refreshPublic ? '?refresh_public=true' : ''}`),
+  liveWalletAuditDetail: (address) => request(`/api/live/top-wallets-audit/${encodeURIComponent(address)}`),
   liveReconcilerStatus: () => request('/api/live/reconciler-status'),
   // BTC 5M Reversal Lab — isolated read-only research
   btc5mDashboard: () => request('/api/btc5m/dashboard'),
