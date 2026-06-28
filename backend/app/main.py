@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, services, top20  # noqa: F401  (btc5m_models import registers research tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models imports register research tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -581,6 +581,72 @@ def btc5m_models_leaderboard(scope: str = "global", db: Session = Depends(get_db
 @app.get("/api/btc5m/research-notes", response_model=MessageOut)
 def btc5m_research_notes(limit: int = 40, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m research notes", detail={"notes": btc5m.research_notes(db, limit=limit)})
+
+
+# ===========================================================================
+# Research Platform V1 — isolated PAPER-ONLY research on top of the BTC 5M Lab.
+# Never places orders, changes production rankings/eligibility/discovery, or
+# touches live trading/bankroll/execution.
+# ===========================================================================
+@app.get("/api/research/dashboard", response_model=MessageOut)
+def research_dashboard(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="research dashboard", detail=research.dashboard(db))
+
+
+@app.post("/api/research/cycle", response_model=MessageOut)
+def research_cycle_run(limit_markets: int = 120, train: bool = True, mutate: bool = True,
+                       db: Session = Depends(get_db)) -> MessageOut:
+    """Run one full continuous-learning cycle (refresh -> seed -> mutate -> ensembles
+    -> replay/paper-trade -> tournament -> hypotheses -> nightly review). Paper-only;
+    reproducible; never touches live trading."""
+    return MessageOut(message="research cycle", detail=research.research_cycle(
+        db, limit_markets=limit_markets, train=train, mutate=mutate))
+
+
+@app.post("/api/research/replay", response_model=MessageOut)
+def research_replay(db: Session = Depends(get_db)) -> MessageOut:
+    """Re-run the deterministic historical replay / paper trading for all strategies."""
+    return MessageOut(message="replay", detail=research.replay_all(db))
+
+
+@app.get("/api/research/strategies", response_model=MessageOut)
+def research_strategies(status: str | None = None, limit: int = 300,
+                        db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="strategy library",
+                      detail={"strategies": research.strategy_library(db, status=status, limit=limit)})
+
+
+@app.get("/api/research/strategies/{strategy_id}", response_model=MessageOut)
+def research_strategy_detail(strategy_id: int, db: Session = Depends(get_db)) -> MessageOut:
+    detail = research.strategy_detail(db, strategy_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="strategy not found")
+    return MessageOut(message="strategy detail", detail=detail)
+
+
+@app.get("/api/research/tournament", response_model=MessageOut)
+def research_tournament(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="tournament", detail=research.tournament(db))
+
+
+@app.get("/api/research/champion", response_model=MessageOut)
+def research_champion(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="champion board", detail=research.champion_board(db))
+
+
+@app.get("/api/research/hypotheses", response_model=MessageOut)
+def research_hypotheses(limit: int = 60, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="hypotheses", detail={"hypotheses": research.hypotheses(db, limit=limit)})
+
+
+@app.get("/api/research/nightly-reviews", response_model=MessageOut)
+def research_nightly_reviews(limit: int = 30, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="nightly reviews", detail={"reviews": research.nightly_reviews(db, limit=limit)})
+
+
+@app.get("/api/research/experiments", response_model=MessageOut)
+def research_experiments(limit: int = 80, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="experiments", detail={"experiments": research.experiments(db, limit=limit)})
 
 
 # ===========================================================================

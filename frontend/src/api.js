@@ -142,6 +142,17 @@ export const api = {
   btc5mShadow: (limit = 50) => request(`/api/btc5m/shadow?limit=${limit}`),
   btc5mModels: (scope = 'global') => request(`/api/btc5m/models?scope=${encodeURIComponent(scope)}`),
   btc5mResearchNotes: (limit = 40) => request('/api/btc5m/research-notes'),
+  // Research Platform V1 — isolated paper research
+  researchDashboard: () => request('/api/research/dashboard'),
+  researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),
+  researchReplay: () => request('/api/research/replay', { method: 'POST' }),
+  researchStrategies: (status) => request(`/api/research/strategies${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  researchStrategy: (id) => request(`/api/research/strategies/${id}`),
+  researchTournament: () => request('/api/research/tournament'),
+  researchChampion: () => request('/api/research/champion'),
+  researchHypotheses: () => request('/api/research/hypotheses'),
+  researchNightlyReviews: () => request('/api/research/nightly-reviews'),
+  researchExperiments: () => request('/api/research/experiments'),
 }
 
 export const COPY_CLASS = {
