@@ -171,6 +171,17 @@ export const api = {
   miCounterfactual: () => request('/api/market-intel/counterfactual'),
   miRecommendations: () => request('/api/market-intel/recommendations'),
   miNightlyReviews: () => request('/api/market-intel/nightly-reviews'),
+  // Paper Challenger Framework V1 — isolated paper A/B research
+  pcDashboard: () => request('/api/challenger/dashboard'),
+  pcRun: (limitMarkets = 150) => request(`/api/challenger/run?limit_markets=${limitMarkets}`, { method: 'POST' }),
+  pcChallengers: () => request('/api/challenger/challengers'),
+  pcChallenger: (key) => request(`/api/challenger/challengers/${encodeURIComponent(key)}`),
+  pcExperiments: () => request('/api/challenger/experiments'),
+  pcExperiment: (id) => request(`/api/challenger/experiments/${id}`),
+  pcComparison: (kind) => request(`/api/challenger/comparison?kind=${encodeURIComponent(kind)}`),
+  pcRegimePerformance: () => request('/api/challenger/regime-performance'),
+  pcRecommendations: () => request('/api/challenger/recommendations'),
+  pcNightlyReviews: () => request('/api/challenger/nightly-reviews'),
 }
 
 export const COPY_CLASS = {

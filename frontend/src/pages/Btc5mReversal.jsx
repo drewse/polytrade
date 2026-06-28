@@ -3,12 +3,13 @@ import { api, fmt } from '../api'
 import { Loading, Empty, WalletLink, Stat } from '../components/common.jsx'
 import ResearchPlatform from './ResearchPlatform.jsx'
 import MarketIntel from './MarketIntel.jsx'
+import ChallengerLab from './ChallengerLab.jsx'
 
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
 
 const SECTIONS = [
-  'Overview', 'Research Platform', 'Market Intelligence', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
+  'Overview', 'Research Platform', 'Market Intelligence', 'Paper Challengers', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
   'Strategy Lab', 'Consensus Graph', 'Feature Importance', 'Shadow Strategy',
   'Model Performance', 'Leaderboard', 'Research Notes',
 ]
@@ -230,7 +231,8 @@ export default function Btc5mReversal() {
         {tab === 'Overview' && <Dashboard d={dash} />}
         {tab === 'Research Platform' && <ResearchPlatform />}
         {tab === 'Market Intelligence' && <MarketIntel />}
-        {tab !== 'Overview' && tab !== 'Research Platform' && tab !== 'Market Intelligence' && tabLoading && !td && <Loading />}
+        {tab === 'Paper Challengers' && <ChallengerLab />}
+        {!['Overview', 'Research Platform', 'Market Intelligence', 'Paper Challengers'].includes(tab) && tabLoading && !td && <Loading />}
         {tab === 'Dataset' && td && (
           <div>
             <div className="cards">

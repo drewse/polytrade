@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models/market_intel_models imports register research tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models/market_intel_models/challenger_models imports register research tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -769,6 +769,70 @@ def mi_recommendations(limit: int = 50, db: Session = Depends(get_db)) -> Messag
 @app.get("/api/market-intel/nightly-reviews", response_model=MessageOut)
 def mi_nightly_reviews(limit: int = 30, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="market intel nightly reviews", detail={"reviews": market_intel.nightly_reviews(db, limit=limit)})
+
+
+# ===========================================================================
+# Paper Challenger Framework V1 — isolated PAPER-ONLY A/B research. Never trades
+# or changes execution/eligibility/rankings/bankroll/copy-trading/risk controls.
+# ===========================================================================
+@app.get("/api/challenger/dashboard", response_model=MessageOut)
+def pc_dashboard(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="challenger dashboard", detail=challenger.dashboard(db))
+
+
+@app.post("/api/challenger/run", response_model=MessageOut)
+def pc_run(refresh_lab: bool = False, limit_markets: int = 150, db: Session = Depends(get_db)) -> MessageOut:
+    """Run one paper-challenger cycle (build immutable experiments -> rebuild
+    portfolios -> significance -> champion -> recommendations -> nightly review).
+    Paper-only; never trades."""
+    return MessageOut(message="challenger cycle", detail=challenger.run_challengers(
+        db, refresh_lab=refresh_lab, limit_markets=limit_markets))
+
+
+@app.get("/api/challenger/challengers", response_model=MessageOut)
+def pc_challengers(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="challengers", detail={"challengers": challenger.challengers(db)})
+
+
+@app.get("/api/challenger/challengers/{key}", response_model=MessageOut)
+def pc_challenger_detail(key: str, db: Session = Depends(get_db)) -> MessageOut:
+    detail = challenger.challenger_detail(db, key)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="challenger not found")
+    return MessageOut(message="challenger detail", detail=detail)
+
+
+@app.get("/api/challenger/experiments", response_model=MessageOut)
+def pc_experiments(limit: int = 60, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="experiments", detail={"experiments": challenger.experiments(db, limit=limit)})
+
+
+@app.get("/api/challenger/experiments/{experiment_id}", response_model=MessageOut)
+def pc_experiment_detail(experiment_id: int, db: Session = Depends(get_db)) -> MessageOut:
+    detail = challenger.experiment_detail(db, experiment_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return MessageOut(message="experiment detail", detail=detail)
+
+
+@app.get("/api/challenger/comparison", response_model=MessageOut)
+def pc_comparison(kind: str = "timing", db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="comparison", detail={"kind": kind, "rows": challenger.comparison(db, kind)})
+
+
+@app.get("/api/challenger/regime-performance", response_model=MessageOut)
+def pc_regime_perf(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="regime performance", detail=challenger.regime_performance(db))
+
+
+@app.get("/api/challenger/recommendations", response_model=MessageOut)
+def pc_recommendations(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="challenger recommendations", detail={"recommendations": challenger.recommendations(db, limit=limit)})
+
+
+@app.get("/api/challenger/nightly-reviews", response_model=MessageOut)
+def pc_nightly_reviews(limit: int = 30, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="challenger nightly reviews", detail={"reviews": challenger.nightly_reviews(db, limit=limit)})
 
 
 # ===========================================================================
