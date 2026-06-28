@@ -129,6 +129,19 @@ export const api = {
   liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
   liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),
   liveReconcileAccount: () => request('/api/live/reconcile-account', { method: 'POST' }),
+  // BTC 5M Reversal Lab — isolated read-only research
+  btc5mDashboard: () => request('/api/btc5m/dashboard'),
+  btc5mRefresh: (limitMarkets = 50) => request(`/api/btc5m/refresh?limit_markets=${limitMarkets}`, { method: 'POST' }),
+  btc5mDataset: () => request('/api/btc5m/dataset'),
+  btc5mWalletIq: (limit = 50) => request(`/api/btc5m/wallet-iq?limit=${limit}`),
+  btc5mWalletProfiles: (limit = 200) => request(`/api/btc5m/wallet-profiles?limit=${limit}`),
+  btc5mClusters: () => request('/api/btc5m/clusters'),
+  btc5mStrategyLab: (scope = 'global') => request(`/api/btc5m/strategy-lab?scope=${encodeURIComponent(scope)}`),
+  btc5mConsensus: () => request('/api/btc5m/consensus'),
+  btc5mFeatureImportance: (scope = 'global') => request(`/api/btc5m/feature-importance?scope=${encodeURIComponent(scope)}`),
+  btc5mShadow: (limit = 50) => request(`/api/btc5m/shadow?limit=${limit}`),
+  btc5mModels: (scope = 'global') => request(`/api/btc5m/models?scope=${encodeURIComponent(scope)}`),
+  btc5mResearchNotes: (limit = 40) => request('/api/btc5m/research-notes'),
 }
 
 export const COPY_CLASS = {

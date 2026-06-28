@@ -14,10 +14,12 @@ import Discovery from './pages/Discovery.jsx'
 import Backtests from './pages/Backtests.jsx'
 import Settings from './pages/Settings.jsx'
 import LiveTrading from './pages/LiveTrading.jsx'
+import Btc5mReversal from './pages/Btc5mReversal.jsx'
 
 const NAV = [
   { to: '/overview', label: 'Overview' },
   { to: '/live-trading', label: 'Live Trading' },
+  { to: '/btc5m-reversal', label: 'BTC 5M Reversal' },
   { to: '/top-20', label: 'TOP 20' },
   { to: '/portfolio', label: 'Portfolio' },
   { to: '/research', label: 'Research' },
@@ -102,6 +104,7 @@ export default function App() {
           <Route path="/" element={<Navigate to="/overview" replace />} />
           <Route path="/overview" element={<Overview />} />
           <Route path="/live-trading" element={<LiveTrading />} />
+          <Route path="/btc5m-reversal" element={<Btc5mReversal />} />
           <Route path="/top-20" element={<Top20 />} />
           <Route path="/portfolio" element={<Portfolio />} />
           <Route path="/research" element={<Research />} />

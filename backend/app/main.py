@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, discovery, live, services, top20
+from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, services, top20  # noqa: F401  (btc5m_models import registers research tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -509,6 +509,78 @@ def mock_seed(db: Session = Depends(get_db)) -> MessageOut:
     services.ensure_settings(db)
     result = services.seed_mock_data(db)
     return MessageOut(message="Seeded mock data", detail=result)
+
+
+# ===========================================================================
+# BTC 5M Reversal Lab — isolated READ-ONLY research module. Never submits orders,
+# changes rankings/eligibility/discovery, or affects live trading.
+# ===========================================================================
+@app.get("/api/btc5m/dashboard", response_model=MessageOut)
+def btc5m_dashboard(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m dashboard", detail=btc5m.dashboard(db))
+
+
+@app.post("/api/btc5m/refresh", response_model=MessageOut)
+def btc5m_refresh(limit_markets: int = 50, train: bool = True,
+                  db: Session = Depends(get_db)) -> MessageOut:
+    """Run one research cycle (index -> fingerprint -> train+promote -> shadow).
+    Idempotent; read-only w.r.t. production. This is the 'small research batch'."""
+    return MessageOut(message="btc5m research cycle", detail=btc5m.refresh(
+        db, limit_markets=limit_markets, train=train))
+
+
+@app.get("/api/btc5m/dataset", response_model=MessageOut)
+def btc5m_dataset(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m dataset", detail=btc5m.dataset_summary(db))
+
+
+@app.get("/api/btc5m/wallet-iq", response_model=MessageOut)
+def btc5m_wallet_iq(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m wallet IQ", detail={"cards": btc5m.wallet_iq_cards(db, limit=limit)})
+
+
+@app.get("/api/btc5m/wallet-profiles", response_model=MessageOut)
+def btc5m_wallet_profiles(limit: int = 200, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m wallet profiles", detail={"profiles": btc5m.wallet_profiles(db, limit=limit)})
+
+
+@app.get("/api/btc5m/clusters", response_model=MessageOut)
+def btc5m_clusters(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m clusters", detail=btc5m.clusters(db))
+
+
+@app.get("/api/btc5m/strategy-lab", response_model=MessageOut)
+def btc5m_strategy_lab(scope: str = "global", db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m strategy lab", detail={
+        "scope": scope, "leaderboard": btc5m.leaderboard(db, scope=scope),
+        "feature_importance": btc5m.feature_importance(db, scope=scope)})
+
+
+@app.get("/api/btc5m/consensus", response_model=MessageOut)
+def btc5m_consensus(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m consensus", detail=btc5m.consensus(db))
+
+
+@app.get("/api/btc5m/feature-importance", response_model=MessageOut)
+def btc5m_feature_importance(scope: str = "global", db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m feature importance",
+                      detail={"scope": scope, "feature_importance": btc5m.feature_importance(db, scope=scope)})
+
+
+@app.get("/api/btc5m/shadow", response_model=MessageOut)
+def btc5m_shadow(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m shadow strategy", detail={
+        "performance": btc5m.shadow_performance(db), "signals": btc5m.shadow_signals(db, limit=limit)})
+
+
+@app.get("/api/btc5m/models", response_model=MessageOut)
+def btc5m_models_leaderboard(scope: str = "global", db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m model leaderboard", detail={"leaderboard": btc5m.leaderboard(db, scope=scope)})
+
+
+@app.get("/api/btc5m/research-notes", response_model=MessageOut)
+def btc5m_research_notes(limit: int = 40, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m research notes", detail={"notes": btc5m.research_notes(db, limit=limit)})
 
 
 # ===========================================================================
