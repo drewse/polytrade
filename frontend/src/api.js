@@ -157,6 +157,20 @@ export const api = {
   researchHypotheses: () => request('/api/research/hypotheses'),
   researchNightlyReviews: () => request('/api/research/nightly-reviews'),
   researchExperiments: () => request('/api/research/experiments'),
+  // Market Intelligence & Regime Engine V1 — isolated read-only analytics
+  miDashboard: () => request('/api/market-intel/dashboard'),
+  miRun: (limitMarkets = 150) => request(`/api/market-intel/run?limit_markets=${limitMarkets}`, { method: 'POST' }),
+  miMarkets: (regime) => request(`/api/market-intel/markets${regime ? `?regime=${encodeURIComponent(regime)}` : ''}`),
+  miMarket: (id) => request(`/api/market-intel/markets/${encodeURIComponent(id)}`),
+  miRegimes: () => request('/api/market-intel/regimes'),
+  miWalletSpecialization: () => request('/api/market-intel/wallet-specialization'),
+  miStrategySpecialization: () => request('/api/market-intel/strategy-specialization'),
+  miLeaderboards: () => request('/api/market-intel/leaderboards'),
+  miDecay: () => request('/api/market-intel/decay'),
+  miOriginality: () => request('/api/market-intel/originality'),
+  miCounterfactual: () => request('/api/market-intel/counterfactual'),
+  miRecommendations: () => request('/api/market-intel/recommendations'),
+  miNightlyReviews: () => request('/api/market-intel/nightly-reviews'),
 }
 
 export const COPY_CLASS = {

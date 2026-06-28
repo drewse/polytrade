@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models imports register research tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_models, discovery, live, market_intel, market_intel_models, research, research_models, services, top20  # noqa: F401  (btc5m_models/research_models/market_intel_models imports register research tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -692,6 +692,83 @@ def research_nightly_reviews(limit: int = 30, db: Session = Depends(get_db)) -> 
 @app.get("/api/research/experiments", response_model=MessageOut)
 def research_experiments(limit: int = 80, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="experiments", detail={"experiments": research.experiments(db, limit=limit)})
+
+
+# ===========================================================================
+# Market Intelligence & Regime Engine V1 — isolated READ-ONLY analytics. Never
+# trades, never changes execution/eligibility/ranking/discovery/bankroll.
+# ===========================================================================
+@app.get("/api/market-intel/dashboard", response_model=MessageOut)
+def mi_dashboard(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="market intel dashboard", detail=market_intel.dashboard(db))
+
+
+@app.post("/api/market-intel/run", response_model=MessageOut)
+def mi_run(refresh_lab: bool = True, limit_markets: int = 150,
+           db: Session = Depends(get_db)) -> MessageOut:
+    """Run one Market-Intelligence batch (profiles -> regimes -> wallet/strategy
+    specialization -> decay -> originality -> counterfactual -> recommendations ->
+    nightly review). Read-only research; never trades."""
+    return MessageOut(message="market intel batch", detail=market_intel.run_intel_batch(
+        db, refresh_lab=refresh_lab, limit_markets=limit_markets))
+
+
+@app.get("/api/market-intel/markets", response_model=MessageOut)
+def mi_markets(regime: str | None = None, limit: int = 200, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="market profiles", detail={"markets": market_intel.markets(db, regime=regime, limit=limit)})
+
+
+@app.get("/api/market-intel/markets/{market_id}", response_model=MessageOut)
+def mi_market_detail(market_id: str, db: Session = Depends(get_db)) -> MessageOut:
+    detail = market_intel.market_detail(db, market_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="market profile not found")
+    return MessageOut(message="market detail", detail=detail)
+
+
+@app.get("/api/market-intel/regimes", response_model=MessageOut)
+def mi_regimes(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="regime distribution", detail=market_intel.regime_distribution(db))
+
+
+@app.get("/api/market-intel/wallet-specialization", response_model=MessageOut)
+def mi_wallet_spec(limit: int = 100, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="wallet specialization", detail={"wallets": market_intel.wallet_specialization(db, limit=limit)})
+
+
+@app.get("/api/market-intel/strategy-specialization", response_model=MessageOut)
+def mi_strategy_spec(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="strategy specialization", detail={"strategies": market_intel.strategy_specialization(db)})
+
+
+@app.get("/api/market-intel/leaderboards", response_model=MessageOut)
+def mi_leaderboards(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="regime leaderboards", detail=market_intel.regime_leaderboards(db))
+
+
+@app.get("/api/market-intel/decay", response_model=MessageOut)
+def mi_decay(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="decay analysis", detail=market_intel.decay_analysis(db))
+
+
+@app.get("/api/market-intel/originality", response_model=MessageOut)
+def mi_originality(limit: int = 100, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="originality graph", detail=market_intel.originality(db, limit=limit))
+
+
+@app.get("/api/market-intel/counterfactual", response_model=MessageOut)
+def mi_counterfactual(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="counterfactual results", detail=market_intel.counterfactual_results(db))
+
+
+@app.get("/api/market-intel/recommendations", response_model=MessageOut)
+def mi_recommendations(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="market recommendations", detail={"recommendations": market_intel.market_recommendations(db, limit=limit)})
+
+
+@app.get("/api/market-intel/nightly-reviews", response_model=MessageOut)
+def mi_nightly_reviews(limit: int = 30, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="market intel nightly reviews", detail={"reviews": market_intel.nightly_reviews(db, limit=limit)})
 
 
 # ===========================================================================
