@@ -87,6 +87,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "requested_size_usd": "FLOAT",      # intended stake (size_usd holds the FILLED amount)
         "tick_size": "FLOAT",               # venue book tick_size used for the decision
         "min_order_size": "FLOAT",          # venue book min_order_size (shares) used
+        "sizing_detail": "JSON",            # dynamic risk-aware sizing breakdown
     },
     "discovery_sources": {
         "backfill_status": "VARCHAR DEFAULT 'pending'",

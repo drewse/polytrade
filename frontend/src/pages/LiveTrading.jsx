@@ -64,6 +64,27 @@ function execBadge(e) {
   return <span className="badge neutral">{e.status}</span>
 }
 
+// dynamic risk-aware sizing breakdown — every position size is explainable
+export function SizingCell({ sizing }) {
+  if (!sizing) return <span className="muted small">—</span>
+  const c = sizing.constraints || {}
+  const tip = [
+    `method: ${sizing.method}`,
+    sizing.market_price != null ? `price: ${sizing.market_price}` : null,
+    sizing.confidence != null ? `confidence: ${sizing.confidence} → ×${sizing.confidence_multiplier}` : null,
+    sizing.edge != null ? `edge: ${sizing.edge} → ×${sizing.edge_factor}` : null,
+    sizing.raw_target_stake != null ? `raw target: $${sizing.raw_target_stake}` : null,
+    sizing.share_cap != null ? `share cap: $${sizing.share_cap} (${sizing.max_shares_per_trade} sh)` : null,
+    Object.keys(c).length ? `caps: ${Object.entries(c).map(([k, v]) => `${k}=${v}`).join(', ')}` : null,
+    `→ final: $${sizing.final_stake} (${sizing.final_shares ?? '—'} sh) · limited by ${sizing.limiting_constraint}`,
+  ].filter(Boolean).join('\n')
+  return (
+    <span className="small" title={tip} style={{ cursor: 'help' }}>
+      <span className="badge neutral">{(sizing.limiting_constraint || '—').replace(/_/g, ' ')}</span>
+    </span>
+  )
+}
+
 // ---- gate trail (the key readability feature) ----------------------------
 const GATE_LABEL = {
   trading_enabled: 'trading enabled',
@@ -303,7 +324,8 @@ export default function LiveTrading() {
         <StatusCard label="Open positions" value={s?.open_positions ?? 0} sub={s?.ended_unsettled ? `${s.ended_unsettled} ended, unsettled` : 'active markets'} />
         <StatusCard label="Day P/L" value={fmt.usd2(s?.day_pnl)} tone={s?.day_pnl > 0 ? 'pos' : s?.day_pnl < 0 ? 'neg' : ''} />
         <StatusCard label="Total realized P/L" value={fmt.usd2(s?.total_realized)} tone={s?.total_realized > 0 ? 'pos' : s?.total_realized < 0 ? 'neg' : ''} />
-        <StatusCard label="Position size" value={fmt.usd2(s?.sizing?.position_usd)} sub={s?.sizing?.method} />
+        <StatusCard label="Position size (base)" value={fmt.usd2(s?.sizing?.position_usd)}
+          sub={s?.sizing?.dynamic_enabled ? `dynamic · ${s?.sizing?.max_shares_per_trade} sh cap` : s?.sizing?.method} />
         <StatusCard label="Max total risk" value={fmt.usd2(lim.max_total_risk)} sub="open-exposure cap ($)" />
         <StatusCard label="Real orders placed" value={s?.real_orders_placed ?? 0} sub="lifetime — not a cap" />
         <StatusCard label="Max possible loss" value={fmt.usd2(s?.max_possible_loss)} tone="neg" />
@@ -385,7 +407,7 @@ export default function LiveTrading() {
                   <th>Time</th><th>Status</th><th>Market</th><th>Outcome</th><th>Side</th>
                   <th className="right">Stake</th><th className="right">Exp</th><th className="right">Limit</th>
                   <th className="right">Fill</th><th className="right">Shares</th><th className="right">Slip</th>
-                  <th>Order id</th><th>Wallet copied</th><th>Reason / error</th>
+                  <th>Sizing</th><th>Order id</th><th>Wallet copied</th><th>Reason / error</th>
                 </tr>
               </thead>
               <tbody>
@@ -402,6 +424,7 @@ export default function LiveTrading() {
                     <td className="right">{num(e.fill_price, 3)}</td>
                     <td className="right">{num(e.shares, 2)}</td>
                     <td className="right">{e.slippage == null ? '—' : pct(e.slippage)}</td>
+                    <td><SizingCell sizing={e.sizing_detail} /></td>
                     <td className="mono small" title={e.order_id || ''}>{e.order_id ? short(e.order_id) : '—'}</td>
                     <td className="mono"><WalletLink address={e.wallet} /></td>
                     <td className="small" title={e.venue_error || ''}>

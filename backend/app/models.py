@@ -447,6 +447,8 @@ class LiveExecution(Base):
     bankroll_after: Mapped[float | None] = mapped_column(Float, nullable=True)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # dynamic risk-aware sizing breakdown (fully explains the chosen stake)
+    sizing_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class LiveState(Base):

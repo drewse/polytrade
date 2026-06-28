@@ -210,6 +210,9 @@ class LiveConfig:
     order_ttl_seconds: float # rest a resting limit this long, then cancel
     cancel_if_unfilled: bool
     allow_partial_fill: bool
+    # dynamic risk-aware sizing
+    max_shares_per_trade: float   # share cap: stake <= price * max_shares_per_trade
+    enable_dynamic_sizing: bool   # confidence/edge-scaled sizing (else flat $)
 
 
 def get_config() -> LiveConfig:
@@ -224,7 +227,7 @@ def get_config() -> LiveConfig:
         # only by available cash + the absolute-$ risk caps below and the loss
         # stops. LIVE_MAX_ORDERS / LIVE_MAX_OPEN_POSITIONS / LIVE_MAX_POSITIONS are
         # deliberately ignored — they never block a new entry.
-        max_per_market=float(os.getenv("LIVE_MAX_PER_MARKET", "4.0")),
+        max_per_market=float(os.getenv("LIVE_MAX_PER_MARKET", "6.0")),
         max_per_wallet=float(os.getenv("LIVE_MAX_PER_WALLET", "8.0")),
         daily_loss_stop=float(os.getenv("LIVE_DAILY_LOSS_STOP", "10.0")),
         total_loss_stop=float(os.getenv("LIVE_TOTAL_LOSS_STOP", "40.0")),
@@ -236,6 +239,8 @@ def get_config() -> LiveConfig:
         order_ttl_seconds=float(os.getenv("ORDER_TTL_SECONDS", "2")),
         cancel_if_unfilled=_truthy(os.getenv("CANCEL_IF_UNFILLED", "true")),
         allow_partial_fill=_truthy(os.getenv("ALLOW_PARTIAL_FILL", "true")),
+        max_shares_per_trade=float(os.getenv("LIVE_MAX_SHARES_PER_TRADE", "20")),
+        enable_dynamic_sizing=_truthy(os.getenv("LIVE_ENABLE_DYNAMIC_SIZING", "true")),
     )
 
 
@@ -256,6 +261,71 @@ def conservative_stake(cfg: LiveConfig, *, available_cash: float, total_open: fl
     if stake < cfg.min_stake:
         return None
     return round(stake, 2)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic, risk-aware sizing — confidence/edge-scaled target, then the SAME
+# absolute-$ hard caps plus a per-trade SHARE cap (so cheap contracts can't buy
+# an oversized share count). Pure + fully explainable. Replaces flat sizing only;
+# it touches no execution/edge/eligibility/routing/slippage/risk-control logic.
+# ---------------------------------------------------------------------------
+# Confidence tier -> fraction of the base position. Higher confidence allocates
+# more (up to 110% on 90+); below the 70 tier (but above the eligibility floor)
+# is sized down to 50%.
+_CONFIDENCE_TIERS = ((90.0, 1.10), (85.0, 1.00), (80.0, 0.90), (75.0, 0.75), (70.0, 0.60))
+
+
+def _confidence_multiplier(confidence: float | None) -> float:
+    if confidence is None:
+        return 1.0
+    for threshold, mult in _CONFIDENCE_TIERS:
+        if confidence >= threshold:
+            return mult
+    return 0.50
+
+
+def _edge_factor(edge: float | None) -> float:
+    """Higher edge slightly increases the target (never decreases it), capped at
+    +10% so the hard caps always dominate."""
+    if edge is None:
+        return 1.0
+    return round(1.0 + min(max(edge, 0.0), 0.20) * 0.5, 4)
+
+
+def dynamic_stake(cfg: LiveConfig, *, price: float, confidence: float | None, edge: float | None,
+                  available_cash: float, total_open: float, wallet_exposure: float,
+                  market_exposure: float) -> tuple[float | None, dict]:
+    """final_stake = min(confidence/edge-scaled target, available cash, remaining
+    total-risk, remaining per-market, remaining per-wallet, price*max_shares).
+    Returns (stake, breakdown). stake is None when the binding constraint is below
+    min_stake. The breakdown explains every input + the limiting constraint."""
+    p = max(0.01, min(0.99, float(price)))
+    mult = _confidence_multiplier(confidence)
+    efac = _edge_factor(edge)
+    target = cfg.position_usd * mult * efac
+    share_cap = p * cfg.max_shares_per_trade
+    constraints = {
+        "dynamic_target": round(target, 4),
+        "available_cash": round(available_cash, 4),
+        "remaining_total_risk": round(cfg.max_total_risk - total_open, 4),
+        "remaining_per_market": round(cfg.max_per_market - market_exposure, 4),
+        "remaining_per_wallet": round(cfg.max_per_wallet - wallet_exposure, 4),
+        "share_cap": round(share_cap, 4),
+    }
+    limiting = min(constraints, key=constraints.get)
+    raw_final = constraints[limiting]
+    detail = {
+        "method": "dynamic", "market_price": round(p, 4), "confidence": confidence, "edge": edge,
+        "confidence_multiplier": mult, "edge_factor": efac, "share_cap": round(share_cap, 4),
+        "max_shares_per_trade": cfg.max_shares_per_trade, "raw_target_stake": round(target, 4),
+        "constraints": constraints, "limiting_constraint": limiting,
+    }
+    if raw_final < cfg.min_stake:
+        detail.update({"final_stake": 0.0, "final_shares": 0.0, "rejected": True})
+        return None, detail
+    final = round(raw_final, 2)
+    detail.update({"final_stake": final, "final_shares": round(final / p, 2), "rejected": False})
+    return final, detail
 
 
 # ---------------------------------------------------------------------------
@@ -742,21 +812,23 @@ def _market_exposure(open_, mid):
 
 
 def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: int | None,
-                   market: Market, outcome: str, price: float, entry_reason: str) -> LiveExecution | None:
+                   market: Market, outcome: str, price: float, entry_reason: str,
+                   confidence: float | None = None, edge: float | None = None) -> LiveExecution | None:
     cfg = get_config()
     idem = f"{strategy_key}:{signal_id}"
     if db.scalar(select(LiveExecution).where(LiveExecution.idempotency_key == idem)):
         return None  # duplicate-order prevention
     st = get_state(db)
 
-    def _reject(reason, size=0.0, *, fill_outcome=None, venue_error=None):
+    def _reject(reason, size=0.0, *, fill_outcome=None, venue_error=None, sizing=None):
         db.add(LiveExecution(idempotency_key=idem, executor=cfg.executor, strategy_key=strategy_key,
                              wallet_address=wallet, signal_id=signal_id, market_id=market.id,
                              market_question=market.question or "", outcome=outcome, side="buy",
                              expected_price=round(price, 4), size_usd=size, status="rejected",
                              entry_reason=entry_reason, exit_reason=reason[:40],
                              fill_outcome=fill_outcome, venue_error=venue_error,
-                             requested_size_usd=size or None, bankroll_before=st.bankroll))
+                             requested_size_usd=size or None, bankroll_before=st.bankroll,
+                             sizing_detail=sizing))
         db.commit()
 
     ok, reason = check_can_open(db, cfg, wallet=wallet, market_id=market.id)
@@ -767,12 +839,24 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
     # whose market already resolved is awaiting settlement, not tying up cash.
     open_ = _open_active(db)
     available_cash = round(st.bankroll - sum(e.size_usd for e in open_), 2)
-    stake = conservative_stake(cfg, available_cash=available_cash,
-                               total_open=sum(e.size_usd for e in open_),
-                               wallet_exposure=_wallet_exposure(open_, wallet),
-                               market_exposure=_market_exposure(open_, market.id))
+    total_open = sum(e.size_usd for e in open_)
+    we = _wallet_exposure(open_, wallet)
+    me = _market_exposure(open_, market.id)
+    # SIZING ONLY — dynamic risk-aware (default) or the legacy flat-$ fallback.
+    if cfg.enable_dynamic_sizing:
+        stake, sizing = dynamic_stake(cfg, price=price, confidence=confidence, edge=edge,
+                                      available_cash=available_cash, total_open=total_open,
+                                      wallet_exposure=we, market_exposure=me)
+    else:
+        stake = conservative_stake(cfg, available_cash=available_cash, total_open=total_open,
+                                   wallet_exposure=we, market_exposure=me)
+        sizing = {"method": "flat", "market_price": round(price, 4), "confidence": confidence,
+                  "edge": edge, "raw_target_stake": cfg.position_usd,
+                  "final_stake": stake or 0.0,
+                  "final_shares": round((stake or 0.0) / max(0.01, price), 2),
+                  "limiting_constraint": "flat_position_usd", "rejected": stake is None}
     if stake is None:
-        _reject("no capital room within caps", fill_outcome="rejected")
+        _reject("no capital room within caps", fill_outcome="rejected", sizing=sizing)
         return None
     try:
         result = get_executor(cfg).place(db=db, market=market, outcome=outcome, price=price,
@@ -781,10 +865,10 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         # unfilled_cancelled / submit_error / cancel_error / pre-trade rejects.
         # Capture the FULL venue error text (never truncated) in venue_error.
         _reject(f"exec: {exc}", size=stake, fill_outcome=(exc.outcome or "rejected"),
-                venue_error=exc.venue_error)
+                venue_error=exc.venue_error, sizing=sizing)
         return None
     except Exception as exc:  # noqa: BLE001  (unexpected -> reject + halt, fail closed)
-        _reject(f"error: {exc}", size=stake, fill_outcome="error", venue_error=_full_err(exc))
+        _reject(f"error: {exc}", size=stake, fill_outcome="error", venue_error=_full_err(exc), sizing=sizing)
         _trip_halt(db, st, f"executor error: {str(exc)[:60]}")
         return None
 
@@ -804,7 +888,8 @@ def process_signal(db: Session, *, strategy_key: str, wallet: str, signal_id: in
         tick_size=result.tick_size, min_order_size=result.min_order_size,
         venue_error=result.venue_error, order_id=result.order_id,
         order_latency_ms=result.order_latency_ms, confirm_latency_ms=result.confirm_latency_ms,
-        status="open", entry_reason=entry_reason, bankroll_before=st.bankroll)
+        status="open", entry_reason=entry_reason, bankroll_before=st.bankroll,
+        sizing_detail=sizing)
     db.add(ex)
     db.commit()
     # No lifetime-order cap: trading is bounded by MAX CONCURRENT open positions
@@ -969,7 +1054,8 @@ def _decide_one(db: Session, s, cfg: LiveConfig, eligible: set, score_map: dict,
     # order pipeline (it logs a LiveExecution: 'open' on fill, 'rejected' otherwise).
     ex = process_signal(db, strategy_key=cfg.strategy, wallet=addr, signal_id=s.id, market=m,
                         outcome=s.outcome, price=float(s.observed_price or 0.5),
-                        entry_reason=f"copy {(addr or '')[:10]} conf={conf:.0f} edge={edge}")
+                        entry_reason=f"copy {(addr or '')[:10]} conf={conf:.0f} edge={edge}",
+                        confidence=conf, edge=edge)
     if ex is not None:
         gates["risk_passed"] = True
         gates["submitted"] = True
@@ -1312,8 +1398,14 @@ def status(db: Session) -> dict:
         "strategy_copied": cfg.strategy,
         "wallet_selection": "production_rank_score (40% reputation, 30% PF, 20% ROI, "
                             "10% recency; filters ROI>0, PF>1.20) — see /api/live/wallet-ranking",
-        "sizing": {"method": "fixed_dollar", "position_usd": cfg.position_usd,
-                   "min_stake": cfg.min_stake, "no_compounding": True, "no_leverage": True},
+        "sizing": {"method": "dynamic_risk_aware" if cfg.enable_dynamic_sizing else "fixed_dollar",
+                   "dynamic_enabled": cfg.enable_dynamic_sizing,
+                   "position_usd": cfg.position_usd, "min_stake": cfg.min_stake,
+                   "max_shares_per_trade": cfg.max_shares_per_trade,
+                   "confidence_tiers": {"70-74": 0.60, "75-79": 0.75, "80-84": 0.90,
+                                        "85-89": 1.00, "90+": 1.10},
+                   "edge_factor": "1 + min(edge,0.20)*0.5 (<=+10%)",
+                   "no_compounding": True, "no_leverage": True},
         "limits_usd": {"max_position": cfg.position_usd, "max_total_risk": cfg.max_total_risk,
                        "max_per_market": cfg.max_per_market,
                        "max_per_wallet": cfg.max_per_wallet, "daily_loss_stop": cfg.daily_loss_stop,
@@ -1347,5 +1439,61 @@ def list_executions(db: Session, limit: int = 100) -> list[dict]:
         "status": e.status, "fill_outcome": e.fill_outcome, "venue_error": e.venue_error,
         "entry_reason": e.entry_reason, "exit_reason": e.exit_reason,
         "realized_pnl": e.realized_pnl, "bankroll_before": e.bankroll_before,
-        "bankroll_after": e.bankroll_after,
+        "bankroll_after": e.bankroll_after, "sizing_detail": e.sizing_detail,
     } for e in rows]
+
+
+def sizing_simulation(db: Session, *, limit: int = 1000) -> dict:
+    """READ-ONLY paper simulation comparing the legacy flat-$ sizing vs the new
+    dynamic risk-aware sizing over recent historical signals. Computes both on a
+    CLEAN slate (no existing exposure, ample cash) so it isolates the sizing-model
+    difference. Places nothing; touches no execution logic."""
+    from collections import Counter
+
+    from .models import PaperSignal
+    cfg = get_config()
+    big = 1e9
+    rows = []
+    sigs = db.scalars(select(PaperSignal).order_by(PaperSignal.created_at.desc()).limit(limit)).all()
+    for s in sigs:
+        price = float(s.observed_price or 0.0)
+        if not (0.0 < price < 1.0):
+            continue
+        conf = float(s.confidence or 0.0)
+        edge = float(s.edge_estimate or 0.0)
+        flat = conservative_stake(cfg, available_cash=big, total_open=0.0,
+                                  wallet_exposure=0.0, market_exposure=0.0) or 0.0
+        dyn, detail = dynamic_stake(cfg, price=price, confidence=conf, edge=edge,
+                                    available_cash=big, total_open=0.0,
+                                    wallet_exposure=0.0, market_exposure=0.0)
+        dyn = dyn or 0.0
+        rows.append({"price": price, "flat_stake": flat, "flat_shares": round(flat / price, 2),
+                     "dyn_stake": dyn, "dyn_shares": round(dyn / price, 2),
+                     "limiting": detail["limiting_constraint"]})
+    n = len(rows)
+
+    def _avg(key):
+        return round(sum(r[key] for r in rows) / n, 3) if n else 0.0
+
+    buckets = [(0.0, 0.10), (0.10, 0.20), (0.20, 0.30), (0.30, 0.50), (0.50, 0.80), (0.80, 1.0)]
+    dist = []
+    for lo, hi in buckets:
+        b = [r for r in rows if lo <= r["price"] < hi]
+        if not b:
+            continue
+        dist.append({"range": f"{int(lo*100)}-{int(hi*100)}c", "n": len(b),
+                     "avg_flat_stake": round(sum(x["flat_stake"] for x in b) / len(b), 2),
+                     "avg_dyn_stake": round(sum(x["dyn_stake"] for x in b) / len(b), 2),
+                     "avg_flat_shares": round(sum(x["flat_shares"] for x in b) / len(b), 1),
+                     "avg_dyn_shares": round(sum(x["dyn_shares"] for x in b) / len(b), 1)})
+    return {
+        "signals": n,
+        "avg_stake_before": _avg("flat_stake"), "avg_stake_after": _avg("dyn_stake"),
+        "avg_shares_before": _avg("flat_shares"), "avg_shares_after": _avg("dyn_shares"),
+        "distribution_by_price": dist,
+        "limiting_constraint_counts": dict(Counter(r["limiting"] for r in rows)),
+        "config": {"position_usd": cfg.position_usd, "max_per_market": cfg.max_per_market,
+                   "max_shares_per_trade": cfg.max_shares_per_trade,
+                   "dynamic_enabled": cfg.enable_dynamic_sizing},
+        "note": "read-only simulation on a clean slate; no orders placed, live logic unchanged",
+    }

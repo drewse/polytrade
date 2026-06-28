@@ -129,6 +129,7 @@ export const api = {
   liveRunOnce: () => request('/api/live/run-once', { method: 'POST' }),
   liveReconcile: (balance) => request(`/api/live/reconcile?balance=${balance}`, { method: 'POST' }),
   liveReconcileAccount: () => request('/api/live/reconcile-account', { method: 'POST' }),
+  liveSizingSimulation: (limit = 1000) => request(`/api/live/sizing-simulation?limit=${limit}`),
   // BTC 5M Reversal Lab — isolated read-only research
   btc5mDashboard: () => request('/api/btc5m/dashboard'),
   btc5mRefresh: (limitMarkets = 50) => request(`/api/btc5m/refresh?limit_markets=${limitMarkets}`, { method: 'POST' }),

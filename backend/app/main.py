@@ -488,6 +488,14 @@ def live_discovery_backfill_status(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="backfill status", detail=discovery_backfill.backfill_status(db))
 
 
+@app.get("/api/live/sizing-simulation", response_model=MessageOut)
+def live_sizing_simulation(limit: int = 1000, db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY: compare legacy flat-$ vs new dynamic risk-aware sizing over recent
+    historical signals (avg stake/shares before vs after, distribution by price).
+    Places nothing; live execution logic untouched."""
+    return MessageOut(message="sizing simulation", detail=live.sizing_simulation(db, limit=limit))
+
+
 @app.get("/api/live/auth-check", response_model=MessageOut)
 def live_auth_check() -> MessageOut:
     """READ-ONLY: validate the live API credentials with one authenticated GET

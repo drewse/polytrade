@@ -43,9 +43,9 @@ def test_fixed_dollar_sizing():
 
 def test_sizing_capped_by_market_wallet_total_and_cash():
     cfg = live.get_config()
-    # per-market cap $4, already $3 -> $1 room
-    assert live.conservative_stake(cfg, available_cash=40, total_open=3,
-                                   wallet_exposure=0, market_exposure=3) == 1.0
+    # per-market cap $6, already $5 -> $1 room
+    assert live.conservative_stake(cfg, available_cash=40, total_open=5,
+                                   wallet_exposure=0, market_exposure=5) == 1.0
     # per-wallet cap $8, already $7.5 -> $0.5 < min_stake $1 -> None
     assert live.conservative_stake(cfg, available_cash=40, total_open=7.5,
                                    wallet_exposure=7.5, market_exposure=0) is None
@@ -335,7 +335,7 @@ def test_status_caps_max_loss_at_40(in_memory_db, monkeypatch):
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
     s = live.status(in_memory_db)
     assert s["live_trading_enabled"] is False
-    assert s["sizing"]["position_usd"] == 2.0 and s["sizing"]["method"] == "fixed_dollar"
+    assert s["sizing"]["position_usd"] == 2.0 and s["sizing"]["method"] == "dynamic_risk_aware"
     assert s["limits_usd"]["total_loss_stop"] == 40.0
     assert s["max_possible_loss"] == 40.0
 
