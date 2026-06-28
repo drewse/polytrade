@@ -153,6 +153,12 @@ export const api = {
   btc5mShadow: (limit = 50) => request(`/api/btc5m/shadow?limit=${limit}`),
   btc5mModels: (scope = 'global') => request(`/api/btc5m/models?scope=${encodeURIComponent(scope)}`),
   btc5mResearchNotes: (limit = 40) => request('/api/btc5m/research-notes'),
+  // BTC 5M Micro-Test Mode (opt-in, isolated, minimum-size live test)
+  btc5mMicroTestStatus: () => request('/api/btc5m/micro-test/status'),
+  btc5mMicroTestRunOnce: (place = false) => request(`/api/btc5m/micro-test/run-once?place=${place}`, { method: 'POST' }),
+  btc5mMicroTestArm: (by) => request(`/api/btc5m/micro-test/arm${by ? `?by=${encodeURIComponent(by)}` : ''}`, { method: 'POST' }),
+  btc5mMicroTestDisarm: () => request('/api/btc5m/micro-test/disarm', { method: 'POST' }),
+  btc5mMicroTestSettle: () => request('/api/btc5m/micro-test/settle', { method: 'POST' }),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

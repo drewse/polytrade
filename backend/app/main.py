@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -682,6 +682,39 @@ def btc5m_models_leaderboard(scope: str = "global", db: Session = Depends(get_db
 @app.get("/api/btc5m/research-notes", response_model=MessageOut)
 def btc5m_research_notes(limit: int = 40, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m research notes", detail={"notes": btc5m.research_notes(db, limit=limit)})
+
+
+# ===========================================================================
+# BTC 5M Micro-Test Mode — opt-in, minimum-size single-wallet live test, fully
+# isolated from general live copy trading (separate table + accounting; reuses
+# only the safe execution primitive). Default DISABLED + DISARMED.
+# ===========================================================================
+@app.get("/api/btc5m/micro-test/status", response_model=MessageOut)
+def btc5m_micro_test_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m micro-test status", detail=btc5m_micro_test.status(db))
+
+
+@app.post("/api/btc5m/micro-test/run-once", response_model=MessageOut)
+def btc5m_micro_test_run_once(place: bool = False, db: Session = Depends(get_db)) -> MessageOut:
+    """Run one micro-test cycle. place=false (default) => PAPER simulation;
+    place=true => real execution via the shared safe path (per LIVE_EXECUTOR)."""
+    btc5m_micro_test.settle(db)                      # settle resolved test positions first
+    return MessageOut(message="btc5m micro-test run", detail=btc5m_micro_test.run_once(db, place=place))
+
+
+@app.post("/api/btc5m/micro-test/arm", response_model=MessageOut)
+def btc5m_micro_test_arm(by: str | None = None, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m micro-test arm", detail=btc5m_micro_test.arm(db, by=by))
+
+
+@app.post("/api/btc5m/micro-test/disarm", response_model=MessageOut)
+def btc5m_micro_test_disarm(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m micro-test disarm", detail=btc5m_micro_test.disarm(db))
+
+
+@app.post("/api/btc5m/micro-test/settle", response_model=MessageOut)
+def btc5m_micro_test_settle(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m micro-test settle", detail=btc5m_micro_test.settle(db))
 
 
 # ===========================================================================
