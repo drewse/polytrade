@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { Loading, Empty, WalletLink } from '../components/common.jsx'
+import Btc5mOnchain from './Btc5mOnchain.jsx'
 
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
@@ -239,6 +240,9 @@ export default function Btc5mMicroTest() {
         onRunLive={() => act(() => api.btc5mMicroTestRunOnce(true),
           'Run a LIVE micro-test cycle now? This may place ONE real minimum-size (5-share) order if a signal qualifies. Max loss for the trade ≤ $3. Continue?')}
       />
+      <div className="panel" style={{ marginTop: 14 }}>
+        <Btc5mOnchain />
+      </div>
       {toast && <div className="toast">{toast}</div>}
     </div>
   )

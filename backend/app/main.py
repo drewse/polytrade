@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_micro_test_worker, btc5m_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_micro_test_worker, btc5m_models, btc5m_onchain_models, btc5m_onchain_source, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -724,6 +724,34 @@ def btc5m_micro_test_settle(db: Session = Depends(get_db)) -> MessageOut:
 @app.get("/api/btc5m/micro-test/latency", response_model=MessageOut)
 def btc5m_micro_test_latency(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m micro-test latency", detail=btc5m_micro_test.latency_stats(db))
+
+
+# --- V3 Phase 1: on-chain OrderFilled detector (PAPER-ONLY measurement) ------
+@app.get("/api/btc5m/onchain/status", response_model=MessageOut)
+def btc5m_onchain_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m onchain status", detail=btc5m_onchain_source.status(db))
+
+
+@app.post("/api/btc5m/onchain/start", response_model=MessageOut)
+def btc5m_onchain_start(db: Session = Depends(get_db)) -> MessageOut:
+    """Start the PAPER-ONLY on-chain detector loop. Never places orders."""
+    return MessageOut(message="btc5m onchain start", detail=btc5m_onchain_source.start(db))
+
+
+@app.post("/api/btc5m/onchain/stop", response_model=MessageOut)
+def btc5m_onchain_stop(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m onchain stop", detail=btc5m_onchain_source.stop(db))
+
+
+@app.post("/api/btc5m/onchain/run-once", response_model=MessageOut)
+def btc5m_onchain_run_once(db: Session = Depends(get_db)) -> MessageOut:
+    """Run one detector poll cycle (paper-only). Useful for manual measurement."""
+    return MessageOut(message="btc5m onchain run-once", detail=btc5m_onchain_source.run_once(db))
+
+
+@app.get("/api/btc5m/onchain/signals", response_model=MessageOut)
+def btc5m_onchain_signals(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m onchain signals", detail=btc5m_onchain_source.signals(db, limit=limit))
 
 
 # ===========================================================================

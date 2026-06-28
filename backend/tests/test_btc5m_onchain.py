@@ -1,0 +1,195 @@
+"""BTC 5M Micro-Test V3 Phase 1 — on-chain detector tests: OrderFilled decode,
+maker/taker watched-wallet detection, token->market mapping, BUY/SELL + outcome
+derivation, dedup + gap-fill, cursor persistence, latency/drift measurement,
+gate simulation, verdict, and PAPER-ONLY isolation (no LiveExecution, no bankroll
+change, no orders)."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from sqlalchemy import func, select
+
+from app import btc5m_onchain_source as oc
+from app import btc5m_onchain_models as om
+from app import live
+from app.models import LiveExecution
+
+PRIMARY = "0x4c9497941333332d29f1c235dd23200f3623ffad"
+BACKUP = "0xd9013df863c1ba932780857b020dfdeacedf8e14"
+OTHER = "0x1111111111111111111111111111111111111111"
+EXCH = oc.DEFAULT_EXCHANGES[0]
+
+
+def _enable(monkeypatch):
+    monkeypatch.setenv("BTC5M_ONCHAIN_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_ONCHAIN_PAPER_ONLY", "true")
+    monkeypatch.setenv("POLYGON_WS_RPC_URL", "https://polygon-rpc.example/x")
+    monkeypatch.setenv("BTC5M_MICRO_TEST_PRIMARY_WALLET", PRIMARY)
+    monkeypatch.setenv("BTC5M_MICRO_TEST_BACKUP_WALLETS", BACKUP)
+    monkeypatch.setenv("BTC5M_MICRO_TEST_MAX_ENTRY_PRICE", "0.60")
+    monkeypatch.setenv("BTC5M_MICRO_TEST_MIN_SECONDS_REMAINING", "30")
+
+
+def _pad(a):
+    return "0x" + a[2:].rjust(64, "0")
+
+
+def _word(n):
+    return format(n, "064x")
+
+
+def _log(*, maker, taker, maker_asset="0", taker_asset="12345", usd=2_500_000, shares=5_000_000,
+         tx="0xabc", log_index="0x1", block="0x10", address=EXCH):
+    data = "0x" + _word(int(maker_asset)) + _word(int(taker_asset)) + _word(usd) + _word(shares) + _word(0)
+    return {"transactionHash": tx, "logIndex": log_index, "blockNumber": block, "address": address,
+            "topics": [oc.ORDERFILLED_TOPIC0, "0x" + "0" * 64, _pad(maker), _pad(taker)], "data": data}
+
+
+GAMMA = [{"conditionId": "0xcond1", "clobTokenIds": '["12345","67890"]', "outcomes": '["Up","Down"]',
+          "question": "Bitcoin Up or Down - 5 minute", "slug": "btc-updown-5m-1",
+          "endDate": None, "closed": False}]
+
+
+def _tmap():
+    return oc.build_token_map(GAMMA)
+
+
+# --- decode + classify ------------------------------------------------------
+def test_decode_order_filled():
+    dec = oc.decode_order_filled(_log(maker=PRIMARY, taker=OTHER))
+    assert dec["maker"] == PRIMARY and dec["taker"] == OTHER
+    assert dec["maker_asset_id"] == "0" and dec["taker_asset_id"] == "12345"
+    assert dec["maker_amount"] == 2_500_000 and dec["tx_hash"] == "0xabc" and dec["log_index"] == 1
+
+
+def test_detect_maker_buy():
+    dec = oc.decode_order_filled(_log(maker=PRIMARY, taker=OTHER))
+    cl = oc.classify_fill(dec, {PRIMARY}, set(oc.DEFAULT_EXCHANGES))
+    assert cl["role"] == "maker" and cl["side"] == "buy" and cl["watched"] == PRIMARY
+    assert cl["token_id"] == "12345" and cl["price"] == 0.5 and cl["shares"] == 5.0 and cl["usd"] == 2.5
+
+
+def test_detect_taker_buy():
+    # taker gave USDC (takerAssetId=0) -> taker BOUGHT makerAssetId
+    dec = oc.decode_order_filled(_log(maker=OTHER, taker=BACKUP, maker_asset="67890", taker_asset="0",
+                                      usd=5_000_000, shares=2_000_000))
+    cl = oc.classify_fill(dec, {BACKUP}, set(oc.DEFAULT_EXCHANGES))
+    assert cl["role"] == "taker" and cl["side"] == "buy" and cl["token_id"] == "67890"
+    # taker gave takerAmount USDC (2_000_000=$2) for makerAmount shares (5_000_000=5) -> price 0.4
+    assert cl["price"] == 0.4
+
+
+def test_ignore_non_watched():
+    dec = oc.decode_order_filled(_log(maker=OTHER, taker="0x2222222222222222222222222222222222222222"))
+    assert oc.classify_fill(dec, {PRIMARY}, set(oc.DEFAULT_EXCHANGES)) is None
+
+
+def test_ignore_exchange_counterparty():
+    dec = oc.decode_order_filled(_log(maker=PRIMARY, taker=EXCH))   # other side is the exchange
+    assert oc.classify_fill(dec, {PRIMARY}, set(oc.DEFAULT_EXCHANGES)) is None
+
+
+def test_token_map_btc_only():
+    tm = _tmap()
+    assert tm["12345"]["outcome"] == "Up" and tm["12345"]["duration_minutes"] == 5
+    assert oc.build_token_map([{"conditionId": "x", "clobTokenIds": '["9"]', "outcomes": '["Yes","No"]',
+                                "question": "Will it rain?", "slug": "weather"}]) == {}
+
+
+# --- process_logs: measurement + dedup + gates ------------------------------
+def _proc(db, logs, *, now=None, price=0.50, block_ago_s=3):
+    cfg = oc._cfg()
+    now = now or datetime.utcnow()
+    return oc.process_logs(db, logs, cfg=cfg, tmap=_tmap(), now=now,
+                           price_fn=lambda t: price,
+                           block_ts_fn=lambda b: now - timedelta(seconds=block_ago_s))
+
+
+def test_process_creates_measured_signal(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    out = _proc(db, [_log(maker=PRIMARY, taker=OTHER)], price=0.55, block_ago_s=3)
+    assert out["signals_created"] == 1
+    s = db.scalar(select(om.Btc5mOnchainSignal))
+    assert s.side == "buy" and s.direction == "YES" and s.price == 0.5
+    assert 2900 <= s.detection_latency_ms <= 3200          # ~3s
+    assert s.market_price_at_detection == 0.55 and s.price_drift == 0.05
+    assert s.would_pass_gates is True and s.ignored_reason is None
+
+
+def test_dedup_and_gapfill_no_duplicate(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    log = _log(maker=PRIMARY, taker=OTHER)
+    assert _proc(db, [log])["signals_created"] == 1
+    out2 = _proc(db, [log])                                 # same tx+log_index re-seen (reconnect replay)
+    assert out2["signals_created"] == 0 and out2["deduped"] == 1
+    assert db.scalar(select(func.count()).select_from(om.Btc5mOnchainSignal)) == 1
+
+
+def test_gate_sim_price_above_max_ignored(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    # price 0.75 > 0.60 ceiling -> recorded but ignored (not actionable)
+    _proc(db, [_log(maker=PRIMARY, taker=OTHER, usd=3_750_000, shares=5_000_000)])
+    s = db.scalar(select(om.Btc5mOnchainSignal))
+    assert s.price == 0.75 and s.would_pass_gates is False and "max entry" in s.ignored_reason
+
+
+def test_non_btc_token_ignored(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    _proc(db, [_log(maker=PRIMARY, taker=OTHER, taker_asset="99999")])   # token not in map
+    s = db.scalar(select(om.Btc5mOnchainSignal))
+    assert s.ignored_reason == "token not in BTC up/down map"
+
+
+# --- run_once: cursor + isolation -------------------------------------------
+def test_run_once_advances_cursor_and_isolated(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    bank0 = live.get_state(db).bankroll
+    now = datetime.utcnow()
+    out = oc.run_once(db, now=now,
+                      latest_block_fn=lambda cfg: 100,
+                      fetch_logs_fn=lambda cfg, a, b: [_log(maker=PRIMARY, taker=OTHER)],
+                      token_fetch_fn=lambda: GAMMA,
+                      price_fn=lambda t: 0.5,
+                      block_ts_fn=lambda b: now - timedelta(seconds=2))
+    assert out["ran"] is True and out["signals_created"] == 1
+    assert oc.get_state(db).last_processed_block == 100
+    # second cycle, new block, no new logs -> cursor advances, no dup
+    oc.run_once(db, now=now, latest_block_fn=lambda cfg: 101,
+                fetch_logs_fn=lambda cfg, a, b: [], token_fetch_fn=lambda: GAMMA)
+    assert oc.get_state(db).last_processed_block == 101
+    # ISOLATION: no production execution / bankroll change ever
+    assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0
+    assert live.get_state(db).bankroll == bank0
+
+
+def test_run_once_disabled_noop(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_ONCHAIN_ENABLED", "false")
+    out = oc.run_once(db, latest_block_fn=lambda cfg: 1, fetch_logs_fn=lambda cfg, a, b: [])
+    assert out["ran"] is False and "false" in out["reason"]
+    assert db.scalar(select(func.count()).select_from(om.Btc5mOnchainSignal)) == 0
+
+
+# --- stats / verdict / status ----------------------------------------------
+def test_verdict_insufficient_then_status_paper_only(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    _proc(db, [_log(maker=PRIMARY, taker=OTHER)])
+    st = oc.status(db)
+    assert st["live_execution"] is False and st["paper_only"] is True
+    assert st["stats"]["verdict"] == "insufficient_data"   # <20 signals
+    assert PRIMARY in st["watched_wallets"]
+
+
+def test_latency_metrics_and_verdict(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    # 22 fast signals (~3s each) on actionable BUYs -> viable verdict
+    for i in range(22):
+        oc.process_logs(db, [_log(maker=PRIMARY, taker=OTHER, tx=f"0x{i:02x}", log_index="0x0")],
+                        cfg=oc._cfg(), tmap=_tmap(), now=now,
+                        price_fn=lambda t: 0.5, block_ts_fn=lambda b: now - timedelta(seconds=3))
+    s = oc.stats(db)
+    assert s["signals"] == 22 and s["measured"] == 22
+    assert s["median_latency_s"] is not None and s["median_latency_s"] < 5
+    assert s["pct_under_10s"] == 100.0
+    assert s["verdict"] == "viable"
