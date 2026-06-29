@@ -166,6 +166,13 @@ export const api = {
   btc5mOnchainStop: () => request('/api/btc5m/onchain/stop', { method: 'POST' }),
   btc5mOnchainRunOnce: () => request('/api/btc5m/onchain/run-once', { method: 'POST' }),
   btc5mOnchainSignals: (limit = 50) => request(`/api/btc5m/onchain/signals?limit=${limit}`),
+  // BTC 5M Independent Strategy Lab (research/paper only)
+  btc5mLabStatus: () => request('/api/btc5m/lab/status'),
+  btc5mLabBuild: (limitMarkets = 80) => request(`/api/btc5m/lab/build-dataset?limit_markets=${limitMarkets}`, { method: 'POST' }),
+  btc5mLabSearch: () => request('/api/btc5m/lab/search', { method: 'POST' }),
+  btc5mLabLeaderboard: (limit = 40) => request(`/api/btc5m/lab/leaderboard?limit=${limit}`),
+  btc5mLabAnalyses: () => request('/api/btc5m/lab/analyses'),
+  btc5mLabReport: () => request('/api/btc5m/lab/report'),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

@@ -5,12 +5,13 @@ import ResearchPlatform from './ResearchPlatform.jsx'
 import MarketIntel from './MarketIntel.jsx'
 import ChallengerLab from './ChallengerLab.jsx'
 import Btc5mMicroTest from './Btc5mMicroTest.jsx'
+import Btc5mStrategyLab from './Btc5mStrategyLab.jsx'
 
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
 
 const SECTIONS = [
-  'Overview', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
+  'Overview', 'Strategy Lab', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
   'Strategy Lab', 'Consensus Graph', 'Feature Importance', 'Shadow Strategy',
   'Model Performance', 'Leaderboard', 'Research Notes',
 ]
@@ -230,11 +231,12 @@ export default function Btc5mReversal() {
 
       <div style={{ marginTop: 12 }}>
         {tab === 'Overview' && <Dashboard d={dash} />}
+        {tab === 'Strategy Lab' && <Btc5mStrategyLab />}
         {tab === 'Micro-Test (Live)' && <Btc5mMicroTest />}
         {tab === 'Research Platform' && <ResearchPlatform />}
         {tab === 'Market Intelligence' && <MarketIntel />}
         {tab === 'Paper Challengers' && <ChallengerLab />}
-        {!['Overview', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers'].includes(tab) && tabLoading && !td && <Loading />}
+        {!['Overview', 'Strategy Lab', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers'].includes(tab) && tabLoading && !td && <Loading />}
         {tab === 'Dataset' && td && (
           <div>
             <div className="cards">
