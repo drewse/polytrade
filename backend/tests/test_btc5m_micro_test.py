@@ -352,6 +352,24 @@ def test_wallet_poll_source_detects_with_latency(in_memory_db, monkeypatch):
     assert 2.0 <= t.detection_latency_s <= 6.0          # ~3s wallet-trade age
 
 
+def test_poll_tz_aware_timestamp_does_not_crash(in_memory_db, monkeypatch):
+    """data-api returns tz-AWARE timestamps; the micro-test uses naive utcnow.
+    Mixing them used to raise TypeError and 500 — normalize to naive UTC."""
+    from datetime import timezone
+    db = in_memory_db
+    _enable(monkeypatch); umt.arm(db)
+    _open_btc5m_market(db, mid="0xtzm1")
+
+    class TzDTO:
+        side = "buy"; market_id = "0xtzm1"; outcome = "Up"; price = 0.50
+        timestamp = datetime.now(timezone.utc) - timedelta(seconds=4)   # tz-aware
+    out = umt.run_once(db, place=False, fetch_fn=lambda a: [TzDTO()] if a == PRIMARY else [])
+    assert out["ran"] is True and out["source"] == "wallet_poll"
+    t = db.scalar(select(mt.Btc5mMicroTestTrade))
+    assert t.wallet_trade_at is not None and t.wallet_trade_at.tzinfo is None   # stored naive
+    assert 3.0 <= t.detection_latency_s <= 7.0
+
+
 def test_price_drift_and_missed_edge_recorded(in_memory_db, monkeypatch):
     db = in_memory_db
     _enable(monkeypatch); umt.arm(db)

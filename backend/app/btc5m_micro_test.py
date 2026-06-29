@@ -19,7 +19,7 @@ ISOLATION GUARANTEES (by construction):
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -28,6 +28,17 @@ from . import btc5m, live
 from . import btc5m_micro_test_models as mt
 from . import btc5m_models as bm
 from .models import Market, Trade
+
+
+def _naive_utc(dt: datetime | None) -> datetime | None:
+    """Normalize a datetime to naive-UTC (the project-wide convention). The public
+    data-api returns tz-AWARE timestamps; everything we store/compare against
+    (utcnow, Market/Trade timestamps) is naive — mixing them raises TypeError."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 MARKET_LIFE_SECONDS = 300
 
@@ -261,10 +272,10 @@ def _poll_wallet_signals(db: Session, cfg: dict, now: datetime, *, fetch_fn=None
             dtos = fetch(addr) or []
         except Exception:  # noqa: BLE001  (one wallet's API hiccup must not break the rest)
             continue
-        for d in sorted(dtos, key=lambda x: getattr(x, "timestamp", None) or now, reverse=True):
+        for d in sorted(dtos, key=lambda x: _naive_utc(getattr(x, "timestamp", None)) or now, reverse=True):
             if str(getattr(d, "side", "buy")).lower() != "buy":
                 continue
-            ts = getattr(d, "timestamp", None)
+            ts = _naive_utc(getattr(d, "timestamp", None))     # data-api is tz-aware -> naive UTC
             if ts and ts < age_cut:
                 continue
             mid = getattr(d, "market_id", None)
@@ -507,7 +518,7 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
 
     cand, extras = chosen
     detected_at = now                                   # we just saw it this cycle
-    wallet_trade_at = cand.get("wallet_trade_at")
+    wallet_trade_at = _naive_utc(cand.get("wallet_trade_at"))   # guard tz-aware vs naive
     detection_latency = ((detected_at - wallet_trade_at).total_seconds()
                          if wallet_trade_at else None)
     st.last_signal = (f"{detected_at.isoformat()} — {cand['role']} {cand['wallet'][:10]}… "
