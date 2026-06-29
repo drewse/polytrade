@@ -193,3 +193,67 @@ def test_execution_paper_only(in_memory_db):
     st = ex.execution_status(db)
     assert "research/paper only" in st["safety"]
     assert live.get_state(db).bankroll == bank0
+
+
+# --- rest-window sweep ------------------------------------------------------
+def test_full_life_timeout_and_long_horizon(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    # max_future=None captures trades for the whole market life (not just 5s)
+    sigs = ex.build_signals(db, "holdout", _model(db), ph1.ALL_FEATURES, max_future=None)
+    assert sigs and any(len(s["future"]) > 0 for s in sigs)
+    assert all("duration_minutes" in s for s in sigs)
+    # timeout=None rests for the full market life -> >= the fills of a 5s window
+    f5 = sum(1 for s in sigs if ex.simulate_method(s, "join_bid", timeout=5)["filled"])
+    ffull = sum(1 for s in sigs if ex.simulate_method(s, "join_bid", timeout=None)["filled"])
+    assert ffull >= f5
+
+
+def test_two_sided_matched_and_adverse():
+    # both sides cross within window -> matched, neutral spread capture
+    s = _sig(future=[(1.0, 0.46), (2.0, 0.54)], half=0.03)
+    r = ex.simulate_method(s, "two_sided", timeout=5.0)
+    assert r["filled"] and r["matched"] and r["pnl"] > 0   # captured 2h spread
+    # only the bid side crosses -> one-sided (adverse) inventory, not matched
+    one = ex.simulate_method(_sig(future=[(1.0, 0.46)], half=0.03), "two_sided", timeout=5.0)
+    assert one["filled"] and not one["matched"]
+
+
+def test_metrics_report_adverse_selection(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    sigs = ex.build_signals(db, "holdout", _model(db), ph1.ALL_FEATURES, max_future=None)
+    res = ex._run_policy(sigs, "join_bid", {"timeout": 60})
+    m = ex._metrics(res)
+    for k in ("uncond_win_rate", "filled_win_rate", "adverse_selection_cost", "matched_fills"):
+        assert k in m
+
+
+def test_rest_window_sweep_structure_and_verdict(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    sw = ex.run_rest_window_sweep(db)
+    assert sw["ok"]
+    assert sw["verdict_code"] in (1, 2, 3, 4)
+    # every policy × window × universe row present, with the key per-fill metrics
+    assert len(sw["rows"]) >= len(ex.SWEEP_POLICIES) * len(ex.REST_WINDOWS)
+    r = sw["rows"][0]
+    for k in ("rest_window_s", "fills_per_day", "ev_per_fill", "ev_per_day",
+              "adverse_selection_cost", "avg_concurrent_positions", "capital_required_usd", "significant"):
+        assert k in r
+    # the per-fill-EV-vs-window curve + the headline analysis fields
+    assert sw["ev_vs_window_join_bid"] and "answers" in sw
+    assert "window_max_total_ev_day" in sw["answers"]
+    # persisted under the execution state, nothing traded
+    assert ex.execution_status(db)["sweep"]["verdict_code"] == sw["verdict_code"]
+    assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0
+
+
+def test_fills_per_day_uses_cadence(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    sigs = ex.build_signals(db, "holdout", _model(db), ph1.ALL_FEATURES, max_future=None)
+    res = [ex.simulate_method(s, "join_bid", timeout=None) for s in sigs]
+    fpd = ex._fills_per_day(sigs, res)
+    # all seeded markets are 5m (288/day); fills/day = 288 * fill_rate <= 288
+    assert 0 <= fpd <= 288

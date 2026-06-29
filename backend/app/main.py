@@ -911,6 +911,14 @@ def btc5m_execution_run(db: Session = Depends(get_db)) -> MessageOut:
                       detail=_lab_safe(execution_lab.run_execution_lab, db))
 
 
+@app.post("/api/btc5m/execution/sweep", response_model=MessageOut)
+def btc5m_execution_sweep(db: Session = Depends(get_db)) -> MessageOut:
+    """Sweep passive resting windows × policies × BTC universes, measuring how per-fill
+    EV and adverse-selection cost evolve as resting time grows. Paper/research only."""
+    return MessageOut(message="btc5m execution rest-window sweep",
+                      detail=_lab_safe(execution_lab.run_rest_window_sweep, db))
+
+
 # ===========================================================================
 # Research Platform V1 — isolated PAPER-ONLY research on top of the BTC 5M Lab.
 # Never places orders, changes production rankings/eligibility/discovery, or

@@ -93,10 +93,13 @@ def _trades_by_market(db: Session, market_ids: set[str]) -> dict:
     return out
 
 
-def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge: float = 0.01) -> list[dict]:
+def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge: float = 0.01,
+                  max_future: float | None = None) -> list[dict]:
     """One signal per decision point where the model takes a directional view. Carries
     the market mid/half-spread, the chosen side, the outcome, and the subsequent trade
-    stream (delay seconds, yes-price) used to decide passive fills."""
+    stream (delay seconds, yes-price) used to decide passive fills. `max_future` caps
+    the captured trade horizon (seconds; None = the rest of the market's life — needed
+    to simulate long resting windows up to full market life)."""
     rows = db.scalars(select(lm.Btc5mLabPoint).where(lm.Btc5mLabPoint.split == split)).all()
     rows = [r for r in rows if r.pm_yes is not None and r.label_up is not None]
     if not rows:
@@ -114,15 +117,18 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
         f = r.features or {}
         half = (r.spread or 0.0) / 2 or DEFAULT_SPREAD / 2
         t = r.t_offset_s or 0
+        life_left = r.secs_to_expiry or 0
+        horizon = life_left if max_future is None else min(max_future, life_left)
         future = []
         for tr in trades_by.get(r.market_id, []):
             d = (tr.seconds_from_creation or 0) - t
-            if 0 < d <= 5:
+            if 0 < d <= horizon:
                 future.append((d, _yes_price(tr)))
         signals.append({
             "market_id": r.market_id, "t": t, "mid": m, "half": half, "side": side,
             "model_prob": p, "edge": abs(edge), "up": bool(r.label_up),
-            "regime": r.regime or "?", "secs_to_expiry": r.secs_to_expiry or 0,
+            "regime": r.regime or "?", "secs_to_expiry": life_left,
+            "duration_minutes": r.duration_minutes or 5,
             "btc_vol": _num(f.get("btc_vol")), "volume_usd": _num(f.get("volume_usd")),
             "flow_imbalance": _num(f.get("flow_imbalance")), "btc_ret_sofar": _num(f.get("btc_ret_sofar")),
             "future": future,
@@ -166,20 +172,51 @@ def _pnl(side: str, entry: float, up: bool) -> float:
     return (1.0 - entry) if win else -entry
 
 
-def simulate_method(sig: dict, method: str, *, timeout: float = 2.0, ev_threshold: float = 0.0):
-    """Simulate one execution style on one signal. Returns dict with filled / entry /
-    pnl / delay / taker_pnl / spread_captured, or filled=False (missed)."""
-    side, up, m = sig["side"], sig["up"], sig["mid"]
+def _eff_timeout(sig: dict, timeout: float | None) -> float:
+    """Resting window in seconds; None ⇒ the full remaining market life."""
+    return float(sig["secs_to_expiry"]) if timeout is None else float(timeout)
+
+
+def simulate_method(sig: dict, method: str, *, timeout: float | None = 2.0, ev_threshold: float = 0.0):
+    """Simulate one execution style on one signal. `timeout=None` rests for the full
+    market life. Returns a result dict (filled / entry / pnl / delay / spread_captured /
+    win / matched), or filled=False (missed)."""
+    side, up, m, h = sig["side"], sig["up"], sig["mid"], sig["half"]
+    to = _eff_timeout(sig, timeout)
     taker_entry = _taker_entry(sig)
     taker_pnl = _pnl(side, taker_entry, up)
-    out = {"side": side, "taker_pnl": taker_pnl, "taker_entry": taker_entry,
+    out = {"side": side, "up": up, "taker_pnl": taker_pnl, "taker_entry": taker_entry,
            "regime": sig["regime"], "btc_vol": sig["btc_vol"], "volume_usd": sig["volume_usd"],
-           "secs_to_expiry": sig["secs_to_expiry"], "mid": m, "filled": False,
-           "entry": None, "pnl": 0.0, "delay": None, "spread_captured": 0.0}
+           "secs_to_expiry": sig["secs_to_expiry"], "duration_minutes": sig.get("duration_minutes", 5),
+           "mid": m, "filled": False, "entry": None, "pnl": 0.0, "delay": None,
+           "spread_captured": 0.0, "win": None, "matched": False}
 
     if method == "market":
         out.update(filled=True, entry=taker_entry, pnl=taker_pnl, delay=0.0,
-                   spread_captured=round(m - taker_entry, 4))   # negative (paid spread)
+                   win=taker_pnl > 0, spread_captured=round(m - taker_entry, 4))
+        return out
+
+    # two-sided market making: rest BOTH a YES bid (m-h) and a YES ask (m+h), ignore the
+    # model side. If BOTH cross within the window -> matched, pure spread capture (2h),
+    # direction-neutral. If only one crosses -> hold that (adversely selected) inventory
+    # to resolution. If neither -> no fill.
+    if method == "two_sided":
+        ybid = _clip(m - h, 0.01, 0.99)
+        yask = _clip(m + h, 0.01, 0.99)
+        d_bid = _first_cross(sig, ybid, up_cross=False, timeout=to)   # someone sells to our bid
+        d_ask = _first_cross(sig, yask, up_cross=True, timeout=to)    # someone buys our ask
+        if d_bid is not None and d_ask is not None:
+            out.update(filled=True, matched=True, entry=round((ybid + yask) / 2, 4),
+                       pnl=round(yask - ybid, 4), win=True, delay=max(d_bid, d_ask),
+                       spread_captured=round(yask - ybid, 4))      # captured full spread, neutral
+        elif d_bid is not None:                                    # left holding YES bought at bid
+            pnl = _pnl("YES", ybid, up)
+            out.update(filled=True, side="YES", entry=ybid, pnl=pnl, win=pnl > 0,
+                       delay=d_bid, spread_captured=round(m - ybid, 4))
+        elif d_ask is not None:                                    # left holding NO (sold YES at ask)
+            pnl = _pnl("NO", _clip(1 - yask, 0.01, 0.99), up)
+            out.update(filled=True, side="NO", entry=_clip(1 - yask, 0.01, 0.99), pnl=pnl,
+                       win=pnl > 0, delay=d_ask, spread_captured=round(yask - m, 4))
         return out
 
     improve = 1 if method == "improve_bid" else 0
@@ -193,12 +230,12 @@ def simulate_method(sig: dict, method: str, *, timeout: float = 2.0, ev_threshol
             return out                                          # no post → no fill (skipped)
 
     # adaptive passive: cap resting time to 1s (cancel stale quotes → less adverse fill)
-    eff_timeout = min(timeout, 1.0) if method == "adaptive" else timeout
-    delay = _first_cross(sig, target, up_cross=up_cross, timeout=eff_timeout)
+    eff = min(to, 1.0) if method == "adaptive" else to
+    delay = _first_cross(sig, target, up_cross=up_cross, timeout=eff)
     if delay is None:
         return out                                              # missed fill
     pnl = _pnl(side, entry, up)
-    out.update(filled=True, entry=entry, pnl=pnl, delay=delay,
+    out.update(filled=True, entry=entry, pnl=pnl, delay=delay, win=pnl > 0,
                spread_captured=round(m - entry if side == "YES" else (1 - m) - entry, 4))
     return out
 
@@ -223,12 +260,23 @@ def _metrics(results: list[dict]) -> dict:
         cum += r["pnl"]; peak = max(peak, cum); mdd = max(mdd, peak - cum)
     gross_win = sum(p for p in pnls if p > 0)
     gross_loss = -sum(p for p in pnls if p < 0)
+    # ADVERSE SELECTION: do the FILLED (price-came-to-you) trades win less than the
+    # unconditional base rate for that side? Δwin-rate ≈ per-trade EV cost (payoff swing
+    # win→loss ≈ 1.0). Matched two-sided fills are direction-neutral → excluded.
+    def would_win(r):
+        return (r["up"] if r["side"] == "YES" else (not r["up"]))
+    uncond = _mean([1 if would_win(r) else 0 for r in results]) if results else 0.0
+    dir_fills = [r for r in filled if not r.get("matched")]
+    filled_win = _mean([1 if r["win"] else 0 for r in dir_fills]) if dir_fills else 0.0
+    adverse = round(uncond - filled_win, 4) if dir_fills else 0.0
     return {
         "signals": n, "fills": nf, "fill_rate": round(nf / n, 4) if n else 0.0,
-        "missed_fills": n - nf,
+        "missed_fills": n - nf, "matched_fills": sum(1 for r in filled if r.get("matched")),
         "avg_fill_delay_s": round(_mean([r["delay"] for r in filled if r["delay"] is not None]), 3),
         "avg_fill_price": round(_mean(costs), 4) if costs else None,
         "avg_spread_captured": round(_mean([r["spread_captured"] for r in filled]), 4) if filled else 0.0,
+        "uncond_win_rate": round(uncond, 4), "filled_win_rate": round(filled_win, 4),
+        "adverse_selection_cost": adverse,
         "win_rate": round(_mean([1 if p > 0 else 0 for p in pnls]), 4) if pnls else 0.0,
         "ev_after_cost": sig["ev_after_cost"], "roi": sig["roi"], "t_stat": sig["t_stat"],
         "ci": [sig["ci_low"], sig["ci_high"]], "sharpe": sig["sharpe"], "significant": sig["significant"],
@@ -542,4 +590,163 @@ def execution_status(db: Session) -> dict:
     st = _state(db)
     return {"execution": st.execution,
             "execution_built_at": st.execution_built_at.isoformat() if st.execution_built_at else None,
+            "sweep": (st.execution or {}).get("sweep") if isinstance(st.execution, dict) else None,
             "safety": _safety()}
+
+
+# ---------------------------------------------------------------------------
+# REST-WINDOW SWEEP — does per-fill EV survive as resting time (and fills) grow,
+# or does informed BTC-led flow pick off longer-rested quotes?
+# ---------------------------------------------------------------------------
+MARKETS_PER_DAY = {5: 288, 15: 96, 60: 24}        # structural BTC up/down cadence
+REST_WINDOWS: list = [5, 15, 30, 60, 120, None]   # seconds; None = full market life
+SWEEP_POLICIES = ("join_bid", "improve_bid", "fair_value_maker", "adaptive", "two_sided")
+UNIVERSES = {"5m": [5], "5m+15m": [5, 15]}        # hourly not indexed in the dataset
+STAKE_USD = 10.0
+
+
+def _fills_per_day(sigs: list[dict], results: list[dict]) -> float:
+    """Operational fills/day = Σ_duration (markets/day · fill_rate_for_that_duration)."""
+    by_dur: dict = {}
+    for s, r in zip(sigs, results):
+        by_dur.setdefault(s["duration_minutes"], [0, 0])
+        by_dur[s["duration_minutes"]][0] += 1
+        by_dur[s["duration_minutes"]][1] += 1 if r["filled"] else 0
+    fpd = 0.0
+    for dur, (n, f) in by_dur.items():
+        fpd += MARKETS_PER_DAY.get(dur, 0) * (f / n if n else 0.0)
+    return round(fpd, 1)
+
+
+def _sweep_row(uname: str, policy: str, win, sigs: list[dict]) -> dict:
+    results = [simulate_method(s, policy, timeout=win) for s in sigs]
+    m = _metrics(results)
+    fpd = _fills_per_day(sigs, results)
+    ev = m["ev_after_cost"]
+    # avg hold ≈ half the remaining life of FILLED markets; concurrency + capital
+    hold = _mean([r["secs_to_expiry"] * 0.5 for r in results if r["filled"]]) or 0.0
+    concurrent = round(fpd * hold / 86400.0, 3)
+    return {
+        "universe": uname, "policy": policy,
+        "rest_window_s": ("full_life" if win is None else win),
+        "signals": m["signals"], "fills": m["fills"], "matched_fills": m["matched_fills"],
+        "fill_rate": m["fill_rate"], "fills_per_hour": round(fpd / 24, 2), "fills_per_day": fpd,
+        "avg_fill_delay_s": m["avg_fill_delay_s"], "avg_fill_price": m["avg_fill_price"],
+        "spread_captured": m["avg_spread_captured"], "adverse_selection_cost": m["adverse_selection_cost"],
+        "uncond_win_rate": m["uncond_win_rate"], "filled_win_rate": m["filled_win_rate"],
+        "ev_per_fill": ev, "ev_per_day": round(fpd * ev, 4), "roi": m["roi"],
+        "profit_factor": m["profit_factor"], "max_drawdown": m["max_drawdown"],
+        "t_stat": m["t_stat"], "ci": m["ci"], "sharpe": m["sharpe"], "significant": m["significant"],
+        "avg_concurrent_positions": concurrent, "capital_required_usd": round(concurrent * STAKE_USD, 2),
+    }
+
+
+def run_rest_window_sweep(db: Session) -> dict:
+    """Sweep resting windows × policies × universes, measuring how per-fill EV and
+    adverse-selection cost evolve as resting time (and fill count) grow. Replaces the
+    remaining assumption in the viability report with measured numbers. Paper/research
+    only — nothing is promoted or traded."""
+    spec = next(iter(_models_to_test(db)), None)
+    if spec is None:
+        return {"ok": False, "error": "no model / dataset too small"}
+    # full-market-life trade horizon, all splits (maximise the fill sample)
+    sigs_all = []
+    for s in ("train", "val", "holdout"):
+        sigs_all += build_signals(db, s, spec["model"], spec["feats"], max_future=None)
+    if len(sigs_all) < MIN_TRADES:
+        return {"ok": False, "error": "too few signals", "n": len(sigs_all)}
+    durations = sorted({s["duration_minutes"] for s in sigs_all})
+    rows = []
+    for uname, durs in UNIVERSES.items():
+        usigs = [s for s in sigs_all if s["duration_minutes"] in durs]
+        if len(usigs) < MIN_TRADES:
+            continue
+        for policy in SWEEP_POLICIES:
+            for win in REST_WINDOWS:
+                rows.append(_sweep_row(uname, policy, win, usigs))
+    analysis = _sweep_analysis(rows)
+    sweep = {"ok": True, "generated_at": datetime.utcnow().isoformat(),
+             "universes": list(UNIVERSES.keys()), "durations_present": durations,
+             "rest_windows": ["full_life" if w is None else w for w in REST_WINDOWS],
+             "policies": list(SWEEP_POLICIES), "markets_per_day": MARKETS_PER_DAY,
+             "n_signals": len(sigs_all), "rows": rows, **analysis,
+             "approximations": [
+                 "fills decided from the historical 1s trade stream over the full resting window",
+                 "adverse_selection_cost = unconditional_win_rate − filled_win_rate (≈ EV/fill cost; payoff swing ≈ 1)",
+                 "two_sided = rest YES bid + YES ask; both cross ⇒ matched (neutral spread), one ⇒ adverse inventory",
+                 "hourly BTC markets are not indexed ⇒ universe limited to 5m and 5m+15m",
+                 "fills/day extrapolated via structural cadence (5m 288/day, 15m 96/day), one quote per market",
+             ],
+             "safety": _safety()}
+    # attach onto the stored execution report (don't overwrite the headline run)
+    st = _state(db)
+    base = st.execution if isinstance(st.execution, dict) else {}
+    base = dict(base) if base else {}
+    base["sweep"] = sweep
+    st.execution = base
+    st.execution_built_at = datetime.utcnow()
+    db.commit()
+    return sweep
+
+
+def _sweep_analysis(rows: list[dict]) -> dict:
+    """Distil the sweep: per-fill-EV-vs-window curve, the windows that maximise total
+    and risk-adjusted EV/day, where adverse selection starts to dominate, whether any
+    config is significantly +EV, and the 1-of-4 verdict."""
+    def curve(policy, universe):
+        seq = [r for r in rows if r["policy"] == policy and r["universe"] == universe]
+        seq.sort(key=lambda r: (999999 if r["rest_window_s"] == "full_life" else r["rest_window_s"]))
+        return [{"rest": r["rest_window_s"], "fill_rate": r["fill_rate"], "fills_per_day": r["fills_per_day"],
+                 "ev_per_fill": r["ev_per_fill"], "ev_per_day": r["ev_per_day"],
+                 "adverse_selection_cost": r["adverse_selection_cost"], "spread_captured": r["spread_captured"],
+                 "significant": r["significant"], "t_stat": r["t_stat"]} for r in seq]
+    universe = "5m+15m" if any(r["universe"] == "5m+15m" for r in rows) else "5m"
+    sig_pos = [r for r in rows if r["significant"] and r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES]
+    # window where adverse selection first exceeds captured spread (per-fill EV turns net-negative
+    # from the maker side) for the directional join_bid policy
+    jb = curve("join_bid", universe)
+    adverse_dominates = next((c["rest"] for c in jb if c["adverse_selection_cost"] > 0
+                              and c["ev_per_fill"] <= 0), None)
+    best_total = max(rows, key=lambda r: r["ev_per_day"]) if rows else None
+    # risk-adjusted: highest ev/day among configs with a usable sample + positive PF
+    radj_pool = [r for r in rows if r["fills"] >= MIN_TRADES and r["ev_per_fill"] > 0]
+    best_radj = max(radj_pool, key=lambda r: r["sharpe"] * (r["ev_per_day"] if r["ev_per_day"] > 0 else 0),
+                    default=None)
+    two_sided = curve("two_sided", universe)
+
+    # verdict (1 viable at scale / 2 viable specific windows / 3 +EV but not significant /
+    # 4 adverse selection destroys longer-rest fills)
+    pos_ev_any = any(r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES for r in rows)
+    longrest_neg = any(r["ev_per_fill"] <= 0 for r in rows
+                       if r["rest_window_s"] in ("full_life", 120) and r["policy"] in ("join_bid", "two_sided")
+                       and r["fills"] >= MIN_TRADES)
+    n_sig = len(sig_pos)
+    if n_sig >= 4:
+        code, verdict = 1, "passive market making is viable at scale"
+    elif n_sig >= 1:
+        code, verdict = 2, "passive market making is viable only in specific windows/regimes"
+    elif pos_ev_any:
+        code, verdict = 3, "positive per-fill EV but not enough sample / significance yet"
+    else:
+        code, verdict = 4, "adverse selection destroys longer-rest fills — passive making fails"
+
+    best = best_total or {}
+    headline = (f"best total EV/day: {best.get('policy')} @ {best.get('rest_window_s')}s on {best.get('universe')} "
+                f"= {best.get('ev_per_day')}/day ({best.get('fills_per_day')} fills/day, EV/fill {best.get('ev_per_fill')}, "
+                f"adverse {best.get('adverse_selection_cost')}, sig={best.get('significant')})")
+    return {
+        "verdict_code": code, "verdict": verdict, "headline": headline,
+        "ev_vs_window_join_bid": jb, "ev_vs_window_two_sided": two_sided,
+        "best_total_ev_day": best_total, "best_risk_adjusted": best_radj,
+        "adverse_dominates_at_s": adverse_dominates,
+        "significant_positive_configs": sig_pos,
+        "answers": {
+            "60s_remains_profitable_per_fill": next(
+                (c["ev_per_fill"] > 0 for c in jb if c["rest"] == 60), None),
+            "fill_rate_offsets_adverse": (best_total or {}).get("ev_per_day", 0) > 0,
+            "window_max_total_ev_day": best.get("rest_window_s"),
+            "window_max_risk_adjusted": (best_radj or {}).get("rest_window_s"),
+            "adverse_dominates_at_s": adverse_dominates,
+            "any_model_significant_positive": n_sig > 0,
+        },
+    }
