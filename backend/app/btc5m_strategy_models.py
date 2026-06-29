@@ -98,4 +98,41 @@ class Btc5mLabState(Base):
     strategies_accepted: Mapped[int] = mapped_column(Integer, default=0)
     last_search_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Quant research platform (fair-value / ensemble / feature-discovery / nightly)
+    research: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    research_built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class Btc5mResearchModel(Base):
+    """A trained fair-value / perspective / ensemble probability model with
+    calibration + EV-after-cost metrics. Research/paper only — estimates P(YES),
+    never trades. The platform promotes ONLY models whose post-cost expected value
+    is statistically significant out-of-sample."""
+    __tablename__ = "btc5m_research_models"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    name: Mapped[str] = mapped_column(String(60), index=True)          # fair_value | ensemble | perspective:<group>
+    kind: Mapped[str] = mapped_column(String(24), default="fair_value")
+    algo: Mapped[str | None] = mapped_column(String(40), nullable=True)  # logistic_regression | random_forest | ...
+    perspective: Mapped[str | None] = mapped_column(String(40), nullable=True)  # price_action | order_flow | ...
+
+    # calibration (lower brier = better; ece = expected calibration error)
+    brier: Mapped[float] = mapped_column(Float, default=0.25)
+    calibration_score: Mapped[float] = mapped_column(Float, default=0.0)
+    ece: Mapped[float] = mapped_column(Float, default=0.0)
+    auc: Mapped[float] = mapped_column(Float, default=0.5)
+    weight: Mapped[float] = mapped_column(Float, default=0.0)          # ensemble weight (inverse-Brier)
+
+    # EV after realistic costs (the promotion gate)
+    n_trades: Mapped[int] = mapped_column(Integer, default=0)
+    ev_after_cost: Mapped[float] = mapped_column(Float, default=0.0)   # mean per-trade PnL on holdout
+    ev_t_stat: Mapped[float] = mapped_column(Float, default=0.0)
+    ev_ci_low: Mapped[float] = mapped_column(Float, default=0.0)
+    ev_ci_high: Mapped[float] = mapped_column(Float, default=0.0)
+    roi: Mapped[float] = mapped_column(Float, default=0.0)
+    significant: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    promoted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)          # reliability curve, per-split, top features

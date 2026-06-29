@@ -12,6 +12,7 @@ from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_tes
 # aliased: the btc5m research module already defines an endpoint function named
 # `btc5m_strategy_lab` (for /api/btc5m/strategy-lab), which would shadow the module.
 from . import btc5m_strategy_lab as strat_lab  # noqa: E402
+from . import btc5m_alpha_research as research_lab  # noqa: E402
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -106,6 +107,11 @@ def _startup() -> None:
     # armed; paper-only unless an explicit live-place opt-in is set). Never starts
     # real trading by itself and never touches the production workers above.
     btc5m_micro_test_worker.start()
+    # Start the nightly BTC 5M alpha-research worker (separate daemon; inert unless
+    # BTC5M_RESEARCH_ENABLED; research/paper ONLY — retrains fair-value models +
+    # writes a research report; no live-trading path exists in it).
+    from . import btc5m_research_worker
+    btc5m_research_worker.start()
 
 
 @app.get("/api/health")
@@ -808,6 +814,44 @@ def btc5m_lab_analyses(db: Session = Depends(get_db)) -> MessageOut:
 @app.get("/api/btc5m/lab/report", response_model=MessageOut)
 def btc5m_lab_report(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m lab report", detail=strat_lab.build_report(db))
+
+
+# --- BTC 5M Alpha Research Platform (fair-value / ensemble / nightly) --------
+# Quant research layer on top of the Strategy Lab dataset: estimates the true
+# P(YES), measures EV-after-cost significance, and promotes only validated
+# signals. 100% research/paper — never trades or touches live execution.
+@app.get("/api/btc5m/research/status", response_model=MessageOut)
+def btc5m_research_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m alpha research status",
+                      detail=_lab_safe(research_lab.research_status, db))
+
+
+@app.post("/api/btc5m/research/run", response_model=MessageOut)
+def btc5m_research_run(build: bool = False, limit_markets: int = 60,
+                       db: Session = Depends(get_db)) -> MessageOut:
+    """Run the research pipeline: fair-value + ensemble + feature discovery +
+    microstructure + cross-market + evolution + decay, then report. `build=true`
+    rebuilds the dataset first (slower). Paper/research only."""
+    return MessageOut(message="btc5m alpha research run",
+                      detail=_lab_safe(lambda d: research_lab.run_pipeline(d, build=build, limit_markets=limit_markets), db))
+
+
+@app.get("/api/btc5m/research/models", response_model=MessageOut)
+def btc5m_research_models(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m research model leaderboard",
+                      detail=_lab_safe(research_lab.model_leaderboard, db))
+
+
+@app.get("/api/btc5m/research/report", response_model=MessageOut)
+def btc5m_research_report(db: Session = Depends(get_db)) -> MessageOut:
+    st = _lab_safe(research_lab.research_status, db)
+    return MessageOut(message="btc5m research report", detail=(st or {}).get("research") if isinstance(st, dict) else st)
+
+
+@app.get("/api/btc5m/research/worker", response_model=MessageOut)
+def btc5m_research_worker_status() -> MessageOut:
+    from . import btc5m_research_worker
+    return MessageOut(message="btc5m research worker", detail=btc5m_research_worker.status())
 
 
 # ===========================================================================

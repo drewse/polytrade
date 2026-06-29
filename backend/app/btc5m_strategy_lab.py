@@ -290,6 +290,36 @@ def pm_flow_features(trades: list, t: int, btc_ret_sofar: float) -> dict:
     }
 
 
+def wallet_features(trades: list, t: int, profitable: set[str]) -> dict:
+    """Wallet-behavior as a FEATURE, not a copy target. Net directional flow of
+    *profitable* wallets up to t — i.e. what experienced traders chose under this
+    market state. The model learns from this label; it never blindly copies it."""
+    before = [tr for tr in trades if (tr.seconds_from_creation or 0) <= t and tr.side == "buy"]
+    pw = [tr for tr in before if (tr.wallet_address or "").lower() in profitable]
+    if not pw:
+        return {"wallet_signal": 0.0, "wallet_recent_signal": 0.0,
+                "wallet_trade_count": 0, "wallet_present": 0}
+    yes = sum(tr.usd_value for tr in pw if tr.direction == "YES")
+    no = sum(tr.usd_value for tr in pw if tr.direction == "NO")
+    tot = yes + no
+    rec = [tr for tr in pw if (tr.seconds_from_creation or 0) >= t - 30]
+    ry = sum(tr.usd_value for tr in rec if tr.direction == "YES")
+    rn = sum(tr.usd_value for tr in rec if tr.direction == "NO")
+    rtot = ry + rn
+    return {
+        "wallet_signal": round((yes - no) / tot, 4) if tot else 0.0,
+        "wallet_recent_signal": round((ry - rn) / rtot, 4) if rtot else 0.0,
+        "wallet_trade_count": len(pw),
+        "wallet_present": 1 if pw else 0,
+    }
+
+
+def _profitable_wallets(db: Session) -> set[str]:
+    rows = db.scalars(select(bm.Btc5mWalletProfile.wallet_address)
+                      .where(bm.Btc5mWalletProfile.profitable.is_(True))).all()
+    return {(a or "").lower() for a in rows}
+
+
 def _regime(f: dict) -> str:
     vol, mom = abs(f.get("btc_vol", 0.0)), abs(f.get("btc_momentum", 0.0))
     if mom > 0.5 and vol > 0.0005:
@@ -372,6 +402,7 @@ def build_dataset(db: Session, *, limit_markets: int = 40, fetch_fn=None,
     n_markets = n_points = 0
     source = None
     err = None
+    profitable = _profitable_wallets(db)
     if fetch_fn is None:
         _dead_sources.clear()
     attempts = 0
@@ -412,7 +443,8 @@ def build_dataset(db: Session, *, limit_markets: int = 40, fetch_fn=None,
             if not bf:
                 continue
             pf = pm_flow_features(trades, t, bf["btc_ret_sofar"])
-            feats = {**bf, **pf, "t_offset_s": t, "secs_to_expiry": life - t,
+            wf = wallet_features(trades, t, profitable)
+            feats = {**bf, **pf, **wf, "t_offset_s": t, "secs_to_expiry": life - t,
                      "hour": (start.hour if start else 0), "duration_minutes": dur, "btc_source": src}
             db.add(lm.Btc5mLabPoint(
                 market_id=mk.market_id, duration_minutes=dur, t_offset_s=t, secs_to_expiry=life - t,
