@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import func, select
@@ -52,16 +53,82 @@ def _truthy(v) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+class OnchainRpcError(RuntimeError):
+    """A JSON-RPC failure that names the failing method + endpoint scheme + the
+    response body + a remediation hint (so the dashboard shows something useful
+    instead of a bare '400 Bad Request')."""
+
+    def __init__(self, *, method: str, scheme: str | None = None, host: str | None = None,
+                 status: int | None = None, body: str | None = None, hint: str | None = None):
+        self.method, self.scheme, self.host = method, scheme, host
+        self.status, self.body, self.hint = status, body, hint
+        msg = f"{method} failed"
+        if status is not None:
+            msg += f": HTTP {status}"
+        if scheme or host:
+            msg += f" via {scheme or '?'}://{host or '?'}"
+        if hint:
+            msg += f" — {hint}"
+        if body:
+            msg += f" | response: {str(body)[:160]}"
+        super().__init__(msg)
+
+
+def _ws_to_http(url: str) -> str:
+    """Best-effort wss/ws -> https/http for JSON-RPC polling. Handles the common
+    providers whose HTTP path differs from their WS path (e.g. Infura's '/ws')."""
+    p = urlparse(url)
+    scheme = "https" if p.scheme == "wss" else "http"
+    netloc, path = p.netloc, p.path
+    if "infura.io" in netloc and path.startswith("/ws/"):
+        path = path[3:]                                   # '/ws/v3/KEY' -> '/v3/KEY'
+    rebuilt = f"{scheme}://{netloc}{path}"
+    return rebuilt + (f"?{p.query}" if p.query else "")
+
+
+def _resolve_http_rpc(https_url: str, ws_url: str) -> dict:
+    """Pick the HTTP(S) JSON-RPC endpoint used for eth_getLogs polling.
+    Prefers POLYGON_RPC_URL; falls back to converting POLYGON_WS_RPC_URL."""
+    https_url, ws_url = (https_url or "").strip(), (ws_url or "").strip()
+    if https_url:
+        if https_url.startswith(("http://", "https://")):
+            return {"url": https_url, "scheme": urlparse(https_url).scheme,
+                    "source": "POLYGON_RPC_URL", "converted": False, "error": None, "note": None}
+        return {"url": None, "scheme": urlparse(https_url).scheme or "?", "source": "POLYGON_RPC_URL",
+                "converted": False, "note": None,
+                "error": "POLYGON_RPC_URL must be an HTTPS JSON-RPC endpoint (eth_getLogs polling needs "
+                         "https://…, not wss://). Set POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/<key>."}
+    if ws_url:
+        if ws_url.startswith(("http://", "https://")):
+            return {"url": ws_url, "scheme": urlparse(ws_url).scheme, "source": "POLYGON_WS_RPC_URL",
+                    "converted": False, "error": None, "note": None}
+        if ws_url.startswith(("wss://", "ws://")):
+            return {"url": _ws_to_http(ws_url), "scheme": "https" if ws_url.startswith("wss://") else "http",
+                    "source": "POLYGON_WS_RPC_URL", "converted": True, "error": None,
+                    "note": "converted wss://→https:// for eth_getLogs polling — set POLYGON_RPC_URL "
+                            "to the provider's HTTPS endpoint to be explicit"}
+        return {"url": None, "scheme": "?", "source": "POLYGON_WS_RPC_URL", "converted": False, "note": None,
+                "error": "POLYGON_WS_RPC_URL has an unrecognized scheme — set POLYGON_RPC_URL=https://… for polling."}
+    return {"url": None, "scheme": None, "source": None, "converted": False, "note": None,
+            "error": "no Polygon RPC configured — set POLYGON_RPC_URL=https://… (HTTPS JSON-RPC) for eth_getLogs polling."}
+
+
 def _cfg() -> dict:
     mt = umt._cfg()
     watched = {mt["primary_wallet"], *mt["backup_wallets"]}
     watched = {w.lower() for w in watched if w}
     ex = os.getenv("BTC5M_ONCHAIN_EXCHANGES", "")
     exchanges = [a.strip().lower() for a in ex.replace(";", ",").split(",") if a.strip()] or DEFAULT_EXCHANGES
+    rpc = _resolve_http_rpc(os.getenv("POLYGON_RPC_URL", ""), os.getenv("POLYGON_WS_RPC_URL", ""))
     return {
         "enabled": _truthy(os.getenv("BTC5M_ONCHAIN_ENABLED", "false")),
         "paper_only": _truthy(os.getenv("BTC5M_ONCHAIN_PAPER_ONLY", "true")),
-        "rpc_url": (os.getenv("POLYGON_WS_RPC_URL", "") or "").strip(),
+        # raw configured URL (either var) — used only for 'is it configured' checks
+        "rpc_url": (os.getenv("POLYGON_RPC_URL", "") or os.getenv("POLYGON_WS_RPC_URL", "") or "").strip(),
+        "http_rpc_url": rpc["url"],                        # the actual endpoint we POST to
+        "rpc_scheme": rpc["scheme"], "rpc_source": rpc["source"], "rpc_converted": rpc["converted"],
+        "rpc_config_error": rpc["error"], "rpc_note": rpc["note"],
+        "ws_rpc_url": (os.getenv("POLYGON_WS_RPC_URL", "") or "").strip(),   # future ws subscribe
         "exchanges": exchanges,
         "confirmations": int(os.getenv("BTC5M_ONCHAIN_CONFIRMATIONS", "0")),
         "poll_gamma_seconds": int(os.getenv("BTC5M_ONCHAIN_POLL_GAMMA_SECONDS", "30")),
@@ -227,20 +294,34 @@ def fetch_token_map(fetch_fn=None) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # JSON-RPC transport (eth_getLogs poller; injectable for tests)
 # ---------------------------------------------------------------------------
-def _http_rpc_url(rpc_url: str) -> str:
-    return rpc_url.replace("wss://", "https://").replace("ws://", "http://")
-
-
 def _rpc(cfg: dict, method: str, params: list):
-    url = _http_rpc_url(cfg["rpc_url"])
+    url = cfg.get("http_rpc_url")
     if not url:
-        raise RuntimeError("POLYGON_WS_RPC_URL not set")
-    with httpx.Client(timeout=config.http_timeout_seconds) as c:
-        r = c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-        r.raise_for_status()
-        d = r.json()
+        raise OnchainRpcError(method=method, scheme=cfg.get("rpc_scheme"),
+                              hint=cfg.get("rpc_config_error") or "POLYGON_RPC_URL not set")
+    p = urlparse(url)
+    scheme, host = p.scheme, p.netloc
+    try:
+        with httpx.Client(timeout=config.http_timeout_seconds) as c:
+            r = c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    except httpx.HTTPError as exc:
+        raise OnchainRpcError(method=method, scheme=scheme, host=host,
+                              hint="network error contacting the RPC endpoint", body=str(exc))
+    if r.status_code != 200:
+        if scheme != "https":
+            hint = ("eth_getLogs polling needs an HTTPS JSON-RPC endpoint — set "
+                    "POLYGON_RPC_URL=https://… (wss:// is only for future websocket subscriptions)")
+        elif r.status_code in (400, 401, 403):
+            hint = ("RPC rejected the request — verify the API key / HTTPS endpoint. If you only set "
+                    "POLYGON_WS_RPC_URL (wss://), set POLYGON_RPC_URL to the provider's matching https:// URL")
+        else:
+            hint = "RPC endpoint returned a non-200 status"
+        raise OnchainRpcError(method=method, scheme=scheme, host=host, status=r.status_code,
+                              body=(r.text or "")[:200], hint=hint)
+    d = r.json()
     if d.get("error"):
-        raise RuntimeError(str(d["error"]))
+        raise OnchainRpcError(method=method, scheme=scheme, host=host, status=200,
+                              body=str(d["error"])[:200], hint="RPC returned a JSON-RPC error")
     return d.get("result")
 
 
@@ -455,6 +536,12 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
     if not cfg["watched"]:
         return {"ran": False, "reason": "no watched wallets configured"}
     st = get_state(db)
+    if cfg.get("rpc_config_error"):                       # bad/misconfigured RPC URL -> clear error
+        st.rpc_connected = False
+        st.error_count = (st.error_count or 0) + 1
+        st.last_error = cfg["rpc_config_error"]
+        db.commit()
+        return {"ran": False, "reason": cfg["rpc_config_error"]}
     try:
         # token-map refresh (with read-only status)
         try:
@@ -607,7 +694,9 @@ def start(db: Session) -> dict:
     if not cfg["enabled"]:
         return {"ok": False, "error": "BTC5M_ONCHAIN_ENABLED is false"}
     if not cfg["rpc_url"]:
-        return {"ok": False, "error": "POLYGON_WS_RPC_URL not set"}
+        return {"ok": False, "error": "no Polygon RPC configured — set POLYGON_RPC_URL=https://… (HTTPS JSON-RPC)"}
+    if cfg.get("rpc_config_error"):
+        return {"ok": False, "error": cfg["rpc_config_error"]}
     if not cfg["watched"]:
         return {"ok": False, "error": "no watched wallets (set BTC5M_MICRO_TEST_PRIMARY_WALLET)"}
     st = get_state(db)
@@ -658,17 +747,31 @@ def _diagnostics(st: om.Btc5mOnchainState, cfg: dict) -> dict:
             "refreshed_at": st.token_map_refreshed_at.isoformat() if st.token_map_refreshed_at else None,
             "error": st.token_map_error,
         },
+        "rpc": {
+            "scheme": cfg.get("rpc_scheme"),
+            "source": cfg.get("rpc_source"),                       # POLYGON_RPC_URL | POLYGON_WS_RPC_URL
+            "host": (urlparse(cfg["http_rpc_url"]).netloc if cfg.get("http_rpc_url") else None),
+            "converted_from_wss": bool(cfg.get("rpc_converted")),
+            "requires": "https (eth_getLogs polling)",
+            "config_error": cfg.get("rpc_config_error"),
+            "note": cfg.get("rpc_note"),
+        },
     }
 
 
 def _diagnosis(st: om.Btc5mOnchainState, cfg: dict, actionable: int) -> dict:
     """Explain what 0 signals means, per the 4 scenarios. Read-only."""
     if not cfg.get("rpc_url"):
-        return {"code": "rpc_not_configured", "message": "POLYGON_WS_RPC_URL is not set"}
-    if not (st.blocks_scanned or 0):
-        return {"code": "not_started", "message": "detector has not scanned any blocks yet — start it / run once"}
+        return {"code": "rpc_not_configured",
+                "message": "no Polygon RPC configured — set POLYGON_RPC_URL=https://… (HTTPS JSON-RPC)"}
+    if cfg.get("rpc_config_error"):
+        return {"code": "rpc_config_issue", "message": cfg["rpc_config_error"]}
+    # an RPC/log error must surface BEFORE "not_started" — a failing scan that
+    # never advanced is an RPC issue, not an un-started detector.
     if (st.error_count or 0) and not st.rpc_connected:
         return {"code": "rpc_log_issue", "message": f"RPC/log error: {st.last_error}"}
+    if not (st.blocks_scanned or 0):
+        return {"code": "not_started", "message": "detector has not scanned any blocks yet — start it / run once"}
     if not (st.logs_scanned or 0):
         return {"code": "rpc_log_issue",
                 "message": ("no OrderFilled events seen on the configured exchanges across "

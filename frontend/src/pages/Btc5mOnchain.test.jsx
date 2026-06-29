@@ -11,7 +11,10 @@ const diagnostics = (over = {}) => ({
   last_watched_event_at: new Date(Date.now() - 8000).toISOString(),
   last_btc_market_event: 'Bitcoin Up or Down 5m buy @ 0.5',
   last_btc_market_event_at: new Date(Date.now() - 9000).toISOString(),
-  last_error: null, token_map: { size: 8, refreshed_at: new Date().toISOString(), error: null }, ...over,
+  last_error: null, token_map: { size: 8, refreshed_at: new Date().toISOString(), error: null },
+  rpc: { scheme: 'https', source: 'POLYGON_RPC_URL', host: 'polygon-mainnet.g.alchemy.com',
+    converted_from_wss: false, requires: 'https (eth_getLogs polling)', config_error: null, note: null },
+  ...over,
 })
 
 const status = (over = {}) => ({
@@ -126,5 +129,15 @@ describe('DiagnosticsPanel', () => {
       diagnostics={diagnostics({ token_map: { size: 0, refreshed_at: null, error: 'gamma timeout' } })}
       diagnosis={{ code: 'rpc_log_issue', message: 'x' }} />)
     expect(screen.getByText(/gamma timeout/)).toBeInTheDocument()
+  })
+
+  it('shows the RPC endpoint scheme/source and a config error with the fix', () => {
+    render(<DiagnosticsPanel
+      diagnostics={diagnostics({ rpc: { scheme: 'wss', source: 'POLYGON_WS_RPC_URL', host: 'x',
+        converted_from_wss: false, requires: 'https (eth_getLogs polling)',
+        config_error: 'POLYGON_RPC_URL must be an HTTPS JSON-RPC endpoint', note: null } })}
+      diagnosis={{ code: 'rpc_config_issue', message: 'set POLYGON_RPC_URL' }} />)
+    expect(screen.getByTestId('rpc-config-error')).toHaveTextContent('HTTPS JSON-RPC endpoint')
+    expect(screen.getByTestId('diagnosis-banner')).toHaveTextContent('rpc config issue')
   })
 })

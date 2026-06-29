@@ -273,3 +273,61 @@ def test_diagnostics_accumulate_across_cycles(in_memory_db, monkeypatch):
          watched_logs=[_log(maker=PRIMARY, taker=OTHER, tx="0xe")], block=101)
     d = oc.status(db)["diagnostics"]
     assert d["blocks_scanned"] >= 2 and d["events_matching_watched"] == 2 and d["btc_token_map_matches"] == 2
+
+
+# --- RPC URL resolution + error reporting (400 fix) -------------------------
+def test_resolve_prefers_polygon_rpc_url():
+    r = oc._resolve_http_rpc("https://polygon-mainnet.g.alchemy.com/v2/KEY", "wss://x/ws")
+    assert r["url"].startswith("https://") and r["source"] == "POLYGON_RPC_URL" and r["error"] is None
+
+
+def test_resolve_rejects_wss_in_rpc_url():
+    r = oc._resolve_http_rpc("wss://polygon-mainnet.g.alchemy.com/v2/KEY", "")
+    assert r["url"] is None and "HTTPS" in r["error"]
+
+
+def test_resolve_converts_alchemy_wss():
+    r = oc._resolve_http_rpc("", "wss://polygon-mainnet.g.alchemy.com/v2/KEY")
+    assert r["url"] == "https://polygon-mainnet.g.alchemy.com/v2/KEY"
+    assert r["converted"] is True and r["scheme"] == "https"
+
+
+def test_resolve_converts_infura_ws_path():
+    r = oc._resolve_http_rpc("", "wss://polygon-mainnet.infura.io/ws/v3/KEY")
+    assert r["url"] == "https://polygon-mainnet.infura.io/v3/KEY"   # '/ws' stripped
+
+
+def test_resolve_none_configured():
+    r = oc._resolve_http_rpc("", "")
+    assert r["url"] is None and "POLYGON_RPC_URL" in r["error"]
+
+
+def test_rpc_error_message_names_method_and_status():
+    e = oc.OnchainRpcError(method="eth_getLogs", scheme="https", host="h", status=400,
+                           body="bad range", hint="check endpoint")
+    s = str(e)
+    assert "eth_getLogs" in s and "400" in s and "https://h" in s and "bad range" in s
+
+
+def test_config_error_diagnosis_when_rpc_url_is_wss(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    monkeypatch.setenv("POLYGON_RPC_URL", "wss://polygon-mainnet.g.alchemy.com/v2/KEY")  # wrong scheme
+    out = oc.run_once(db)
+    assert out["ran"] is False
+    diag = oc.status(db)["diagnosis"]
+    assert diag["code"] == "rpc_config_issue"
+    assert oc.status(db)["diagnostics"]["rpc"]["scheme"] in ("wss", "?")
+
+
+def test_rpc_error_surfaces_before_not_started(in_memory_db, monkeypatch):
+    """A failing scan (blocks=0, error) must read as rpc_log_issue, NOT not_started."""
+    db = in_memory_db; _enable(monkeypatch)
+
+    def boom(cfg):
+        raise oc.OnchainRpcError(method="eth_blockNumber", scheme="https", host="h", status=400,
+                                 body="Must be authenticated!", hint="check key")
+    out = oc.run_once(db, latest_block_fn=boom, token_fetch_fn=lambda: GAMMA)
+    assert out["ran"] is False
+    st = oc.get_state(db)
+    assert (st.error_count or 0) >= 1 and "eth_blockNumber" in (st.last_error or "")
+    assert oc.status(db)["diagnosis"]["code"] == "rpc_log_issue"   # not 'not_started'

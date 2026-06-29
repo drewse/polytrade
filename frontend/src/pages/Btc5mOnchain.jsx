@@ -58,10 +58,30 @@ export function DiagnosticsPanel({ diagnostics, diagnosis }) {
           <div className="small"><b>BTC market:</b> {d.last_btc_market_event || '—'} <span className="muted">{ago(d.last_btc_market_event_at)}</span></div>
         </div>
         <div className="card" style={{ flex: 1, minWidth: 240 }}>
+          <div className="label">RPC endpoint</div>
+          {(() => {
+            const rpc = d.rpc || {}
+            return (
+              <>
+                <div className="small">scheme <b className={rpc.scheme === 'https' ? 'pos' : 'neg'}>{rpc.scheme || '—'}</b>
+                  {rpc.host ? <> · {rpc.host}</> : null}</div>
+                <div className="small muted">from {rpc.source || '—'}{rpc.converted_from_wss ? ' (converted wss→https)' : ''} · needs {rpc.requires}</div>
+                {rpc.config_error && <div className="small neg" data-testid="rpc-config-error">⚠ {rpc.config_error}</div>}
+                {rpc.note && !rpc.config_error && <div className="small muted">ℹ {rpc.note}</div>}
+              </>
+            )
+          })()}
+        </div>
+      </div>
+
+      <div className="cards" style={{ marginTop: 10 }}>
+        <div className="card" style={{ flex: 1, minWidth: 240 }}>
           <div className="label">Token map</div>
           <div className="small">size <b>{tm.size ?? 0}</b> · refreshed {ago(tm.refreshed_at)}</div>
           {tm.error && <div className="small neg">⚠ {tm.error}</div>}
-          <div className="label" style={{ marginTop: 8 }}>Ignored by reason</div>
+        </div>
+        <div className="card" style={{ flex: 1, minWidth: 240 }}>
+          <div className="label">Ignored by reason</div>
           {ignored.length
             ? ignored.map(([r, n]) => <div key={r} className="small"><span className="badge neutral">{n}</span> {r}</div>)
             : <div className="small muted">none</div>}
