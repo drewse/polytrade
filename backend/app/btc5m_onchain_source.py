@@ -601,31 +601,69 @@ def _safe_price(token_id: str) -> float | None:
 # ---------------------------------------------------------------------------
 # one poll cycle (reconnect/gap-fill safe)
 # ---------------------------------------------------------------------------
-def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, res: dict) -> None:
-    """Fold a cycle's read-only diagnostics into the persisted detector state."""
+def _decode_health(logs: list[dict], cfg: dict, now: datetime) -> dict:
+    """Decode EVERY OrderFilled in the (unfiltered) diagnostic window — no signals,
+    no watched matching — purely to report decode health: counts by signature,
+    unknown-topic0 count, last decoded signature, last decode error. Validates the
+    v1/v2 decoder against the whole venue's live events."""
+    exchanges = set(cfg["exchanges"])
+    h = {"decoded": 0, "by_signature": {}, "unknown_topic0": 0, "last_decoded_signature": None,
+         "last_decode_error": None, "last_orderfilled": None, "last_orderfilled_at": None}
+    for log in logs:
+        topics = log.get("topics") or []
+        if not topics or str(log.get("address", "")).lower() not in exchanges:
+            continue
+        t0 = str(topics[0]).lower()
+        if t0 not in KNOWN_ORDERFILLED:
+            h["unknown_topic0"] += 1
+            continue
+        try:
+            dec = decode_order_filled(log)
+        except Exception as exc:  # noqa: BLE001
+            h["last_decode_error"] = f"{KNOWN_ORDERFILLED[t0]['version']}: {type(exc).__name__}: {exc}"
+            h["unknown_topic0"] += 1
+            continue
+        if dec is None:
+            h["unknown_topic0"] += 1
+            continue
+        ver = dec["version"]
+        h["decoded"] += 1
+        h["by_signature"][ver] = h["by_signature"].get(ver, 0) + 1
+        h["last_decoded_signature"] = KNOWN_ORDERFILLED[t0]["sig"]
+        h["last_orderfilled"] = f"[{ver}] block {dec['block_number']} {dec['maker'][:10]}…→{dec['taker'][:10]}…"
+        h["last_orderfilled_at"] = now
+    return h
+
+
+def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, res: dict,
+                     health: dict | None = None) -> None:
+    """Fold a cycle's read-only diagnostics into the persisted detector state.
+    Decode-health (decoded/by_signature/unknown/last_decoded) comes from the
+    venue-wide unfiltered scan; watched/btc/ignored come from process_logs."""
     d = res.get("diag", {}) if res else {}
+    h = health or {}
     st.blocks_scanned = (st.blocks_scanned or 0) + max(0, blocks)
     st.logs_scanned = (st.logs_scanned or 0) + max(0, logs_all)
-    st.events_decoded = (st.events_decoded or 0) + d.get("decoded", 0)
+    st.events_decoded = (st.events_decoded or 0) + h.get("decoded", 0)        # ALL OrderFilled decoded
     st.events_watched = (st.events_watched or 0) + d.get("watched", 0)
     st.btc_matches = (st.btc_matches or 0) + d.get("btc_matches", 0)
-    st.unknown_topic0_count = (st.unknown_topic0_count or 0) + d.get("unknown_topic0", 0)
+    st.unknown_topic0_count = (st.unknown_topic0_count or 0) + h.get("unknown_topic0", 0)
     if d.get("ignored_by_reason"):
         merged = dict(st.ignored_by_reason or {})
         for k, v in d["ignored_by_reason"].items():
             merged[k] = merged.get(k, 0) + v
         st.ignored_by_reason = merged
-    if d.get("by_signature"):
+    if h.get("by_signature"):
         merged = dict(st.decoded_by_signature or {})
-        for k, v in d["by_signature"].items():
+        for k, v in h["by_signature"].items():
             merged[k] = merged.get(k, 0) + v
         st.decoded_by_signature = merged
-    if d.get("last_decoded_signature"):
-        st.last_decoded_signature = d["last_decoded_signature"]
-    if d.get("last_decode_error"):
-        st.last_decode_error = d["last_decode_error"]
-    if d.get("last_orderfilled"):
-        st.last_orderfilled_at = d["last_orderfilled_at"]; st.last_orderfilled_desc = d["last_orderfilled"]
+    if h.get("last_decoded_signature"):
+        st.last_decoded_signature = h["last_decoded_signature"]
+    if h.get("last_decode_error"):
+        st.last_decode_error = h["last_decode_error"]
+    if h.get("last_orderfilled"):
+        st.last_orderfilled_at = h["last_orderfilled_at"]; st.last_orderfilled_desc = h["last_orderfilled"]
     if d.get("last_watched"):
         st.last_watched_event_at = d["last_watched_at"]; st.last_watched_desc = d["last_watched"]
     if d.get("last_btc"):
@@ -677,17 +715,21 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
         logs = (fetch_logs_fn or rpc_get_logs)(cfg, from_block, confirmed)
         res = process_logs(db, logs, cfg=cfg, tmap=tmap, now=now, price_fn=price_fn, block_ts_fn=block_ts_fn)
 
-        # read-only diagnostic: count ALL OrderFilled (any wallet) over a bounded
-        # recent window, to tell "no watched-wallet trade" apart from "RPC/contract
-        # issue". Fail-soft — never affects detection.
-        logs_all = 0
+        # read-only diagnostic: scan ALL OrderFilled (any wallet) over a bounded
+        # recent window and run them through the decoder (no signals created), so
+        # "OrderFilled seen / decoded-by-signature / unknown-topic0" reflect the
+        # whole venue — this distinguishes "no watched-wallet trade" from an
+        # "RPC/contract/topic0 issue". Fail-soft; never affects detection.
+        logs_all, health = 0, {}
         try:
             diag_from = max(from_block, confirmed - cfg["diag_blocks"] + 1)
-            logs_all = len((fetch_all_logs_fn or rpc_get_logs_all)(cfg, diag_from, confirmed))
+            all_logs = (fetch_all_logs_fn or rpc_get_logs_all)(cfg, diag_from, confirmed) or []
+            logs_all = len(all_logs)
+            health = _decode_health(all_logs, cfg, now)
         except Exception:  # noqa: BLE001
-            logs_all = max(logs_all, len(logs))      # at least the watched logs we did see
+            logs_all = len(logs)                     # at least the watched logs we did see
 
-        _accumulate_diag(st, blocks=(confirmed - from_block + 1), logs_all=logs_all, res=res)
+        _accumulate_diag(st, blocks=(confirmed - from_block + 1), logs_all=logs_all, res=res, health=health)
         st.last_processed_block = confirmed
         st.last_poll_at = now
         st.rpc_connected = True
