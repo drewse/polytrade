@@ -755,23 +755,37 @@ def btc5m_onchain_signals(limit: int = 50, db: Session = Depends(get_db)) -> Mes
 
 
 # --- BTC 5M Independent Strategy Lab (research/paper only) -------------------
+def _lab_safe(fn, db):
+    """Run a lab call; on error return a JSON error detail instead of a 500
+    (research tool — never crash the API)."""
+    try:
+        return fn(db)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/btc5m/lab/status", response_model=MessageOut)
 def btc5m_lab_status(db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut(message="btc5m strategy lab status", detail=btc5m_strategy_lab.status(db))
+    return MessageOut(message="btc5m strategy lab status", detail=_lab_safe(btc5m_strategy_lab.status, db))
 
 
 @app.post("/api/btc5m/lab/build-dataset", response_model=MessageOut)
 def btc5m_lab_build(limit_markets: int = 80, db: Session = Depends(get_db)) -> MessageOut:
     """Build the synchronized BTC-spot + Polymarket + order-flow dataset. Paper-only."""
-    return MessageOut(message="btc5m lab build", detail=btc5m_strategy_lab.build_dataset(db, limit_markets=limit_markets))
+    return MessageOut(message="btc5m lab build",
+                      detail=_lab_safe(lambda d: btc5m_strategy_lab.build_dataset(d, limit_markets=limit_markets), db))
 
 
 @app.post("/api/btc5m/lab/search", response_model=MessageOut)
 def btc5m_lab_search(db: Session = Depends(get_db)) -> MessageOut:
     """Generate + backtest strategies (train/val/holdout), reject overfit, rank robust."""
-    res = btc5m_strategy_lab.run_search(db)
-    btc5m_strategy_lab.build_report(db)
-    return MessageOut(message="btc5m lab search", detail=res)
+    def _run(d):
+        res = btc5m_strategy_lab.run_search(d)
+        btc5m_strategy_lab.build_report(d)
+        return res
+    return MessageOut(message="btc5m lab search", detail=_lab_safe(_run, db))
 
 
 @app.get("/api/btc5m/lab/leaderboard", response_model=MessageOut)

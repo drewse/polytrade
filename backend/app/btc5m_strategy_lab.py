@@ -70,9 +70,13 @@ def _btc_norm(ret: float) -> float:
 # ---------------------------------------------------------------------------
 # BTC spot price client (injectable; fail-soft)
 # ---------------------------------------------------------------------------
+_BTC_TIMEOUT = float(os.getenv("BTC5M_LAB_BTC_TIMEOUT", "6"))   # short — a geo-blocked source must fail fast
+_dead_sources: set[str] = set()      # sources that errored THIS build run (e.g. Binance geo-block in US)
+
+
 def _binance_klines(start_ms: int, end_ms: int, interval: str = "1s") -> list[tuple[int, float]]:
     url = "https://api.binance.com/api/v3/klines"
-    with httpx.Client(timeout=config.http_timeout_seconds) as c:
+    with httpx.Client(timeout=_BTC_TIMEOUT) as c:
         r = c.get(url, params={"symbol": "BTCUSDT", "interval": interval,
                                "startTime": start_ms, "endTime": end_ms, "limit": 1000})
         r.raise_for_status()
@@ -82,7 +86,7 @@ def _binance_klines(start_ms: int, end_ms: int, interval: str = "1s") -> list[tu
 
 def _coinbase_candles(start_ms: int, end_ms: int) -> list[tuple[int, float]]:
     url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-    with httpx.Client(timeout=config.http_timeout_seconds, headers={"User-Agent": "polytrade-lab"}) as c:
+    with httpx.Client(timeout=_BTC_TIMEOUT, headers={"User-Agent": "polytrade-lab"}) as c:
         r = c.get(url, params={"granularity": 60, "start": int(start_ms / 1000), "end": int(end_ms / 1000)})
         r.raise_for_status()
         rows = r.json()
@@ -90,21 +94,34 @@ def _coinbase_candles(start_ms: int, end_ms: int) -> list[tuple[int, float]]:
     return sorted([(int(k[0]) * 1000, float(k[4])) for k in rows])
 
 
+# Coinbase first (reachable in US); Binance 1s is finer-grained but geo-blocked in US.
+_BTC_SOURCES = (("coinbase_1m", _coinbase_candles), ("binance_1s", _binance_klines))
+
+
 def fetch_btc_series(start: datetime, end: datetime, *, fetch_fn=None) -> tuple[list[tuple[int, float]], str | None]:
-    """BTC close prices over [start, end] as (t_offset_s, price). Binance 1s first,
-    Coinbase 1m fallback. Returns (series, source|None). Never raises."""
+    """BTC close prices over [start, end] as (t_offset_s, price). A source that
+    ERRORS (e.g. geo-block) is skipped for the rest of the run so we never wait on
+    it 60× — only the first market eats the timeout. Returns (series, source|None).
+    Never raises."""
     if fetch_fn is not None:
         return fetch_fn(start, end), "injected"
     start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-    for name, fn in (("binance_1s", _binance_klines), ("coinbase_1m", _coinbase_candles)):
+    for name, fn in _BTC_SOURCES:
+        if name in _dead_sources:
+            continue
         try:
             raw = fn(start_ms, end_ms)
-            if raw:
-                base = raw[0][0]
-                return [(int((t - base) / 1000), p) for t, p in raw], name
-        except Exception:  # noqa: BLE001  (fail-soft; try the next source)
+        except Exception:  # noqa: BLE001  (network/geo-block -> mark dead for this run)
+            _dead_sources.add(name)
             continue
+        if raw:
+            base = raw[0][0]
+            return [(int((t - base) / 1000), p) for t, p in raw], name
     return [], None
+
+
+def all_btc_sources_dead() -> bool:
+    return all(name in _dead_sources for name, _ in _BTC_SOURCES)
 
 
 def _price_at(series: list[tuple[int, float]], t_offset: int) -> float | None:
@@ -229,6 +246,9 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
     n_markets = n_points = 0
     source = None
     err = None
+    if fetch_fn is None:
+        _dead_sources.clear()                            # fresh per build run
+    attempts = 0
     for mk in markets:
         dur = _slug_duration(mk.slug, mk.question)
         life = (dur or 5) * 60
@@ -236,10 +256,15 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
         end = mk.resolution_time or (start + timedelta(seconds=life) if start else None)
         if not (start and end):
             continue
+        attempts += 1
         series, src = fetch_btc_series(start, end, fetch_fn=fetch_fn)
         source = source or src
         if not series:
             err = "btc price unavailable"
+            # early-abort: if no BTC source is reachable, stop after a few tries
+            # (don't grind through every market with no data)
+            if fetch_fn is None and all_btc_sources_dead() and attempts >= 3:
+                break
             continue
         label_up = _market_label_up(mk, series)
         if label_up is None:
