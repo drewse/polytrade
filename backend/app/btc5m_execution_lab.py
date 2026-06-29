@@ -287,8 +287,11 @@ def fill_probability_model(signals: list[dict]) -> dict:
         y5.append(1 if d is not None else 0)
     emp = {str(to): round(_mean([1 if (d is not None and d <= to) else 0 for d in sig_delays]), 4)
            for to in EMPIRICAL_TIMEOUTS}
-    # exponential hazard λ from mean time-to-fill among fills (per second), for sub-second
-    lam = (1.0 / _mean(delays)) if delays else 0.0
+    # UNCONDITIONAL crossing-trade hazard λ = fills per signal-second over the 5s window
+    # (NOT 1/mean-delay, which only describes the few orders that did fill and wildly
+    # overstates fill probability when most orders never fill). This keeps the modelled
+    # sub-second points consistent with the empirical 1s/2s/5s rates.
+    lam = len(delays) / (len(signals) * 5.0) if signals else 0.0
     modelled = {str(to): round(1 - math.exp(-lam * to), 4) for to in TIMEOUTS}
     # which features predict a fill (logistic on fill-within-5s)
     importances = []
