@@ -118,6 +118,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "last_btc_desc": "TEXT",
         "token_map_refreshed_at": "DATETIME",
         "token_map_error": "TEXT",
+        "decoded_by_signature": "JSON",
+        "unknown_topic0_count": "BIGINT DEFAULT 0",
+        "last_decoded_signature": "TEXT",
+        "last_decode_error": "TEXT",
     },
     # BTC 5M Micro-Test V2 — latency instrumentation + price-drift columns added
     # after the V1 table shipped (ALTER preserves the existing empty table).

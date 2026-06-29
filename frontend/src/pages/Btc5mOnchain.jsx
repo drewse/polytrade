@@ -87,6 +87,29 @@ export function DiagnosticsPanel({ diagnostics, diagnosis }) {
             : <div className="small muted">none</div>}
         </div>
       </div>
+
+      {(() => {
+        const dec = d.decoding || {}
+        return (
+          <div className="card" style={{ marginTop: 10 }} data-testid="decoding-diag">
+            <div className="label">Event decoding — {dec.abi_source || 'OrderFilled'}</div>
+            <div className="small">
+              decoded by signature: {Object.keys(dec.decoded_by_signature || {}).length
+                ? Object.entries(dec.decoded_by_signature).map(([v, n]) => <span key={v} className="badge yes" style={{ marginRight: 4 }}>{v}×{n}</span>)
+                : <span className="muted">none yet</span>}
+              {' · '}unknown topic0: <b className={dec.unknown_topic0_count ? 'neg' : ''}>{dec.unknown_topic0_count ?? 0}</b>
+            </div>
+            <div className="small muted">last decoded: {dec.last_decoded_signature || '—'}</div>
+            {dec.last_decode_error && <div className="small neg">decode error: {dec.last_decode_error}</div>}
+            <div className="small muted" style={{ marginTop: 4 }}>known signatures:</div>
+            {(dec.known_signatures || []).map((s) => (
+              <div key={s.version} className="small mono" title={s.topic0}>
+                <span className="badge sharp">{s.version}</span> {s.signature}
+              </div>
+            ))}
+          </div>
+        )
+      })()}
     </div>
   )
 }

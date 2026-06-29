@@ -96,4 +96,10 @@ class Btc5mOnchainState(Base):
     token_map_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     token_map_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # --- event-decoding diagnostics (v1/v2 OrderFilled) ---------------------
+    decoded_by_signature: Mapped[dict] = mapped_column(JSON, default=dict)   # {"v1": n, "v2": m}
+    unknown_topic0_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_decoded_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_decode_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

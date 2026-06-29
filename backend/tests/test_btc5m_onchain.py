@@ -319,6 +319,95 @@ def test_config_error_diagnosis_when_rpc_url_is_wss(in_memory_db, monkeypatch):
     assert oc.status(db)["diagnostics"]["rpc"]["scheme"] in ("wss", "?")
 
 
+# --- v2 OrderFilled (CTFExchange current; side + single tokenId) ------------
+def _v2log(*, maker, taker, side=0, token="12345", maker_amt=2_500_000, taker_amt=5_000_000,
+           fee=0, tx="0xv2", log_index="0x1", block="0x10", address=oc.DEFAULT_EXCHANGES[1]):
+    data = "0x" + _word(side) + _word(int(token)) + _word(maker_amt) + _word(taker_amt) + _word(fee) + _word(0) + _word(0)
+    return {"transactionHash": tx, "logIndex": log_index, "blockNumber": block, "address": address,
+            "topics": [oc.ORDERFILLED_V2, "0x" + "0" * 64, _pad(maker), _pad(taker)], "data": data}
+
+
+# real production receipt values (tx 0xc49436…, CTFExchange 0xe111…):
+REAL_V2_TAKER = "0xdf7930e89a2c47560165331863c31deca0733dcd"
+REAL_V2_MAKER = "0x87b5f743808f0d7dfaacd303d329b84788b3cfc2"
+REAL_V2_TOKEN = "5021063252940354361659831081453334571034164151689405177567614293621153747592"
+
+
+def test_decode_v2_real_receipt():
+    """Decode the exact OrderFilled log from a live CTFExchange v2 trade."""
+    log = _v2log(maker=REAL_V2_MAKER, taker=REAL_V2_TAKER, side=0, token=REAL_V2_TOKEN,
+                 maker_amt=847500, taker_amt=3390000, fee=0)
+    dec = oc.decode_order_filled(log)
+    assert dec["version"] == "v2" and dec["side"] == 0
+    assert dec["token_id"] == REAL_V2_TOKEN
+    assert dec["maker_amount"] == 847500 and dec["taker_amount"] == 3390000 and dec["fee"] == 0
+    assert dec["maker"] == REAL_V2_MAKER and dec["taker"] == REAL_V2_TAKER
+
+
+def test_v2_classify_taker_sell_and_maker_buy():
+    log = _v2log(maker=REAL_V2_MAKER, taker=REAL_V2_TAKER, side=0, token=REAL_V2_TOKEN,
+                 maker_amt=847500, taker_amt=3390000)
+    dec = oc.decode_order_filled(log)
+    # taker is the watched wallet: maker BOUGHT -> taker SOLD. price 0.8475/3.39 = 0.25
+    ct = oc.classify_fill(dec, {REAL_V2_TAKER}, set(oc.DEFAULT_EXCHANGES))
+    assert ct["role"] == "taker" and ct["side"] == "sell" and ct["price"] == 0.25
+    assert ct["shares"] == 3.39 and ct["usd"] == 0.8475
+    # maker perspective: BUY
+    cm = oc.classify_fill(dec, {REAL_V2_MAKER}, set(oc.DEFAULT_EXCHANGES))
+    assert cm["role"] == "maker" and cm["side"] == "buy" and cm["price"] == 0.25
+
+
+def test_v2_watched_buy_emits_btc_signal(in_memory_db, monkeypatch):
+    """Watched wallet BUYS a BTC token via v2 -> actionable paper signal."""
+    db = in_memory_db; _enable(monkeypatch)
+    # maker=PRIMARY, side=BUY(0), token 12345 in the BTC map, $2.50 for 5 shares -> price 0.5
+    log = _v2log(maker=PRIMARY, taker=OTHER, side=0, token="12345", maker_amt=2_500_000, taker_amt=5_000_000)
+    out = _proc(db, [log], price=0.5)
+    assert out["diag"]["by_signature"] == {"v2": 1}
+    s = db.scalar(select(om.Btc5mOnchainSignal))
+    assert s.side == "buy" and s.direction == "YES" and s.price == 0.5 and s.shares == 5.0
+    assert s.would_pass_gates is True and s.ignored_reason is None
+
+
+def test_both_versions_decoded_and_counted(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    logs = [_log(maker=PRIMARY, taker=OTHER, tx="0xa"),                       # v1 watched BTC buy
+            _v2log(maker=PRIMARY, taker=OTHER, token="67890", tx="0xb")]      # v2 watched BTC buy (other outcome)
+    out = _proc(db, logs)
+    assert out["diag"]["by_signature"].get("v1") == 1 and out["diag"]["by_signature"].get("v2") == 1
+    assert out["diag"]["last_decoded_signature"]
+
+
+def test_unknown_topic0_counted_not_crash(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    bad = _v2log(maker=PRIMARY, taker=OTHER)
+    bad["topics"][0] = "0x" + "ab" * 32                                       # unknown event
+    out = _proc(db, [bad])
+    assert out["diag"]["unknown_topic0"] == 1 and out["diag"]["decoded"] == 0
+    assert db.scalar(select(func.count()).select_from(om.Btc5mOnchainSignal)) == 0
+
+
+def test_status_exposes_decoding_diagnostics(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    wl = [_v2log(maker=PRIMARY, taker=OTHER, token="12345")]
+    oc.run_once(db, now=datetime.utcnow(), latest_block_fn=lambda cfg: 100,
+                fetch_logs_fn=lambda cfg, a, b: wl, fetch_all_logs_fn=lambda cfg, a, b: wl,
+                token_fetch_fn=lambda: GAMMA, price_fn=lambda t: 0.5,
+                block_ts_fn=lambda b: datetime.utcnow() - timedelta(seconds=3))
+    dec = oc.status(db)["diagnostics"]["decoding"]
+    assert dec["abi_source"].startswith("CTFExchange")
+    assert {s["version"] for s in dec["known_signatures"]} == {"v1", "v2"}
+    assert dec["decoded_by_signature"].get("v2") == 1
+
+
+def test_v2_paper_only_no_liveexecution(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    bank0 = live.get_state(db).bankroll
+    _proc(db, [_v2log(maker=PRIMARY, taker=OTHER, token="12345")])
+    assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0
+    assert live.get_state(db).bankroll == bank0
+
+
 def test_block_chunks_respects_span():
     assert list(oc._block_chunks(0, 4, 10)) == [(0, 4)]
     assert list(oc._block_chunks(100, 129, 10)) == [(100, 109), (110, 119), (120, 129)]

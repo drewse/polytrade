@@ -35,10 +35,30 @@ from . import btc5m, btc5m_micro_test as umt
 from . import btc5m_onchain_models as om
 from .settings import config
 
-# OrderFilled(bytes32 orderHash, address maker, address taker, uint256 makerAssetId,
-#  uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)
-ORDERFILLED_TOPIC0 = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
-COLLATERAL_ASSET_ID = "0"          # USDC collateral is assetId 0 in CTF exchange accounting
+# Known Polymarket CTFExchange OrderFilled event signatures (verified on
+# PolygonScan, contract name "CTFExchange"). We support BOTH and decode by topic0.
+#
+# v1 (old/canonical): 3 indexed + 5 data words
+#   OrderFilled(bytes32 orderHash, address maker, address taker,
+#               uint256 makerAssetId, uint256 takerAssetId,
+#               uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)
+ORDERFILLED_V1 = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+# v2 (current; 0xe111…): 3 indexed + 7 data words (single tokenId + side enum)
+#   OrderFilled(bytes32 orderHash, address maker, address taker,
+#               uint8 side, uint256 tokenId, uint256 makerAmountFilled,
+#               uint256 takerAmountFilled, uint256 fee, bytes32 builder, bytes32 metadata)
+ORDERFILLED_V2 = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+KNOWN_ORDERFILLED = {
+    ORDERFILLED_V1: {"version": "v1",
+                     "sig": "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"},
+    ORDERFILLED_V2: {"version": "v2",
+                     "sig": "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)"},
+}
+ORDERFILLED_TOPICS = list(KNOWN_ORDERFILLED.keys())   # eth_getLogs topic0 OR-filter
+ORDERFILLED_TOPIC0 = ORDERFILLED_V1                   # back-compat alias
+ABI_SOURCE = "CTFExchange (verified, PolygonScan) — OrderFilled v1+v2"
+SIDE_BUY, SIDE_SELL = 0, 1         # Polymarket Side enum
+COLLATERAL_ASSET_ID = "0"          # v1: USDC collateral is assetId 0
 DECIMALS = 1_000_000               # USDC + CTF outcome tokens both use 6 decimals
 
 # Polygon CTF exchange contracts (lowercased). Confirm on PolygonScan before live use.
@@ -159,13 +179,30 @@ def _addr_from_topic(topic: str) -> str:
     return "0x" + str(topic)[-40:].lower()
 
 
-def decode_order_filled(log: dict) -> dict:
-    """Decode a raw eth log into the OrderFilled fields (dependency-light: topics
-    carry the indexed addresses; data is 5 packed uint256 words)."""
+def order_filled_version(log: dict) -> str | None:
+    """Return 'v1'/'v2' for a known OrderFilled topic0, else None."""
+    topics = log.get("topics") or []
+    if not topics:
+        return None
+    info = KNOWN_ORDERFILLED.get(str(topics[0]).lower())
+    return info["version"] if info else None
+
+
+def decode_order_filled(log: dict) -> dict | None:
+    """Decode a raw OrderFilled log by version (topic0). Returns None for an
+    unknown/unsupported topic0 (caller counts it). Never raises on a known layout.
+
+    v1: data = [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee]
+    v2: data = [side(uint8), tokenId, makerAmountFilled, takerAmountFilled, fee, builder, metadata]
+    """
+    version = order_filled_version(log)
+    if version is None:
+        return None
     topics = log["topics"]
     data = str(log["data"])[2:] if str(log["data"]).startswith("0x") else str(log["data"])
     words = [data[i:i + 64] for i in range(0, len(data), 64)]
-    return {
+    base = {
+        "version": version,
         "tx_hash": str(log["transactionHash"]).lower(),
         "log_index": _hexint(log.get("logIndex", 0)),
         "block_number": _hexint(log.get("blockNumber", 0)),
@@ -173,41 +210,63 @@ def decode_order_filled(log: dict) -> dict:
         "order_hash": str(topics[1]),
         "maker": _addr_from_topic(topics[2]),
         "taker": _addr_from_topic(topics[3]),
-        "maker_asset_id": str(int(words[0], 16)),
-        "taker_asset_id": str(int(words[1], 16)),
-        "maker_amount": int(words[2], 16),
-        "taker_amount": int(words[3], 16),
-        "fee": int(words[4], 16),
     }
+    if version == "v1":
+        base.update({
+            "maker_asset_id": str(int(words[0], 16)), "taker_asset_id": str(int(words[1], 16)),
+            "maker_amount": int(words[2], 16), "taker_amount": int(words[3], 16), "fee": int(words[4], 16),
+        })
+    else:  # v2
+        base.update({
+            "side": int(words[0], 16), "token_id": str(int(words[1], 16)),
+            "maker_amount": int(words[2], 16), "taker_amount": int(words[3], 16), "fee": int(words[4], 16),
+            "builder": "0x" + words[5], "metadata": "0x" + words[6],
+        })
+    return base
+
+
+def _exchange_counterparty(role: str, maker: str, taker: str, exchanges: set[str]) -> bool:
+    other = taker if role == "maker" else maker
+    return other in exchanges
 
 
 def classify_fill(dec: dict, watched: set[str], exchanges: set[str]) -> dict | None:
-    """From the watched wallet's perspective, derive side/token/price/shares/usd.
-    Returns None if the watched wallet is not involved or the counterparty is the
-    exchange contract itself (mint/burn sub-event)."""
+    """From the watched wallet's perspective, derive side(buy/sell)/token/price/
+    shares/usd. Handles BOTH v1 and v2 OrderFilled. Returns None if the watched
+    wallet is not involved or the counterparty is the exchange itself."""
+    if dec is None:
+        return None
     maker, taker = dec["maker"], dec["taker"]
     role = "maker" if maker in watched else "taker" if taker in watched else None
-    if role is None:
+    if role is None or maker == taker or _exchange_counterparty(role, maker, taker, exchanges):
         return None
-    if maker == taker:
-        return None
-    other = taker if role == "maker" else maker
-    if other in exchanges:                              # exchange-as-counterparty sub-event
-        return None
-    if role == "maker":
-        if dec["maker_asset_id"] == COLLATERAL_ASSET_ID:   # gave USDC -> BOUGHT tokens
-            side, token, usd_raw, sh_raw = "buy", dec["taker_asset_id"], dec["maker_amount"], dec["taker_amount"]
-        else:                                              # gave tokens -> SOLD
-            side, token, sh_raw, usd_raw = "sell", dec["maker_asset_id"], dec["maker_amount"], dec["taker_amount"]
-        wallet = maker
-    else:
-        if dec["taker_asset_id"] == COLLATERAL_ASSET_ID:   # gave USDC -> BOUGHT tokens
-            side, token, usd_raw, sh_raw = "buy", dec["maker_asset_id"], dec["taker_amount"], dec["maker_amount"]
+    wallet = maker if role == "maker" else taker
+
+    if dec["version"] == "v1":
+        if role == "maker":
+            if dec["maker_asset_id"] == COLLATERAL_ASSET_ID:   # gave USDC -> BOUGHT tokens
+                side, token, usd_raw, sh_raw = "buy", dec["taker_asset_id"], dec["maker_amount"], dec["taker_amount"]
+            else:
+                side, token, sh_raw, usd_raw = "sell", dec["maker_asset_id"], dec["maker_amount"], dec["taker_amount"]
         else:
-            side, token, sh_raw, usd_raw = "sell", dec["taker_asset_id"], dec["taker_amount"], dec["maker_amount"]
-        wallet = taker
+            if dec["taker_asset_id"] == COLLATERAL_ASSET_ID:
+                side, token, usd_raw, sh_raw = "buy", dec["maker_asset_id"], dec["taker_amount"], dec["maker_amount"]
+            else:
+                side, token, sh_raw, usd_raw = "sell", dec["taker_asset_id"], dec["taker_amount"], dec["maker_amount"]
+    else:  # v2 — single tokenId + Side enum (the MAKER order's side)
+        token = dec["token_id"]
+        # maker BUY: makerAmount=USDC, takerAmount=shares; maker SELL: reversed
+        if dec["side"] == SIDE_BUY:
+            usd_raw, sh_raw = dec["maker_amount"], dec["taker_amount"]
+        else:
+            sh_raw, usd_raw = dec["maker_amount"], dec["taker_amount"]
+        # watched direction: maker uses the order side directly; taker is the opposite
+        maker_buys = dec["side"] == SIDE_BUY
+        watched_buys = maker_buys if role == "maker" else (not maker_buys)
+        side = "buy" if watched_buys else "sell"
+
     price = round(usd_raw / sh_raw, 4) if sh_raw else None   # 1e6 scaling cancels -> $/share
-    return {"watched": wallet, "role": role, "side": side, "token_id": token,
+    return {"watched": wallet, "role": role, "side": side, "token_id": token, "version": dec["version"],
             "usd": round(usd_raw / DECIMALS, 4), "shares": round(sh_raw / DECIMALS, 4), "price": price}
 
 
@@ -357,7 +416,7 @@ def rpc_get_logs(cfg: dict, from_block: int, to_block: int) -> list[dict]:
     for ca, cb in _block_chunks(from_block, to_block, span):
         base = {"fromBlock": hex(ca), "toBlock": hex(cb), "address": cfg["exchanges"]}
         for slot in (2, 3):                             # topic[2]=maker, topic[3]=taker
-            topics = [ORDERFILLED_TOPIC0, None, None, None]
+            topics = [ORDERFILLED_TOPICS, None, None, None]   # OR-filter v1+v2 OrderFilled
             topics[slot] = watched_topics
             for lg in (_rpc(cfg, "eth_getLogs", [{**base, "topics": topics[:slot + 1]}]) or []):
                 key = (str(lg["transactionHash"]).lower(), _hexint(lg.get("logIndex", 0)))
@@ -377,7 +436,7 @@ def rpc_get_logs_all(cfg: dict, from_block: int, to_block: int) -> list[dict]:
     out: list[dict] = []
     for ca, cb in _block_chunks(from_block, to_block, span):
         out.extend(_rpc(cfg, "eth_getLogs", [{"fromBlock": hex(ca), "toBlock": hex(cb),
-                                              "address": cfg["exchanges"], "topics": [ORDERFILLED_TOPIC0]}]) or [])
+                                              "address": cfg["exchanges"], "topics": [ORDERFILLED_TOPICS]}]) or [])
     return out
 
 
@@ -437,18 +496,35 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
     created = ignored = skipped = 0
     # per-cycle read-only diagnostics
     diag = {"decoded": 0, "watched": 0, "btc_matches": 0, "ignored_by_reason": {},
+            "by_signature": {}, "unknown_topic0": 0, "last_decoded_signature": None,
+            "last_decode_error": None,
             "last_orderfilled": None, "last_orderfilled_at": None,
             "last_watched": None, "last_watched_at": None,
             "last_btc": None, "last_btc_at": None}
     for log in logs:
         topics = log.get("topics") or []
-        if not topics or str(topics[0]).lower() != ORDERFILLED_TOPIC0:
+        if not topics:
             continue
         if str(log.get("address", "")).lower() not in exchanges:
             continue
-        dec = decode_order_filled(log)
+        t0 = str(topics[0]).lower()
+        if t0 not in KNOWN_ORDERFILLED:                          # unknown/unsupported event layout
+            diag["unknown_topic0"] += 1
+            continue
+        try:
+            dec = decode_order_filled(log)
+        except Exception as exc:  # noqa: BLE001  (a malformed log must not crash the cycle)
+            diag["last_decode_error"] = f"{KNOWN_ORDERFILLED[t0]['version']}: {type(exc).__name__}: {exc}"
+            diag["unknown_topic0"] += 1
+            continue
+        if dec is None:
+            diag["unknown_topic0"] += 1
+            continue
+        ver = dec["version"]
         diag["decoded"] += 1
-        diag["last_orderfilled"] = f"block {dec['block_number']} {dec['maker'][:10]}…→{dec['taker'][:10]}…"
+        diag["by_signature"][ver] = diag["by_signature"].get(ver, 0) + 1
+        diag["last_decoded_signature"] = KNOWN_ORDERFILLED[t0]["sig"]
+        diag["last_orderfilled"] = f"[{ver}] block {dec['block_number']} {dec['maker'][:10]}…→{dec['taker'][:10]}…"
         diag["last_orderfilled_at"] = now
         if _exists(db, dec["tx_hash"], dec["log_index"]):        # dedup (gap-fill safe)
             skipped += 1
@@ -533,11 +609,21 @@ def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, re
     st.events_decoded = (st.events_decoded or 0) + d.get("decoded", 0)
     st.events_watched = (st.events_watched or 0) + d.get("watched", 0)
     st.btc_matches = (st.btc_matches or 0) + d.get("btc_matches", 0)
+    st.unknown_topic0_count = (st.unknown_topic0_count or 0) + d.get("unknown_topic0", 0)
     if d.get("ignored_by_reason"):
         merged = dict(st.ignored_by_reason or {})
         for k, v in d["ignored_by_reason"].items():
             merged[k] = merged.get(k, 0) + v
         st.ignored_by_reason = merged
+    if d.get("by_signature"):
+        merged = dict(st.decoded_by_signature or {})
+        for k, v in d["by_signature"].items():
+            merged[k] = merged.get(k, 0) + v
+        st.decoded_by_signature = merged
+    if d.get("last_decoded_signature"):
+        st.last_decoded_signature = d["last_decoded_signature"]
+    if d.get("last_decode_error"):
+        st.last_decode_error = d["last_decode_error"]
     if d.get("last_orderfilled"):
         st.last_orderfilled_at = d["last_orderfilled_at"]; st.last_orderfilled_desc = d["last_orderfilled"]
     if d.get("last_watched"):
@@ -761,6 +847,15 @@ def _diagnostics(st: om.Btc5mOnchainState, cfg: dict) -> dict:
         "btc_token_map_matches": st.btc_matches or 0,
         "ignored_by_reason": st.ignored_by_reason or {},
         "error_count": st.error_count or 0,
+        "decoding": {
+            "abi_source": ABI_SOURCE,
+            "known_signatures": [{"version": v["version"], "topic0": t, "signature": v["sig"]}
+                                 for t, v in KNOWN_ORDERFILLED.items()],
+            "decoded_by_signature": st.decoded_by_signature or {},
+            "unknown_topic0_count": st.unknown_topic0_count or 0,
+            "last_decoded_signature": st.last_decoded_signature,
+            "last_decode_error": st.last_decode_error,
+        },
         "last_block_scanned": st.last_processed_block,
         "last_orderfilled": st.last_orderfilled_desc,
         "last_orderfilled_at": st.last_orderfilled_at.isoformat() if st.last_orderfilled_at else None,

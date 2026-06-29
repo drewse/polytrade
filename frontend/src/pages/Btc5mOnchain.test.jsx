@@ -14,6 +14,15 @@ const diagnostics = (over = {}) => ({
   last_error: null, token_map: { size: 8, refreshed_at: new Date().toISOString(), error: null },
   rpc: { scheme: 'https', source: 'POLYGON_RPC_URL', host: 'polygon-mainnet.g.alchemy.com',
     converted_from_wss: false, requires: 'https (eth_getLogs polling)', config_error: null, note: null },
+  decoding: {
+    abi_source: 'CTFExchange (verified, PolygonScan) — OrderFilled v1+v2',
+    known_signatures: [
+      { version: 'v1', topic0: '0xd0a08e8c', signature: 'OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)' },
+      { version: 'v2', topic0: '0xd543adfd', signature: 'OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)' },
+    ],
+    decoded_by_signature: { v2: 12 }, unknown_topic0_count: 0,
+    last_decoded_signature: 'OrderFilled(bytes32,address,address,uint8,...)', last_decode_error: null,
+  },
   ...over,
 })
 
@@ -129,6 +138,14 @@ describe('DiagnosticsPanel', () => {
       diagnostics={diagnostics({ token_map: { size: 0, refreshed_at: null, error: 'gamma timeout' } })}
       diagnosis={{ code: 'rpc_log_issue', message: 'x' }} />)
     expect(screen.getByText(/gamma timeout/)).toBeInTheDocument()
+  })
+
+  it('shows event-decoding diagnostics (signatures, by-version counts, ABI source)', () => {
+    render(<DiagnosticsPanel diagnostics={diagnostics()} diagnosis={{ code: 'detecting', message: 'x' }} />)
+    const dec = screen.getByTestId('decoding-diag')
+    expect(dec).toHaveTextContent('CTFExchange')
+    expect(dec).toHaveTextContent('v2×12')
+    expect(dec).toHaveTextContent('uint8,uint256')   // the v2 signature
   })
 
   it('shows the RPC endpoint scheme/source and a config error with the fix', () => {
