@@ -185,6 +185,9 @@ export const api = {
   btc5mDiscoveryNightly: (build = false, crossAssets = true) => request(`/api/btc5m/discovery/nightly?build=${build}&cross_assets=${crossAssets}`, { method: 'POST' }),
   btc5mDiscoveryFeatures: (limit = 60) => request(`/api/btc5m/discovery/features?limit=${limit}`),
   btc5mDiscoveryModels: () => request('/api/btc5m/discovery/models'),
+  // BTC 5M Execution Research Lab (Phase 3: passive-vs-market execution; paper only)
+  btc5mExecutionStatus: () => request('/api/btc5m/execution/status'),
+  btc5mExecutionRun: () => request('/api/btc5m/execution/run', { method: 'POST' }),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

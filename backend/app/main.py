@@ -14,6 +14,7 @@ from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_tes
 from . import btc5m_strategy_lab as strat_lab  # noqa: E402
 from . import btc5m_alpha_research as research_lab  # noqa: E402
 from . import btc5m_alpha_discovery as discovery_lab  # noqa: E402
+from . import btc5m_execution_lab as execution_lab  # noqa: E402
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -890,6 +891,24 @@ def btc5m_discovery_features(limit: int = 60, db: Session = Depends(get_db)) -> 
 def btc5m_discovery_models(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m alpha model generations",
                       detail=_lab_safe(discovery_lab.model_generations, db))
+
+
+# --- BTC 5M Execution Research Lab (Phase 3: passive-vs-market simulation) ----
+# Simulates execution styles on historical signals/trades to test whether passive
+# liquidity provision converts predictive-but-untradeable models into significant
+# +EV. Research/paper only — no live execution path.
+@app.get("/api/btc5m/execution/status", response_model=MessageOut)
+def btc5m_execution_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m execution lab status",
+                      detail=_lab_safe(execution_lab.execution_status, db))
+
+
+@app.post("/api/btc5m/execution/run", response_model=MessageOut)
+def btc5m_execution_run(db: Session = Depends(get_db)) -> MessageOut:
+    """Simulate market vs passive execution, build the frontier, run the promotion
+    experiment, and answer the research questions. Paper/research only."""
+    return MessageOut(message="btc5m execution lab run",
+                      detail=_lab_safe(execution_lab.run_execution_lab, db))
 
 
 # ===========================================================================

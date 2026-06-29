@@ -112,6 +112,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "alpha_generation": "INTEGER DEFAULT 0",
         "alpha_research": "JSON",
         "alpha_built_at": "DATETIME",
+        "execution": "JSON",
+        "execution_built_at": "DATETIME",
     },
     # BTC 5M on-chain detector read-only diagnostics added after the table shipped.
     "btc5m_onchain_state": {

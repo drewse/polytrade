@@ -105,6 +105,9 @@ class Btc5mLabState(Base):
     alpha_generation: Mapped[int] = mapped_column(Integer, default=0)
     alpha_research: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     alpha_built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Phase 3 — Execution Research Lab (passive-vs-market execution simulation)
+    execution: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    execution_built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
