@@ -454,32 +454,40 @@ def run_once(db: Session, *, place: bool = False, now: datetime | None = None,
     if not cfg["enabled"]:
         return {"ran": False, "reason": "BTC5M micro-test disabled (BTC5M_MICRO_TEST_ENABLED=false)"}
     st = get_mt_state(db)
-    if st.stopped:
-        return {"ran": False, "reason": f"stopped — requires manual re-arm ({st.stop_reason})"}
-    if not st.armed:
-        return {"ran": False, "reason": "not armed — explicit arm required"}
     if not cfg["primary_wallet"]:
         return {"ran": False, "reason": "no primary wallet configured"}
 
-    # respect GLOBAL safety: if general live trading is halted/paused, do nothing
-    gstate = live.get_state(db)
-    if gstate.halted:
-        return {"ran": False, "reason": f"global trading halted/paused: {gstate.halt_reason}"}
-
-    acct = _accounting(db)
-    # auto-stop conditions (checked BEFORE acting)
-    if acct["settled_trades"] >= cfg["max_trades"]:
-        _stop(db, st, f"reached {cfg['max_trades']} settled test trades")
-        return {"ran": False, "reason": st.stop_reason, "stopped": True}
-    if acct["realized_pnl"] <= -cfg["total_loss_stop"]:
-        _stop(db, st, f"total test loss stop (${cfg['total_loss_stop']:.0f}) hit")
-        return {"ran": False, "reason": st.stop_reason, "stopped": True}
-    if acct["day_realized_pnl"] <= -cfg["daily_loss_stop"]:
-        _stop(db, st, f"daily test loss stop (${cfg['daily_loss_stop']:.0f}) hit")
-        return {"ran": False, "reason": st.stop_reason, "stopped": True}
-    # concurrency cap (skip, do not stop)
-    if acct["open_positions"] >= cfg["max_concurrent"]:
-        return {"ran": False, "reason": f"max concurrent test positions ({cfg['max_concurrent']}) open"}
+    # ----------------------------------------------------------------------
+    # LIVE-EXECUTION gates — applied ONLY on the path that can place a real
+    # order (place=True). The arm latch, the stop/re-arm latch, the global
+    # halt, the loss stops and the concurrency cap all exist to protect REAL
+    # order placement. The PAPER path (place=False) can never call the
+    # executor, so it must not be blocked by them — it needs only that the
+    # feature is enabled. Live behaviour below is unchanged.
+    # ----------------------------------------------------------------------
+    if place:
+        if st.stopped:
+            return {"ran": False, "reason": f"stopped — requires manual re-arm ({st.stop_reason})"}
+        if not st.armed:
+            return {"ran": False, "reason": "not armed — explicit arm required"}
+        # respect GLOBAL safety: if general live trading is halted/paused, do nothing
+        gstate = live.get_state(db)
+        if gstate.halted:
+            return {"ran": False, "reason": f"global trading halted/paused: {gstate.halt_reason}"}
+        acct = _accounting(db)
+        # auto-stop conditions (checked BEFORE acting)
+        if acct["settled_trades"] >= cfg["max_trades"]:
+            _stop(db, st, f"reached {cfg['max_trades']} settled test trades")
+            return {"ran": False, "reason": st.stop_reason, "stopped": True}
+        if acct["realized_pnl"] <= -cfg["total_loss_stop"]:
+            _stop(db, st, f"total test loss stop (${cfg['total_loss_stop']:.0f}) hit")
+            return {"ran": False, "reason": st.stop_reason, "stopped": True}
+        if acct["day_realized_pnl"] <= -cfg["daily_loss_stop"]:
+            _stop(db, st, f"daily test loss stop (${cfg['daily_loss_stop']:.0f}) hit")
+            return {"ran": False, "reason": st.stop_reason, "stopped": True}
+        # concurrency cap (skip, do not stop)
+        if acct["open_positions"] >= cfg["max_concurrent"]:
+            return {"ran": False, "reason": f"max concurrent test positions ({cfg['max_concurrent']}) open"}
 
     # find the first qualifying, not-yet-mirrored signal (low-latency poll first)
     chosen = None

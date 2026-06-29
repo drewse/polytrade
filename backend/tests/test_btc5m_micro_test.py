@@ -90,11 +90,25 @@ def test_disabled_never_trades(in_memory_db, monkeypatch):
     assert db.scalar(select(func.count()).select_from(mt.Btc5mMicroTestTrade)) == 0
 
 
-def test_not_armed_never_trades(in_memory_db, monkeypatch):
+def test_paper_runs_without_arm(in_memory_db, monkeypatch):
+    """PAPER path requires only enabled — the arm latch protects live execution
+    only, and paper can never place a real order."""
     db = in_memory_db
     _enable(monkeypatch)
     _seed_signal(db)
-    out = umt.run_once(db, place=False)           # enabled but never armed
+    out = umt.run_once(db, place=False)           # enabled, NOT armed -> paper still runs
+    assert out["ran"] is True and out["mode"] == "paper"
+    t = db.scalar(select(mt.Btc5mMicroTestTrade))
+    assert t.executor == "paper"                  # recorded, but no real order
+
+
+def test_live_requires_arm(in_memory_db, monkeypatch):
+    """LIVE path (place=True) still requires the explicit arm — unchanged."""
+    db = in_memory_db
+    _enable(monkeypatch)
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
+    _seed_signal(db)
+    out = umt.run_once(db, place=True, executor=FakeFilled())   # enabled but never armed
     assert out["ran"] is False and "not armed" in out["reason"]
     assert db.scalar(select(func.count()).select_from(mt.Btc5mMicroTestTrade)) == 0
 
@@ -164,14 +178,15 @@ def test_backup_wallet_used_and_logged(in_memory_db, monkeypatch):
     assert t.wallet_role == "backup" and t.wallet_triggered == BACKUP
 
 
-# --- concurrency / stops ----------------------------------------------------
+# --- concurrency / stops (LIVE-path gates: exercised with place=True) --------
 def test_one_concurrent_position_enforced(in_memory_db, monkeypatch):
     db = in_memory_db
     _enable(monkeypatch); umt.arm(db)
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
     _seed_signal(db, mid="0xbtcm1")
     _seed_signal(db, mid="0xbtcm2")
-    assert umt.run_once(db, place=False)["ran"] is True       # opens 1
-    out = umt.run_once(db, place=False)                        # second blocked
+    assert umt.run_once(db, place=True, executor=FakeFilled())["placed"] is True   # opens 1
+    out = umt.run_once(db, place=True, executor=FakeFilled())                       # second blocked
     assert out["ran"] is False and "concurrent" in out["reason"]
     assert db.scalar(select(func.count()).select_from(mt.Btc5mMicroTestTrade)
                      .where(mt.Btc5mMicroTestTrade.status == "open")) == 1
@@ -192,7 +207,7 @@ def test_total_loss_stop_enforced(in_memory_db, monkeypatch):
     for i in range(6):
         _closed_loss(db, f"loss{i}", -3.0, day=False)         # -$18 total <= -$15 stop
     _seed_signal(db)
-    out = umt.run_once(db, place=False)
+    out = umt.run_once(db, place=True)                         # live-path stop
     assert out.get("stopped") is True
     st = umt.get_mt_state(db)
     assert st.stopped is True and st.armed is False and "total" in st.stop_reason
@@ -204,7 +219,7 @@ def test_daily_loss_stop_enforced(in_memory_db, monkeypatch):
     for i in range(4):
         _closed_loss(db, f"d{i}", -3.0, day=True)             # -$12 today <= -$10 daily stop
     _seed_signal(db)
-    out = umt.run_once(db, place=False)
+    out = umt.run_once(db, place=True)                         # live-path stop
     assert out.get("stopped") is True and "daily" in umt.get_mt_state(db).stop_reason
 
 
@@ -214,7 +229,7 @@ def test_max_trades_stop_enforced(in_memory_db, monkeypatch):
     for i in range(3):
         _closed_loss(db, f"t{i}", 1.0)                        # 3 settled (wins) hits the cap
     _seed_signal(db)
-    out = umt.run_once(db, place=False)
+    out = umt.run_once(db, place=True)                         # live-path stop
     assert out.get("stopped") is True and "settled test trades" in umt.get_mt_state(db).stop_reason
 
 
@@ -244,14 +259,19 @@ def test_execution_error_stops_test(in_memory_db, monkeypatch):
     assert t.status == "rejected" and t.venue_error == "boom"
 
 
-def test_global_halt_blocks_micro_test(in_memory_db, monkeypatch):
+def test_global_halt_blocks_live_micro_test(in_memory_db, monkeypatch):
+    """Global halt blocks the LIVE path (place=True). Paper is unaffected (it can
+    place no order)."""
     db = in_memory_db
     _enable(monkeypatch); umt.arm(db)
+    monkeypatch.setenv("LIVE_EXECUTOR", "dry_run")
     st = live.get_state(db)
     st.halted = True; st.halt_reason = "paused (manual)"; db.commit()
     _seed_signal(db)
-    out = umt.run_once(db, place=False)
+    out = umt.run_once(db, place=True, executor=FakeFilled())
     assert out["ran"] is False and "halt" in out["reason"]
+    # paper still runs while global trading is halted (no real order possible)
+    assert umt.run_once(db, place=False)["ran"] is True
 
 
 def test_isolation_no_liveexecution_or_bankroll_change(in_memory_db, monkeypatch):
