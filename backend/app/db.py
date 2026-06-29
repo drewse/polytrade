@@ -109,6 +109,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "lag_profile": "JSON",
         "research": "JSON",
         "research_built_at": "DATETIME",
+        "alpha_generation": "INTEGER DEFAULT 0",
+        "alpha_research": "JSON",
+        "alpha_built_at": "DATETIME",
     },
     # BTC 5M on-chain detector read-only diagnostics added after the table shipped.
     "btc5m_onchain_state": {

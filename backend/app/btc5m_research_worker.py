@@ -56,17 +56,20 @@ def run_pipeline_once(*, build: bool = True, wait: bool = True) -> dict:
     if not _cycle_lock.acquire(blocking=wait):
         return {"skipped": "a research run is already in progress"}
     try:
-        from . import btc5m_alpha_research as research
+        from . import btc5m_alpha_discovery as discovery
         from .db import session_scope
         cfg = get_config()
         db = session_scope()
         try:
-            report = research.run_pipeline(db, build=build, limit_markets=cfg["limit_markets"])
+            # Full nightly: Phase-1 fair-value/ensemble + Phase-2 alpha discovery
+            # (feature mining, registry, meta-learning, cross-asset). Paper only.
+            result = discovery.run_nightly(db, build=build, limit_markets=cfg["limit_markets"])
             _state["last_run_at"] = datetime.utcnow()
             _state["last_error"] = None
-            _state["last_verdict"] = report.get("verdict")
+            disc = result.get("alpha_discovery") or {}
+            _state["last_verdict"] = f"gen {result.get('generation')}: {disc.get('verdict')}"
             _state["runs"] += 1
-            return report
+            return result
         finally:
             db.close()
     finally:

@@ -179,6 +179,12 @@ export const api = {
   btc5mResearchModels: () => request('/api/btc5m/research/models'),
   btc5mResearchReport: () => request('/api/btc5m/research/report'),
   btc5mResearchWorker: () => request('/api/btc5m/research/worker'),
+  // BTC 5M Alpha Discovery Engine (Phase 2: feature mining / meta-learning; paper only)
+  btc5mDiscoveryStatus: () => request('/api/btc5m/discovery/status'),
+  btc5mDiscoveryRun: (crossAssets = true) => request(`/api/btc5m/discovery/run?cross_assets=${crossAssets}`, { method: 'POST' }),
+  btc5mDiscoveryNightly: (build = false, crossAssets = true) => request(`/api/btc5m/discovery/nightly?build=${build}&cross_assets=${crossAssets}`, { method: 'POST' }),
+  btc5mDiscoveryFeatures: (limit = 60) => request(`/api/btc5m/discovery/features?limit=${limit}`),
+  btc5mDiscoveryModels: () => request('/api/btc5m/discovery/models'),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

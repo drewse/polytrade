@@ -79,17 +79,18 @@ def _empty_meta(source=None) -> dict:
             "missing_s": 0, "stale_s": 0, "ticks": 0, "calls": 0, "error": None}
 
 
-def _kraken_1s(start: datetime, end: datetime) -> tuple[list[tuple[int, float]], dict]:
-    """TRUE 1-second BTC/USD from Kraken historical trade ticks (US-reachable),
+def _kraken_1s(start: datetime, end: datetime, pair: str = "XBTUSD") -> tuple[list[tuple[int, float]], dict]:
+    """TRUE 1-second price from Kraken historical trade ticks (US-reachable),
     aggregated to 1s bars (last trade price per second, forward-filled). Returns
-    (series, coverage_meta). The primary 1s source."""
+    (series, coverage_meta). The primary 1s source. `pair` selects the asset
+    (XBTUSD default; ETHUSD/SOLUSD for cross-market lead research)."""
     start_s, end_s = start.timestamp(), end.timestamp()
     since = int((start_s - 60) * 1e9)            # 60s buffer so the opening second has a price
     ticks: list[tuple[float, float]] = []
     calls = 0
     with httpx.Client(timeout=_BTC_TIMEOUT, headers={"User-Agent": "polytrade-lab"}) as c:
         while calls < 6:
-            r = c.get("https://api.kraken.com/0/public/Trades", params={"pair": "XBTUSD", "since": str(since)})
+            r = c.get("https://api.kraken.com/0/public/Trades", params={"pair": pair, "since": str(since)})
             r.raise_for_status()
             d = r.json()
             calls += 1

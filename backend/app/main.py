@@ -13,6 +13,7 @@ from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_tes
 # `btc5m_strategy_lab` (for /api/btc5m/strategy-lab), which would shadow the module.
 from . import btc5m_strategy_lab as strat_lab  # noqa: E402
 from . import btc5m_alpha_research as research_lab  # noqa: E402
+from . import btc5m_alpha_discovery as discovery_lab  # noqa: E402
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -852,6 +853,43 @@ def btc5m_research_report(db: Session = Depends(get_db)) -> MessageOut:
 def btc5m_research_worker_status() -> MessageOut:
     from . import btc5m_research_worker
     return MessageOut(message="btc5m research worker", detail=btc5m_research_worker.status())
+
+
+# --- BTC 5M Alpha Discovery Engine (Phase 2: feature mining / meta-learning) -
+# Mines new candidate features, scores them (IC / MI / SHAP / stability / decay),
+# tracks them across generations, and runs a model lifecycle. Research/paper only.
+@app.get("/api/btc5m/discovery/status", response_model=MessageOut)
+def btc5m_discovery_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m alpha discovery status",
+                      detail=_lab_safe(discovery_lab.discovery_status, db))
+
+
+@app.post("/api/btc5m/discovery/run", response_model=MessageOut)
+def btc5m_discovery_run(cross_assets: bool = True, db: Session = Depends(get_db)) -> MessageOut:
+    """Run one discovery generation: mine features → registry → meta-learn → cross-asset.
+    `cross_assets` fetches ETH/SOL (slower). Paper/research only."""
+    return MessageOut(message="btc5m alpha discovery run",
+                      detail=_lab_safe(lambda d: discovery_lab.run_discovery(d, cross_assets=cross_assets), db))
+
+
+@app.post("/api/btc5m/discovery/nightly", response_model=MessageOut)
+def btc5m_discovery_nightly(build: bool = False, cross_assets: bool = True,
+                            db: Session = Depends(get_db)) -> MessageOut:
+    """Full nightly run: Phase-1 fair-value/ensemble + Phase-2 discovery. Paper only."""
+    return MessageOut(message="btc5m alpha nightly",
+                      detail=_lab_safe(lambda d: discovery_lab.run_nightly(d, build=build, cross_assets=cross_assets), db))
+
+
+@app.get("/api/btc5m/discovery/features", response_model=MessageOut)
+def btc5m_discovery_features(limit: int = 60, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m alpha feature registry",
+                      detail=_lab_safe(lambda d: discovery_lab.feature_registry(d, limit=limit), db))
+
+
+@app.get("/api/btc5m/discovery/models", response_model=MessageOut)
+def btc5m_discovery_models(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m alpha model generations",
+                      detail=_lab_safe(discovery_lab.model_generations, db))
 
 
 # ===========================================================================
