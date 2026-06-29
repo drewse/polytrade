@@ -75,10 +75,19 @@ export function DiagnosticsPanel({ diagnostics, diagnosis }) {
       </div>
 
       <div className="cards" style={{ marginTop: 10 }}>
-        <div className="card" style={{ flex: 1, minWidth: 240 }}>
-          <div className="label">Token map</div>
+        <div className="card" style={{ flex: 1, minWidth: 240 }} data-testid="token-map-card">
+          <div className="label">Token map (BTC up/down)</div>
           <div className="small">size <b>{tm.size ?? 0}</b> · refreshed {ago(tm.refreshed_at)}</div>
+          <div className="small muted">open <b>{tm.open_btc_markets ?? 0}</b> · recently-closed <b>{tm.recently_closed_btc_markets ?? 0}</b> · pages {tm.pages_fetched ?? 0}</div>
           {tm.error && <div className="small neg">⚠ {tm.error}</div>}
+          {Object.keys(tm.top_unmapped_tokens || {}).length > 0 && (
+            <>
+              <div className="small muted" style={{ marginTop: 4 }}>top unmapped tokenIds:</div>
+              {Object.entries(tm.top_unmapped_tokens).slice(0, 4).map(([t, n]) => (
+                <div key={t} className="small mono" title={t}><span className="badge bad">{n}</span> {t.slice(0, 18)}…</div>
+              ))}
+            </>
+          )}
         </div>
         <div className="card" style={{ flex: 1, minWidth: 240 }}>
           <div className="label">Ignored by reason</div>

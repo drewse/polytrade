@@ -11,7 +11,12 @@ const diagnostics = (over = {}) => ({
   last_watched_event_at: new Date(Date.now() - 8000).toISOString(),
   last_btc_market_event: 'Bitcoin Up or Down 5m buy @ 0.5',
   last_btc_market_event_at: new Date(Date.now() - 9000).toISOString(),
-  last_error: null, token_map: { size: 8, refreshed_at: new Date().toISOString(), error: null },
+  last_error: null,
+  token_map: {
+    size: 48, open_btc_markets: 6, recently_closed_btc_markets: 42, pages_fetched: 3,
+    refreshed_at: new Date().toISOString(), error: null,
+    top_unmapped_tokens: { '999888777666555444333': 5 },
+  },
   rpc: { scheme: 'https', source: 'POLYGON_RPC_URL', host: 'polygon-mainnet.g.alchemy.com',
     converted_from_wss: false, requires: 'https (eth_getLogs polling)', config_error: null, note: null },
   decoding: {
@@ -138,6 +143,15 @@ describe('DiagnosticsPanel', () => {
       diagnostics={diagnostics({ token_map: { size: 0, refreshed_at: null, error: 'gamma timeout' } })}
       diagnosis={{ code: 'rpc_log_issue', message: 'x' }} />)
     expect(screen.getByText(/gamma timeout/)).toBeInTheDocument()
+  })
+
+  it('shows token-map coverage (open/recently-closed/pages) and top unmapped tokenIds', () => {
+    render(<DiagnosticsPanel diagnostics={diagnostics()} diagnosis={{ code: 'detecting', message: 'x' }} />)
+    const card = screen.getByTestId('token-map-card')
+    expect(card).toHaveTextContent('open')
+    expect(card).toHaveTextContent('recently-closed')
+    expect(card).toHaveTextContent('pages')
+    expect(card).toHaveTextContent('top unmapped tokenIds')
   })
 
   it('shows event-decoding diagnostics (signatures, by-version counts, ABI source)', () => {

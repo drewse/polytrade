@@ -97,11 +97,11 @@ def test_token_map_btc_only():
 
 
 # --- process_logs: measurement + dedup + gates ------------------------------
-def _proc(db, logs, *, now=None, price=0.50, block_ago_s=3):
+def _proc(db, logs, *, now=None, price=0.50, block_ago_s=3, resolve_fn=lambda t: None):
     cfg = oc._cfg()
     now = now or datetime.utcnow()
     return oc.process_logs(db, logs, cfg=cfg, tmap=_tmap(), now=now,
-                           price_fn=lambda t: price,
+                           price_fn=lambda t: price, resolve_fn=resolve_fn,   # no network in tests
                            block_ts_fn=lambda b: now - timedelta(seconds=block_ago_s))
 
 
@@ -135,9 +135,10 @@ def test_gate_sim_price_above_max_ignored(in_memory_db, monkeypatch):
 
 def test_non_btc_token_ignored(in_memory_db, monkeypatch):
     db = in_memory_db; _enable(monkeypatch)
-    _proc(db, [_log(maker=PRIMARY, taker=OTHER, taker_asset="99999")])   # token not in map
+    out = _proc(db, [_log(maker=PRIMARY, taker=OTHER, taker_asset="99999")])   # token not in map, unresolvable
     s = db.scalar(select(om.Btc5mOnchainSignal))
-    assert s.ignored_reason == "token not in BTC up/down map"
+    assert s.ignored_reason == "token_unmapped"                          # records the unmapped tokenId
+    assert out["diag"]["unmapped_tokens"].get("99999") == 1
 
 
 # --- run_once: cursor + isolation -------------------------------------------
@@ -209,14 +210,14 @@ def test_process_logs_emits_diagnostics(in_memory_db, monkeypatch):
     out = _proc(db, logs)
     d = out["diag"]
     assert d["decoded"] == 3 and d["watched"] == 2 and d["btc_matches"] == 1
-    assert d["ignored_by_reason"].get("token not in BTC up/down map") == 1
+    assert d["ignored_by_reason"].get("token_unmapped") == 1
     assert d["last_watched"] and d["last_btc"]
 
 
-def _run(db, now, *, all_logs, watched_logs=None, token=GAMMA, block=100):
+def _run(db, now, *, all_logs, watched_logs=None, token=GAMMA, block=100, resolve_fn=lambda t: None):
     return oc.run_once(db, now=now, latest_block_fn=lambda cfg: block,
                        fetch_logs_fn=lambda cfg, a, b: watched_logs if watched_logs is not None else [],
-                       fetch_all_logs_fn=lambda cfg, a, b: all_logs,
+                       fetch_all_logs_fn=lambda cfg, a, b: all_logs, resolve_fn=resolve_fn,
                        token_fetch_fn=lambda: token, price_fn=lambda t: 0.5,
                        block_ts_fn=lambda b: now - timedelta(seconds=3))
 
@@ -317,6 +318,88 @@ def test_config_error_diagnosis_when_rpc_url_is_wss(in_memory_db, monkeypatch):
     diag = oc.status(db)["diagnosis"]
     assert diag["code"] == "rpc_config_issue"
     assert oc.status(db)["diagnostics"]["rpc"]["scheme"] in ("wss", "?")
+
+
+# --- token-map coverage / freshness -----------------------------------------
+def _mkt(cid, toks, *, q="Bitcoin Up or Down - June 30, 1:50AM-1:55AM ET",
+         slug="btc-updown-5m-1782798600", closed=False, end=None):
+    return {"conditionId": cid, "clobTokenIds": list(toks), "outcomes": ["Up", "Down"],
+            "question": q, "slug": slug, "closed": closed, "endDate": end}
+
+
+def test_is_btc_updown_matches_multiple_patterns():
+    assert oc._is_btc_updown("Bitcoin Up or Down - 5m", "btc-updown-5m-1")
+    assert oc._is_btc_updown("BTC Up/Down", "x")
+    assert oc._is_btc_updown(None, "btc-updown-15m-2")
+    assert oc._is_btc_updown("Will BTC be Up or Down?", None)
+    assert not oc._is_btc_updown("Ethereum price above $4000?", "eth-price")
+    assert not oc._is_btc_updown("Will the Lakers win?", "nba-lakers")
+
+
+def test_paginate_dedupes_and_failsoft(monkeypatch):
+    _enable(monkeypatch); cfg = oc._cfg()
+    pages = {0: [_mkt("0xA", ["1", "2"]), _mkt("0xB", ["3", "4"])],
+             1: [_mkt("0xB", ["3", "4"]),                # duplicate conditionId
+                 _mkt("0xC", ["5", "6"], slug="btc-updown-15m-9")],
+             2: []}                                      # empty page -> stop
+    markets, stats = oc._paginate_open_btc(cfg, page_fn=lambda p: pages.get(p, []))
+    cids = [m["condition_id"] for m in markets]
+    assert cids == ["0xA", "0xB", "0xC"] and stats["error"] is None        # deduped
+    assert stats["pages"] >= 3
+
+
+def test_fetch_token_map_paginated(monkeypatch):
+    _enable(monkeypatch); cfg = oc._cfg()
+    oc._tm_cache.update({"map": {}, "refreshed_at": None}); oc._token_resolve_cache.clear()
+    pages = {0: [_mkt("0xA", ["111", "222"])], 1: [_mkt("0xB", ["333", "444"])], 2: []}
+    tmap = oc.fetch_token_map(cfg, page_fn=lambda p: pages.get(p, []))
+    assert set(tmap.keys()) == {"111", "222", "333", "444"}
+    assert tmap["111"]["outcome"] == "Up" and tmap["222"]["outcome"] == "Down"
+
+
+def test_just_closed_market_retained_in_window(monkeypatch):
+    _enable(monkeypatch); cfg = oc._cfg()
+    now = datetime.utcnow()
+    recent = _mkt("0xR", ["9"], closed=True, end=(now - timedelta(minutes=10)).isoformat())
+    old = _mkt("0xO", ["8"], closed=True, end=(now - timedelta(minutes=300)).isoformat())
+    assert oc._market_active_window(oc._parse_market_row(recent), cfg, now) is True   # within lookback
+    assert oc._market_active_window(oc._parse_market_row(old), cfg, now) is False     # beyond lookback
+
+
+def test_resolve_token_on_demand_finds_market(monkeypatch):
+    _enable(monkeypatch); cfg = oc._cfg(); oc._token_resolve_cache.clear()
+    # the Gamma clob_token_ids lookup returns the market for tokenId 777
+    meta = oc.resolve_token(cfg, "777", resolve_fn=lambda t: [_mkt("0xZ", ["777", "778"])])
+    assert meta is not None and meta["condition_id"] == "0xZ" and meta["outcome"] == "Up"
+    # cached negative for an unknown token (no network re-hit)
+    assert oc.resolve_token(cfg, "doesnotexist", resolve_fn=lambda t: []) is None
+
+
+def test_unmapped_token_resolved_on_demand_emits_signal(in_memory_db, monkeypatch):
+    """A watched fill whose token isn't in the pre-built map is resolved on demand
+    -> BTC match + actionable paper signal (the coverage fix in action)."""
+    db = in_memory_db; _enable(monkeypatch); cfg = oc._cfg(); oc._token_resolve_cache.clear()
+    # token 555 is NOT in _tmap()/GAMMA, but the Gamma clob_token_ids lookup finds it
+    gamma_lookup = lambda tok: [_mkt("0xNEW", ["555", "556"])] if tok == "555" else []
+    resolve_meta = lambda t: oc.resolve_token(cfg, t, resolve_fn=gamma_lookup)   # rows -> meta
+    log = _v2log(maker=PRIMARY, taker=OTHER, side=0, token="555", maker_amt=2_500_000, taker_amt=5_000_000)
+    out = _proc(db, [log], resolve_fn=resolve_meta)
+    assert out["diag"]["btc_matches"] == 1 and out["diag"]["resolved_on_demand"] == 1
+    s = db.scalar(select(om.Btc5mOnchainSignal))
+    assert s.side == "buy" and s.direction == "YES" and s.would_pass_gates is True
+
+
+def test_token_map_diagnostics_in_status(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    # one watched fill on an unresolvable token -> top_unmapped_tokens populated
+    oc.run_once(db, now=datetime.utcnow(), latest_block_fn=lambda cfg: 100,
+                fetch_logs_fn=lambda cfg, a, b: [_v2log(maker=PRIMARY, taker=OTHER, token="999999")],
+                fetch_all_logs_fn=lambda cfg, a, b: [], token_fetch_fn=lambda: GAMMA,
+                resolve_fn=lambda t: None, price_fn=lambda t: 0.5,
+                block_ts_fn=lambda b: datetime.utcnow() - timedelta(seconds=3))
+    tm = oc.status(db)["diagnostics"]["token_map"]
+    assert "open_btc_markets" in tm and "pages_fetched" in tm and "top_unmapped_tokens" in tm
+    assert tm["top_unmapped_tokens"].get("999999") == 1
 
 
 # --- v2 OrderFilled (CTFExchange current; side + single tokenId) ------------

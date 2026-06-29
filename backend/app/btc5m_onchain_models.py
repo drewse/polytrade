@@ -95,6 +95,11 @@ class Btc5mOnchainState(Base):
     last_btc_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_map_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     token_map_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # token-map coverage diagnostics
+    token_map_pages: Mapped[int] = mapped_column(Integer, default=0)
+    token_map_open: Mapped[int] = mapped_column(Integer, default=0)
+    token_map_closed: Mapped[int] = mapped_column(Integer, default=0)
+    unmapped_tokens: Mapped[dict] = mapped_column(JSON, default=dict)    # {tokenId: count} top-N
 
     # --- event-decoding diagnostics (v1/v2 OrderFilled) ---------------------
     decoded_by_signature: Mapped[dict] = mapped_column(JSON, default=dict)   # {"v1": n, "v2": m}

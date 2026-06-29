@@ -159,6 +159,11 @@ def _cfg() -> dict:
         # Alchemy's FREE tier caps eth_getLogs at a 10-block range; chunk every
         # query to <= this many blocks (also the per-cycle catch-up window).
         "max_block_span": max(1, int(os.getenv("BTC5M_ONCHAIN_MAX_BLOCK_SPAN", "10"))),
+        # token-map coverage/freshness (BTC up/down markets churn fast)
+        "tm_lookback_min": int(os.getenv("BTC5M_TOKEN_MAP_LOOKBACK_MINUTES", "180")),
+        "tm_lookahead_min": int(os.getenv("BTC5M_TOKEN_MAP_LOOKAHEAD_MINUTES", "60")),
+        "tm_max_markets": int(os.getenv("BTC5M_TOKEN_MAP_MAX_MARKETS", "500")),
+        "tm_refresh_seconds": max(1, int(os.getenv("BTC5M_TOKEN_MAP_REFRESH_SECONDS", "15"))),
         "watched": watched,
         "max_entry_price": mt["max_entry_price"],
         "min_seconds_remaining": mt["min_seconds_remaining"],
@@ -285,7 +290,13 @@ def _parse_duration(slug: str | None, question: str | None) -> int | None:
 
 
 def _is_btc_updown(question: str | None, slug: str | None) -> bool:
-    return btc5m.is_btc5m_market(question, slug, None) or "btc-updown" in (slug or "").lower()
+    """Match BTC up/down markets across slug + title variants (not one exact
+    pattern): needs a Bitcoin reference AND an up/down cue."""
+    s = ((slug or "") + " " + (question or "")).lower()
+    has_btc = "bitcoin" in s or "btc" in s
+    has_updown = any(k in s for k in ("up or down", "up-or-down", "updown", "up/down", "up & down"))
+    return (has_btc and has_updown) or btc5m.is_btc5m_market(question, slug, None) \
+        or "btc-updown" in (slug or "").lower()
 
 
 def _parse_market_row(row: dict) -> dict | None:
@@ -318,28 +329,74 @@ def _parse_market_row(row: dict) -> dict | None:
     }
 
 
-def _default_gamma_fetch() -> list[dict]:
-    url = f"{config.gamma_api_base}/markets"
-    out: list[dict] = []
+GAMMA_PAGE_SIZE = 100   # Gamma caps /markets at 100 rows/page (ignores larger limit)
+
+
+def _gamma_get(params: dict) -> list[dict]:
     with httpx.Client(timeout=config.http_timeout_seconds) as c:
-        # active (open) markets; Gamma paginates — a couple of pages of recent
-        # high-volume markets covers the rolling BTC up/down set.
-        for off in (0, 500):
-            try:
-                r = c.get(url, params={"closed": "false", "limit": 500, "offset": off,
-                                       "order": "startDate", "ascending": "false"})
-                r.raise_for_status()
-                rows = r.json()
-                out.extend(rows if isinstance(rows, list) else rows.get("data", []))
-            except Exception:  # noqa: BLE001
-                break
-    return out
+        r = c.get(f"{config.gamma_api_base}/markets", params=params)
+        r.raise_for_status()
+        rows = r.json()
+    return rows if isinstance(rows, list) else (rows.get("data") or [])
+
+
+def _paginate_open_btc(cfg: dict, page_fn=None) -> tuple[list[dict], dict]:
+    """Page through Gamma's open markets (100/page) collecting BTC up/down markets,
+    deduped by conditionId. Stops at max_markets or when a page has no BTC markets
+    for a couple of pages. Fail-soft per page."""
+    page = page_fn or (lambda off: _gamma_get(
+        {"closed": "false", "limit": GAMMA_PAGE_SIZE, "offset": off,
+         "order": "startDate", "ascending": "false"}))
+    seen: set[str] = set()
+    markets: list[dict] = []
+    pages = 0
+    err = None
+    max_pages = max(1, cfg["tm_max_markets"] // GAMMA_PAGE_SIZE)
+    misses = 0
+    for p in range(max_pages):
+        try:
+            rows = page_fn(p) if page_fn else page(p * GAMMA_PAGE_SIZE)
+        except Exception as exc:  # noqa: BLE001  (fail-soft per page)
+            err = f"{type(exc).__name__}: {exc}"
+            break
+        pages += 1
+        if not rows:
+            break
+        found = 0
+        for row in rows:
+            meta = _parse_market_row(row)
+            if not meta:
+                continue
+            cid = meta.get("condition_id") or meta.get("market_id")
+            if cid in seen:
+                continue
+            seen.add(cid)
+            markets.append(meta)
+            found += 1
+        misses = 0 if found else misses + 1
+        if len(markets) >= cfg["tm_max_markets"] or misses >= 3:
+            break
+    return markets, {"pages": pages, "error": err}
+
+
+def _market_active_window(meta: dict, cfg: dict, now: datetime) -> bool:
+    """Keep a market mapped while it is open OR ended within the lookback window
+    (just-closed markets — a fill can arrive seconds after expiry) OR ends within
+    the lookahead window."""
+    secs = _seconds_until_expiry(meta.get("end_date"), now)
+    if secs is None:
+        return True                                   # unknown end -> keep
+    if secs >= -cfg["tm_lookback_min"] * 60 and secs <= cfg["tm_lookahead_min"] * 60 + 86400:
+        return True
+    return secs >= -cfg["tm_lookback_min"] * 60       # ended within lookback
 
 
 def build_token_map(rows: list[dict]) -> dict[str, dict]:
+    """Build {token_id -> market meta}. Accepts raw Gamma rows OR already-parsed
+    meta dicts (so callers can pass either)."""
     tmap: dict[str, dict] = {}
     for row in rows or []:
-        meta = _parse_market_row(row)
+        meta = row if ("clob_token_ids" in row) else _parse_market_row(row)
         if not meta:
             continue
         for i, tok in enumerate(meta["clob_token_ids"]):
@@ -348,9 +405,63 @@ def build_token_map(rows: list[dict]) -> dict[str, dict]:
     return tmap
 
 
-def fetch_token_map(fetch_fn=None) -> dict[str, dict]:
-    rows = (fetch_fn or _default_gamma_fetch)()
-    return build_token_map(rows)
+# module-level token-map cache (process-local; the detector + API share a process)
+_tm_cache = {"map": {}, "refreshed_at": None, "pages": 0, "open": 0, "closed": 0, "error": None}
+_token_resolve_cache: dict[str, dict | None] = {}   # token_id -> meta | None (on-demand)
+
+
+def fetch_token_map(cfg: dict, *, fetch_fn=None, page_fn=None, now=None) -> dict[str, dict]:
+    """Return the BTC up/down token map, refreshed at most every tm_refresh_seconds.
+    `fetch_fn` (tests) bypasses pagination/cache and builds directly from its rows."""
+    now = now or datetime.utcnow()
+    if fetch_fn is not None:                          # deterministic test path
+        return build_token_map(fetch_fn() or [])
+    fresh = (_tm_cache["refreshed_at"] is not None
+             and (now - _tm_cache["refreshed_at"]).total_seconds() < cfg["tm_refresh_seconds"])
+    if fresh and not page_fn:
+        return _tm_cache["map"]
+    markets, stats = _paginate_open_btc(cfg, page_fn=page_fn)
+    markets = [m for m in markets if _market_active_window(m, cfg, now)]
+    tmap = build_token_map(markets)
+    # carry forward on-demand-resolved tokens still inside the active window
+    for tok, meta in list(_token_resolve_cache.items()):
+        if meta and tok not in tmap and _market_active_window(meta, cfg, now):
+            for i, t in enumerate(meta["clob_token_ids"]):
+                if str(t) == tok:
+                    tmap[tok] = {**meta, "outcome": meta["outcomes"][i] if i < len(meta["outcomes"]) else None,
+                                 "outcome_index": i}
+    _tm_cache.update({"map": tmap, "refreshed_at": now, "pages": stats["pages"], "error": stats["error"],
+                      "open": sum(1 for m in markets if not m.get("closed")),
+                      "closed": sum(1 for m in markets if m.get("closed"))})
+    return tmap
+
+
+def resolve_token(cfg: dict, token_id: str, *, resolve_fn=None, now=None) -> dict | None:
+    """On-demand: resolve an unmapped tokenId to its BTC up/down market via Gamma's
+    clob_token_ids lookup. Cached (positive + negative). Returns token meta or None."""
+    token_id = str(token_id)
+    if token_id in _token_resolve_cache:
+        cached = _token_resolve_cache[token_id]
+        return _token_meta(cached, token_id) if cached else None
+    fetch = resolve_fn or (lambda t: _gamma_get({"clob_token_ids": t}))
+    try:
+        rows = fetch(token_id) or []
+    except Exception:  # noqa: BLE001
+        return None
+    meta = None
+    for row in rows:
+        m = _parse_market_row(row)
+        if m and token_id in [str(x) for x in m["clob_token_ids"]] and _is_btc_updown(m["question"], m["slug"]):
+            meta = m
+            break
+    _token_resolve_cache[token_id] = meta             # cache positive OR negative
+    return _token_meta(meta, token_id) if meta else None
+
+
+def _token_meta(meta: dict, token_id: str) -> dict:
+    toks = [str(t) for t in meta["clob_token_ids"]]
+    i = toks.index(token_id) if token_id in toks else 0
+    return {**meta, "outcome": meta["outcomes"][i] if i < len(meta["outcomes"]) else None, "outcome_index": i}
 
 
 # ---------------------------------------------------------------------------
@@ -490,14 +601,16 @@ def _seconds_until_expiry(end_date, now: datetime) -> float | None:
 # process logs -> measured paper-only signals
 # ---------------------------------------------------------------------------
 def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: datetime | None = None,
-                 price_fn=None, block_ts_fn=None) -> dict:
+                 price_fn=None, block_ts_fn=None, resolve_fn=None) -> dict:
     now = now or datetime.utcnow()
     watched, exchanges = cfg["watched"], set(cfg["exchanges"])
     created = ignored = skipped = 0
+    # on-demand resolver for tokens not in the pre-built map (default: Gamma lookup)
+    resolve = resolve_fn if resolve_fn is not None else (lambda t: resolve_token(cfg, t))
     # per-cycle read-only diagnostics
     diag = {"decoded": 0, "watched": 0, "btc_matches": 0, "ignored_by_reason": {},
             "by_signature": {}, "unknown_topic0": 0, "last_decoded_signature": None,
-            "last_decode_error": None,
+            "last_decode_error": None, "unmapped_tokens": {}, "resolved_on_demand": 0,
             "last_orderfilled": None, "last_orderfilled_at": None,
             "last_watched": None, "last_watched_at": None,
             "last_btc": None, "last_btc_at": None}
@@ -535,7 +648,13 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
         diag["watched"] += 1
         diag["last_watched"] = f"block {dec['block_number']} {cl['watched'][:10]}… {cl['side']} {cl['token_id'][:8]}…"
         diag["last_watched_at"] = now
-        meta = tmap.get(str(cl["token_id"]))
+        token = str(cl["token_id"])
+        meta = tmap.get(token)
+        if meta is None:                                         # on-demand fallback resolution
+            meta = resolve(token)
+            if meta is not None:
+                tmap[token] = meta                               # warm the map for the rest of the cycle
+                diag["resolved_on_demand"] += 1
         if meta is not None:
             diag["btc_matches"] += 1
             diag["last_btc"] = f"{(meta.get('question') or '')[:32]} {cl['side']} @ {cl['price']}"
@@ -546,7 +665,8 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
 
         ignored_reason = None
         if meta is None:
-            ignored_reason = "token not in BTC up/down map"
+            ignored_reason = "token_unmapped"                    # not a BTC up/down market we can resolve
+            diag["unmapped_tokens"][token] = diag["unmapped_tokens"].get(token, 0) + 1
         elif meta.get("closed"):
             ignored_reason = "market closed"
         elif cl["side"] != "buy":
@@ -653,6 +773,12 @@ def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, re
         for k, v in d["ignored_by_reason"].items():
             merged[k] = merged.get(k, 0) + v
         st.ignored_by_reason = merged
+    if d.get("unmapped_tokens"):
+        merged = dict(st.unmapped_tokens or {})
+        for k, v in d["unmapped_tokens"].items():
+            merged[k] = merged.get(k, 0) + v
+        # keep only the top 20 unmapped tokens (so we can see which dominate)
+        st.unmapped_tokens = dict(sorted(merged.items(), key=lambda kv: -kv[1])[:20])
     if h.get("by_signature"):
         merged = dict(st.decoded_by_signature or {})
         for k, v in h["by_signature"].items():
@@ -671,7 +797,8 @@ def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, re
 
 
 def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, latest_block_fn=None,
-             token_fetch_fn=None, price_fn=None, block_ts_fn=None, fetch_all_logs_fn=None) -> dict:
+             token_fetch_fn=None, price_fn=None, block_ts_fn=None, fetch_all_logs_fn=None,
+             resolve_fn=None) -> dict:
     now = now or datetime.utcnow()
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -686,12 +813,15 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
         db.commit()
         return {"ran": False, "reason": cfg["rpc_config_error"]}
     try:
-        # token-map refresh (with read-only status)
+        # token-map refresh (paginated open BTC markets, throttled; with status)
         try:
-            tmap = fetch_token_map(token_fetch_fn)
+            tmap = fetch_token_map(cfg, fetch_fn=token_fetch_fn, now=now)
             st.token_map_size = len(tmap)
             st.token_map_refreshed_at = now
-            st.token_map_error = None if tmap else "token map empty (no BTC up/down markets found)"
+            st.token_map_pages = _tm_cache.get("pages", 0)
+            st.token_map_open = _tm_cache.get("open", 0)
+            st.token_map_closed = _tm_cache.get("closed", 0)
+            st.token_map_error = _tm_cache.get("error") or (None if tmap else "no BTC up/down markets found")
         except Exception as exc:  # noqa: BLE001  (token map is best-effort)
             tmap = {}
             st.token_map_error = f"{type(exc).__name__}: {exc}"
@@ -713,7 +843,8 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
             skipped = (confirmed - span + 1) - from_block
             from_block = confirmed - span + 1
         logs = (fetch_logs_fn or rpc_get_logs)(cfg, from_block, confirmed)
-        res = process_logs(db, logs, cfg=cfg, tmap=tmap, now=now, price_fn=price_fn, block_ts_fn=block_ts_fn)
+        res = process_logs(db, logs, cfg=cfg, tmap=tmap, now=now, price_fn=price_fn,
+                           block_ts_fn=block_ts_fn, resolve_fn=resolve_fn)
 
         # read-only diagnostic: scan ALL OrderFilled (any wallet) over a bounded
         # recent window and run them through the decoder (no signals created), so
@@ -908,8 +1039,13 @@ def _diagnostics(st: om.Btc5mOnchainState, cfg: dict) -> dict:
         "last_error": st.last_error,
         "token_map": {
             "size": st.token_map_size or 0,
+            "open_btc_markets": st.token_map_open or 0,
+            "recently_closed_btc_markets": st.token_map_closed or 0,
+            "pages_fetched": st.token_map_pages or 0,
             "refreshed_at": st.token_map_refreshed_at.isoformat() if st.token_map_refreshed_at else None,
             "error": st.token_map_error,
+            "top_unmapped_tokens": dict(sorted((st.unmapped_tokens or {}).items(),
+                                               key=lambda kv: -kv[1])[:8]),
         },
         "rpc": {
             "scheme": cfg.get("rpc_scheme"),
