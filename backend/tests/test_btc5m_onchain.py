@@ -319,6 +319,46 @@ def test_config_error_diagnosis_when_rpc_url_is_wss(in_memory_db, monkeypatch):
     assert oc.status(db)["diagnostics"]["rpc"]["scheme"] in ("wss", "?")
 
 
+def test_block_chunks_respects_span():
+    assert list(oc._block_chunks(0, 4, 10)) == [(0, 4)]
+    assert list(oc._block_chunks(100, 129, 10)) == [(100, 109), (110, 119), (120, 129)]
+    assert list(oc._block_chunks(100, 105, 3)) == [(100, 102), (103, 105)]
+
+
+def test_get_logs_chunks_to_free_tier_cap(monkeypatch):
+    """Wide ranges must be split into <=max_block_span sub-queries (Alchemy free
+    tier caps eth_getLogs at 10 blocks)."""
+    monkeypatch.setenv("BTC5M_ONCHAIN_ENABLED", "true")
+    monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example/x")
+    monkeypatch.setenv("BTC5M_MICRO_TEST_PRIMARY_WALLET", PRIMARY)
+    cfg = oc._cfg()
+    ranges = []
+
+    def fake_rpc(cfg, method, params):
+        p = params[0]
+        ranges.append(int(p["toBlock"], 16) - int(p["fromBlock"], 16) + 1)
+        return []
+    monkeypatch.setattr(oc, "_rpc", fake_rpc)
+    oc.rpc_get_logs_all(cfg, 1000, 1045)               # 46 blocks
+    assert ranges and all(r <= 10 for r in ranges) and sum(ranges) == 46
+
+
+def test_run_once_jumps_when_cursor_far_behind(in_memory_db, monkeypatch):
+    """A stale cursor far behind the tip self-heals: scan only the last span
+    blocks (never a 500-block range that would 400 on the free tier)."""
+    db = in_memory_db; _enable(monkeypatch)
+    st = oc.get_state(db); st.last_processed_block = 1000; db.commit()   # tip will be 1600 -> 600 behind
+    seen_range = {}
+
+    def fl(cfg, a, b):
+        seen_range["span"] = b - a + 1
+        return []
+    oc.run_once(db, now=datetime.utcnow(), latest_block_fn=lambda cfg: 1600,
+                fetch_logs_fn=fl, fetch_all_logs_fn=lambda cfg, a, b: [], token_fetch_fn=lambda: GAMMA)
+    assert seen_range["span"] <= 10                    # bounded, not 600
+    assert oc.get_state(db).last_processed_block == 1600
+
+
 def test_rpc_error_surfaces_before_not_started(in_memory_db, monkeypatch):
     """A failing scan (blocks=0, error) must read as rpc_log_issue, NOT not_started."""
     db = in_memory_db; _enable(monkeypatch)

@@ -136,6 +136,9 @@ def _cfg() -> dict:
         "target_latency_s": float(os.getenv("BTC5M_ONCHAIN_TARGET_LATENCY_SECONDS", "5")),
         "poll_seconds": max(1, int(os.getenv("BTC5M_ONCHAIN_POLL_SECONDS", "2"))),
         "diag_blocks": max(1, int(os.getenv("BTC5M_ONCHAIN_DIAG_BLOCKS", "5"))),
+        # Alchemy's FREE tier caps eth_getLogs at a 10-block range; chunk every
+        # query to <= this many blocks (also the per-cycle catch-up window).
+        "max_block_span": max(1, int(os.getenv("BTC5M_ONCHAIN_MAX_BLOCK_SPAN", "10"))),
         "watched": watched,
         "max_entry_price": mt["max_entry_price"],
         "min_seconds_remaining": mt["min_seconds_remaining"],
@@ -329,27 +332,39 @@ def _topic_addr(addr: str) -> str:
     return "0x" + addr[2:].rjust(64, "0").lower()
 
 
+def _block_chunks(from_block: int, to_block: int, span: int):
+    """Yield (a, b) windows of at most `span` blocks (free-tier eth_getLogs cap)."""
+    a = from_block
+    while a <= to_block:
+        b = min(to_block, a + span - 1)
+        yield a, b
+        a = b + 1
+
+
 def rpc_block_number(cfg: dict) -> int:
     return _hexint(_rpc(cfg, "eth_blockNumber", []))
 
 
 def rpc_get_logs(cfg: dict, from_block: int, to_block: int) -> list[dict]:
     """OrderFilled logs in [from_block, to_block] where a WATCHED wallet is maker
-    OR taker (two topic-filtered queries, merged + de-duplicated)."""
+    OR taker (two topic-filtered queries, merged + de-duplicated). Chunked to the
+    free-tier block-range cap so wide ranges don't 400."""
     watched_topics = [_topic_addr(a) for a in sorted(cfg["watched"])]
     if not watched_topics:
         return []
-    base = {"fromBlock": hex(from_block), "toBlock": hex(to_block), "address": cfg["exchanges"]}
+    span = cfg.get("max_block_span", 10)
     seen, out = set(), []
-    for slot in (2, 3):                                 # topic[2]=maker, topic[3]=taker
-        topics = [ORDERFILLED_TOPIC0, None, None, None]
-        topics[slot] = watched_topics
-        for lg in (_rpc(cfg, "eth_getLogs", [{**base, "topics": topics[:slot + 1]}]) or []):
-            key = (str(lg["transactionHash"]).lower(), _hexint(lg.get("logIndex", 0)))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(lg)
+    for ca, cb in _block_chunks(from_block, to_block, span):
+        base = {"fromBlock": hex(ca), "toBlock": hex(cb), "address": cfg["exchanges"]}
+        for slot in (2, 3):                             # topic[2]=maker, topic[3]=taker
+            topics = [ORDERFILLED_TOPIC0, None, None, None]
+            topics[slot] = watched_topics
+            for lg in (_rpc(cfg, "eth_getLogs", [{**base, "topics": topics[:slot + 1]}]) or []):
+                key = (str(lg["transactionHash"]).lower(), _hexint(lg.get("logIndex", 0)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(lg)
     return out
 
 
@@ -357,9 +372,13 @@ def rpc_get_logs_all(cfg: dict, from_block: int, to_block: int) -> list[dict]:
     """ALL OrderFilled logs on the configured exchanges in [from_block, to_block]
     (no wallet filter). Read-only diagnostic: lets us see whether the chain is
     producing OrderFilled at all (RPC + contract addresses + topic0 healthy) even
-    when no WATCHED wallet has traded. Bounded by the caller to a small window."""
-    return _rpc(cfg, "eth_getLogs", [{"fromBlock": hex(from_block), "toBlock": hex(to_block),
-                                      "address": cfg["exchanges"], "topics": [ORDERFILLED_TOPIC0]}]) or []
+    when no WATCHED wallet has traded. Chunked to the free-tier block-range cap."""
+    span = cfg.get("max_block_span", 10)
+    out: list[dict] = []
+    for ca, cb in _block_chunks(from_block, to_block, span):
+        out.extend(_rpc(cfg, "eth_getLogs", [{"fromBlock": hex(ca), "toBlock": hex(cb),
+                                              "address": cfg["exchanges"], "topics": [ORDERFILLED_TOPIC0]}]) or [])
+    return out
 
 
 _BLOCK_TS_CACHE: dict[int, datetime] = {}
@@ -554,13 +573,21 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
             st.token_map_error = f"{type(exc).__name__}: {exc}"
         latest = (latest_block_fn or rpc_block_number)(cfg)
         confirmed = max(0, latest - cfg["confirmations"])
-        # cursor: resume from last_processed_block+1; first run starts at the tip
-        # (we are measuring NEW fills, not backfilling all history)
-        from_block = (st.last_processed_block + 1) if st.last_processed_block else confirmed
+        span = cfg["max_block_span"]
+        # cursor: resume from last_processed_block+1; first run scans the last
+        # `span` blocks (measuring NEW fills, not backfilling all history).
+        from_block = (st.last_processed_block + 1) if st.last_processed_block else max(0, confirmed - span + 1)
         if from_block > confirmed:
             st.last_poll_at = now; st.rpc_connected = True; db.commit()
             return {"ran": True, "from_block": from_block, "to_block": confirmed,
                     "signals_created": 0, "ignored": 0, "deduped": 0, "no_new_blocks": True}
+        # Free-tier safety + stay real-time: never scan more than `span` blocks
+        # behind the tip in one cycle. A stale/way-behind cursor self-heals by
+        # jumping forward (old backlog is skipped — we want recent fills).
+        skipped = 0
+        if confirmed - from_block + 1 > span:
+            skipped = (confirmed - span + 1) - from_block
+            from_block = confirmed - span + 1
         logs = (fetch_logs_fn or rpc_get_logs)(cfg, from_block, confirmed)
         res = process_logs(db, logs, cfg=cfg, tmap=tmap, now=now, price_fn=price_fn, block_ts_fn=block_ts_fn)
 
@@ -582,7 +609,7 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
         st.signals_captured = db.scalar(select(func.count()).select_from(om.Btc5mOnchainSignal)) or 0
         db.commit()
         return {"ran": True, "from_block": from_block, "to_block": confirmed,
-                "logs_scanned": logs_all, **res}
+                "skipped_blocks": skipped, "logs_scanned": logs_all, **res}
     except Exception as exc:  # noqa: BLE001  (fail-soft: record, keep cursor, retry next poll)
         st.rpc_connected = False
         st.error_count = (st.error_count or 0) + 1
