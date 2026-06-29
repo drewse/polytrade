@@ -88,6 +88,11 @@ class Btc5mLabState(Base):
     points_built: Mapped[int] = mapped_column(Integer, default=0)
     btc_price_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     btc_fetch_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    btc_resolution_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    btc_coverage_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    btc_missing_s: Mapped[int] = mapped_column(Integer, default=0)
+    btc_stale_s: Mapped[int] = mapped_column(Integer, default=0)
+    lag_profile: Mapped[dict] = mapped_column(JSON, default=dict)   # {lag_s: avg BTC->YES corr}
     dataset_built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     strategies_tested: Mapped[int] = mapped_column(Integer, default=0)
     strategies_accepted: Mapped[int] = mapped_column(Integer, default=0)

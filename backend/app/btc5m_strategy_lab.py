@@ -70,54 +70,126 @@ def _btc_norm(ret: float) -> float:
 # ---------------------------------------------------------------------------
 # BTC spot price client (injectable; fail-soft)
 # ---------------------------------------------------------------------------
-_BTC_TIMEOUT = float(os.getenv("BTC5M_LAB_BTC_TIMEOUT", "6"))   # short — a geo-blocked source must fail fast
+_BTC_TIMEOUT = float(os.getenv("BTC5M_LAB_BTC_TIMEOUT", "8"))   # short — a geo-blocked source must fail fast
 _dead_sources: set[str] = set()      # sources that errored THIS build run (e.g. Binance geo-block in US)
 
 
-def _binance_klines(start_ms: int, end_ms: int, interval: str = "1s") -> list[tuple[int, float]]:
-    url = "https://api.binance.com/api/v3/klines"
-    with httpx.Client(timeout=_BTC_TIMEOUT) as c:
-        r = c.get(url, params={"symbol": "BTCUSDT", "interval": interval,
-                               "startTime": start_ms, "endTime": end_ms, "limit": 1000})
-        r.raise_for_status()
-        rows = r.json()
-    return [(int(k[0]), float(k[4])) for k in rows]   # (openTime ms, close)
+def _empty_meta(source=None) -> dict:
+    return {"source": source, "resolution_s": None, "coverage_pct": 0.0,
+            "missing_s": 0, "stale_s": 0, "ticks": 0, "calls": 0, "error": None}
 
 
-def _coinbase_candles(start_ms: int, end_ms: int) -> list[tuple[int, float]]:
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+def _kraken_1s(start: datetime, end: datetime) -> tuple[list[tuple[int, float]], dict]:
+    """TRUE 1-second BTC/USD from Kraken historical trade ticks (US-reachable),
+    aggregated to 1s bars (last trade price per second, forward-filled). Returns
+    (series, coverage_meta). The primary 1s source."""
+    start_s, end_s = start.timestamp(), end.timestamp()
+    since = int((start_s - 60) * 1e9)            # 60s buffer so the opening second has a price
+    ticks: list[tuple[float, float]] = []
+    calls = 0
     with httpx.Client(timeout=_BTC_TIMEOUT, headers={"User-Agent": "polytrade-lab"}) as c:
-        r = c.get(url, params={"granularity": 60, "start": int(start_ms / 1000), "end": int(end_ms / 1000)})
+        while calls < 6:
+            r = c.get("https://api.kraken.com/0/public/Trades", params={"pair": "XBTUSD", "since": str(since)})
+            r.raise_for_status()
+            d = r.json()
+            calls += 1
+            if d.get("error"):
+                if calls == 1:
+                    raise RuntimeError(f"kraken: {d['error']}")
+                break                                # transient (e.g. rate limit) -> use what we have
+            res = d["result"]
+            pair = next(k for k in res if k != "last")
+            tr = res[pair]
+            ticks += [(float(t[2]), float(t[0])) for t in tr]
+            last = int(res["last"])
+            if not tr or ticks[-1][0] >= end_s or last <= since:
+                break
+            since = last
+    # aggregate to 1s
+    sec: dict[int, float] = {}
+    for ts, p in ticks:
+        if ts <= end_s:
+            sec[int(ts)] = p
+    pre = [p for ts, p in ticks if ts < start_s]
+    last_p = pre[-1] if pre else None             # opening price from the buffer
+    bars: list[tuple[int, float | None]] = []
+    miss = stale = covered = 0
+    for s in range(int(start_s), int(end_s) + 1):
+        if s in sec:
+            last_p = sec[s]; covered += 1
+        elif last_p is not None:
+            stale += 1; covered += 1               # forward-filled -> still a valid price
+        else:
+            miss += 1
+        bars.append((s - int(start_s), last_p))
+    # back-fill any leading None with the first known price (keep offsets aligned)
+    first = next((p for _, p in bars if p is not None), None)
+    series = [(t, p if p is not None else first) for t, p in bars if (p is not None or first is not None)]
+    total = len(bars)
+    meta = {"source": "kraken_1s", "resolution_s": 1,
+            "coverage_pct": round(100 * covered / total, 1) if total else 0.0,
+            "missing_s": miss, "stale_s": stale, "ticks": len(ticks), "calls": calls, "error": None}
+    return series, meta
+
+
+def _binance_1s(start: datetime, end: datetime) -> tuple[list[tuple[int, float]], dict]:
+    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+    with httpx.Client(timeout=_BTC_TIMEOUT) as c:
+        r = c.get("https://api.binance.com/api/v3/klines",
+                  params={"symbol": "BTCUSDT", "interval": "1s", "startTime": start_ms,
+                          "endTime": end_ms, "limit": 1000})
         r.raise_for_status()
         rows = r.json()
-    # coinbase: [time(s), low, high, open, close, volume] descending
-    return sorted([(int(k[0]) * 1000, float(k[4])) for k in rows])
+    if not rows:
+        return [], _empty_meta("binance_1s")
+    base = int(rows[0][0])
+    series = [(int((int(k[0]) - base) / 1000), float(k[4])) for k in rows]
+    meta = {"source": "binance_1s", "resolution_s": 1, "coverage_pct": round(100 * len(series) / max(1, (end_ms - base) / 1000 + 1), 1),
+            "missing_s": 0, "stale_s": 0, "ticks": len(rows), "calls": 1, "error": None}
+    return series, meta
 
 
-# Coinbase first (reachable in US); Binance 1s is finer-grained but geo-blocked in US.
-_BTC_SOURCES = (("coinbase_1m", _coinbase_candles), ("binance_1s", _binance_klines))
+def _coinbase_1m(start: datetime, end: datetime) -> tuple[list[tuple[int, float]], dict]:
+    sms, ems = int(start.timestamp()), int(end.timestamp())
+    with httpx.Client(timeout=_BTC_TIMEOUT, headers={"User-Agent": "polytrade-lab"}) as c:
+        r = c.get("https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                  params={"granularity": 60, "start": sms, "end": ems})
+        r.raise_for_status()
+        rows = r.json()
+    if not rows:
+        return [], _empty_meta("coinbase_1m")
+    bars = sorted([(int(k[0]), float(k[4])) for k in rows])
+    base = bars[0][0]
+    series = [(t - base, p) for t, p in bars]
+    return series, {"source": "coinbase_1m", "resolution_s": 60, "coverage_pct": 100.0,
+                    "missing_s": 0, "stale_s": 0, "ticks": len(bars), "calls": 1,
+                    "error": "1-minute resolution — too coarse for BTC-lead"}
 
 
-def fetch_btc_series(start: datetime, end: datetime, *, fetch_fn=None) -> tuple[list[tuple[int, float]], str | None]:
-    """BTC close prices over [start, end] as (t_offset_s, price). A source that
-    ERRORS (e.g. geo-block) is skipped for the rest of the run so we never wait on
-    it 60× — only the first market eats the timeout. Returns (series, source|None).
-    Never raises."""
+# Kraken 1s first (US-reachable historical ticks); Binance 1s next (geo-blocked in
+# US, dead-skipped); Coinbase 1m last resort. 1m is flagged as inadequate.
+_BTC_SOURCES = (("kraken_1s", _kraken_1s), ("binance_1s", _binance_1s), ("coinbase_1m", _coinbase_1m))
+
+
+def fetch_btc_series(start: datetime, end: datetime, *, fetch_fn=None):
+    """BTC prices over [start, end] as (t_offset_s, price) + coverage meta. A
+    source that ERRORS is skipped for the rest of the run (so a geo-blocked source
+    isn't waited on 80×). Returns (series, source|None, meta). Never raises."""
     if fetch_fn is not None:
-        return fetch_fn(start, end), "injected"
-    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+        s = fetch_fn(start, end)
+        return s, "injected", {**_empty_meta("injected"), "resolution_s": 1,
+                               "coverage_pct": 100.0 if s else 0.0, "ticks": len(s)}
     for name, fn in _BTC_SOURCES:
         if name in _dead_sources:
             continue
         try:
-            raw = fn(start_ms, end_ms)
-        except Exception:  # noqa: BLE001  (network/geo-block -> mark dead for this run)
+            series, meta = fn(start, end)
+        except Exception as exc:  # noqa: BLE001
             _dead_sources.add(name)
             continue
-        if raw:
-            base = raw[0][0]
-            return [(int((t - base) / 1000), p) for t, p in raw], name
-    return [], None
+        if series:
+            return series, name, meta
+    return [], None, _empty_meta()
 
 
 def all_btc_sources_dead() -> bool:
@@ -139,22 +211,33 @@ def _price_at(series: list[tuple[int, float]], t_offset: int) -> float | None:
 # feature engine (pure)
 # ---------------------------------------------------------------------------
 def btc_features(series: list[tuple[int, float]], t: int) -> dict:
-    """BTC spot features at decision time t (seconds after open)."""
+    """BTC spot features at decision time t (seconds after open). With a true 1s
+    series these short-horizon returns are meaningful (the whole point of the 1s
+    source) — over a 1m series they collapse."""
     p0 = series[0][1] if series else None
     pt = _price_at(series, t)
     if p0 is None or pt is None or p0 <= 0:
         return {}
+
     def ret(dt):
         prev = _price_at(series, t - dt)
         return (pt - prev) / prev if prev else 0.0
-    window = [p for (tt, p) in series if t - 30 <= tt <= t]
-    rets = [(window[i] - window[i - 1]) / window[i - 1] for i in range(1, len(window))] if len(window) > 1 else [0.0]
+
+    w30 = [p for (tt, p) in series if t - 30 <= tt <= t]
+    w10 = [p for (tt, p) in series if t - 10 <= tt <= t]
+    rets = [(w30[i] - w30[i - 1]) / w30[i - 1] for i in range(1, len(w30))] if len(w30) > 1 else [0.0]
+    hi = max((p for tt, p in series if t - 30 <= tt <= t), default=pt)
+    lo = min((p for tt, p in series if t - 30 <= tt <= t), default=pt)
     return {
         "btc_ret_sofar": round((pt - p0) / p0, 6),
-        "btc_ret_5s": round(ret(5), 6), "btc_ret_10s": round(ret(10), 6), "btc_ret_30s": round(ret(30), 6),
-        "btc_momentum": round(_slope(window), 4),
+        "btc_ret_1s": round(ret(1), 6), "btc_ret_2s": round(ret(2), 6), "btc_ret_3s": round(ret(3), 6),
+        "btc_ret_5s": round(ret(5), 6), "btc_ret_10s": round(ret(10), 6), "btc_ret_20s": round(ret(20), 6),
+        "btc_ret_30s": round(ret(30), 6), "btc_ret_60s": round(ret(60), 6),
+        "btc_momentum": round(_slope(w10), 4),                 # short-horizon slope (1s)
+        "btc_acceleration": round(_slope(w10) - _slope(w30), 4),
         "btc_vol": round(_std(rets), 6),
-        "btc_candle": 1 if ret(10) > 0 else (-1 if ret(10) < 0 else 0),
+        "btc_candle": 1 if ret(5) > 0 else (-1 if ret(5) < 0 else 0),
+        "btc_breakout": 1 if pt >= hi - 1e-9 else (-1 if pt <= lo + 1e-9 else 0),
     }
 
 
@@ -185,8 +268,15 @@ def pm_flow_features(trades: list, t: int, btc_ret_sofar: float) -> dict:
     recent_imb = round((ry - rn) / rtot, 4) if rtot else 0.0
     largest = max((tr.usd_value for tr in before), default=0.0)
     lag = round(_btc_norm(btc_ret_sofar) - (yes_t - 0.5), 4)   # >0: BTC up more than YES priced
+    # forward YES at t+L (latency sensitivity: what we'd pay entering L seconds late)
+    def yes_at(tt):
+        upto = [tr for tr in trades if (tr.seconds_from_creation or 0) <= tt]
+        upto.sort(key=lambda tr: tr.seconds_from_creation or 0)
+        return round(_yes_price(upto[-1]), 4) if upto else round(yes_t, 4)
     return {
         "pm_yes": round(yes_t, 4),
+        "yes_lat_1": yes_at(t + 1), "yes_lat_2": yes_at(t + 2),
+        "yes_lat_3": yes_at(t + 3), "yes_lat_5": yes_at(t + 5),
         "pm_momentum": round(yes_t - yes_prev, 4),
         "lag": lag,
         "flow_imbalance": imbalance,
@@ -236,10 +326,46 @@ def _market_label_up(mk, btc_series) -> bool | None:
     return None
 
 
-def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
+def _market_lag_profile(btc_series, trades, life, max_lag: int = 10) -> dict:
+    """Per-market BTC->YES lead/lag: does BTC's recent 3s return predict the YES
+    price change over the NEXT k seconds? Returns {lag_k: corr}. A positive corr
+    peaking at k>0 means BTC LEADS Polymarket by ~k seconds."""
+    price_by = {toff: p for (toff, p) in btc_series if p is not None and 0 <= toff <= life}
+    if len(price_by) < 10:
+        return {}
+    bp, lastp = [], None
+    yes_by = {}
+    for tr in sorted(trades, key=lambda x: x.seconds_from_creation or 0):
+        s = tr.seconds_from_creation or 0
+        if 0 <= s <= life:
+            yes_by[s] = _yes_price(tr)
+    yes, lasty = [], 0.5
+    for s in range(0, life + 1):
+        if s in price_by:
+            lastp = price_by[s]
+        bp.append(lastp)
+        if s in yes_by:
+            lasty = yes_by[s]
+        yes.append(lasty)
+    if any(p is None for p in bp[:5]):
+        return {}
+    prof = {}
+    for k in range(0, max_lag + 1):
+        xs, ys = [], []
+        for t in range(3, life - k):
+            if bp[t] is None or bp[t - 3] is None:
+                continue
+            xs.append((bp[t] - bp[t - 3]) / bp[t - 3])       # BTC 3s return at t
+            ys.append(yes[t + k] - yes[t])                    # YES change over next k
+        prof[k] = _corr(xs, ys)
+    return prof
+
+
+def build_dataset(db: Session, *, limit_markets: int = 40, fetch_fn=None,
                   decision_fractions=DECISION_FRACTIONS) -> dict:
-    """Build synchronized decision-point rows for resolved BTC 5m/15m markets.
-    Idempotent per market (clears + rebuilds that market's points)."""
+    """Build synchronized decision-point rows for resolved BTC 5m/15m markets, with
+    a true 1s BTC series. Idempotent per market. Also computes the BTC->YES lag
+    profile + source-quality coverage."""
     markets = db.scalars(select(bm.Btc5mMarket).where(bm.Btc5mMarket.resolved.is_(True))
                          .order_by(bm.Btc5mMarket.created_time.desc()).limit(limit_markets)).all()
     st = _state(db)
@@ -247,8 +373,11 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
     source = None
     err = None
     if fetch_fn is None:
-        _dead_sources.clear()                            # fresh per build run
+        _dead_sources.clear()
     attempts = 0
+    cov_sum = miss_sum = stale_sum = res_max = cov_n = 0
+    lag_sum: dict[int, float] = {}
+    lag_n = 0
     for mk in markets:
         dur = _slug_duration(mk.slug, mk.question)
         life = (dur or 5) * 60
@@ -257,20 +386,24 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
         if not (start and end):
             continue
         attempts += 1
-        series, src = fetch_btc_series(start, end, fetch_fn=fetch_fn)
+        series, src, meta = fetch_btc_series(start, end, fetch_fn=fetch_fn)
         source = source or src
         if not series:
             err = "btc price unavailable"
-            # early-abort: if no BTC source is reachable, stop after a few tries
-            # (don't grind through every market with no data)
             if fetch_fn is None and all_btc_sources_dead() and attempts >= 3:
                 break
             continue
+        cov_sum += meta.get("coverage_pct", 0.0); miss_sum += meta.get("missing_s", 0)
+        stale_sum += meta.get("stale_s", 0); res_max = max(res_max, meta.get("resolution_s") or 0); cov_n += 1
         label_up = _market_label_up(mk, series)
         if label_up is None:
             continue
         trades = db.scalars(select(bm.Btc5mTrade).where(bm.Btc5mTrade.market_id == mk.market_id)).all()
-        # idempotent: clear this market's existing points
+        prof = _market_lag_profile(series, trades, life)
+        if prof:
+            for k, v in prof.items():
+                lag_sum[k] = lag_sum.get(k, 0.0) + v
+            lag_n += 1
         for old in db.scalars(select(lm.Btc5mLabPoint).where(lm.Btc5mLabPoint.market_id == mk.market_id)).all():
             db.delete(old)
         for frac in decision_fractions:
@@ -280,7 +413,7 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
                 continue
             pf = pm_flow_features(trades, t, bf["btc_ret_sofar"])
             feats = {**bf, **pf, "t_offset_s": t, "secs_to_expiry": life - t,
-                     "hour": (start.hour if start else 0), "duration_minutes": dur}
+                     "hour": (start.hour if start else 0), "duration_minutes": dur, "btc_source": src}
             db.add(lm.Btc5mLabPoint(
                 market_id=mk.market_id, duration_minutes=dur, t_offset_s=t, secs_to_expiry=life - t,
                 regime=_regime(feats), features=feats, pm_yes=pf.get("pm_yes"), spread=pf.get("spread"),
@@ -293,9 +426,15 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
     st.points_built = db.scalar(select(func.count()).select_from(lm.Btc5mLabPoint)) or 0
     st.btc_price_source = source
     st.btc_fetch_error = err
+    st.btc_resolution_s = res_max or None
+    st.btc_coverage_pct = round(cov_sum / cov_n, 1) if cov_n else 0.0
+    st.btc_missing_s = miss_sum
+    st.btc_stale_s = stale_sum
+    st.lag_profile = {str(k): round(v / lag_n, 4) for k, v in sorted(lag_sum.items())} if lag_n else {}
     st.dataset_built_at = datetime.utcnow()
     db.commit()
-    return {"markets_built": n_markets, "points_built": n_points, "btc_source": source, "btc_error": err}
+    return {"markets_built": n_markets, "points_built": n_points, "btc_source": source,
+            "btc_resolution_s": res_max or None, "btc_coverage_pct": st.btc_coverage_pct, "btc_error": err}
 
 
 def _assign_splits(db: Session) -> None:
@@ -322,7 +461,7 @@ def _assign_splits(db: Session) -> None:
 # ---------------------------------------------------------------------------
 # strategy families + backtest (pure)
 # ---------------------------------------------------------------------------
-STRATEGY_FAMILIES = ("btc_lead", "fade_overreaction", "flow_confirm")
+STRATEGY_FAMILIES = ("btc_lead", "btc_momentum", "btc_reversal", "fade_overreaction", "flow_confirm")
 
 
 def evaluate_strategy(p: dict, family: str, prm: dict) -> str | None:
@@ -340,14 +479,33 @@ def evaluate_strategy(p: dict, family: str, prm: dict) -> str | None:
     btc = p.get("btc_ret_sofar", 0.0)
 
     if family == "btc_lead":
-        # BTC has moved but YES hasn't fully repriced (lag) -> follow BTC
-        if abs(p.get("lag", 0.0)) < prm["min_lag"]:
+        # BTC moved over a SHORT (1s-resolution) horizon but YES hasn't repriced
+        bret = p.get(f"btc_ret_{prm['horizon']}s", 0.0)
+        if abs(bret) < prm["min_btc_move"]:
             return None
-        if abs(btc) < prm["min_btc_move"]:
+        if abs(p.get("pm_momentum", 0.0)) > prm["max_pm_move"]:    # YES already moved -> too late
             return None
-        if prm.get("require_momentum") and (btc > 0) != (p.get("btc_momentum", 0.0) > 0):
+        if prm.get("require_lag") and abs(p.get("lag", 0.0)) < 0.08:
             return None
-        return "YES" if btc > 0 else "NO"
+        return "YES" if bret > 0 else "NO"
+
+    if family == "btc_momentum":
+        # BTC trending over 3s AND 10s (aligned) -> continuation
+        r3, r10 = p.get("btc_ret_3s", 0.0), p.get("btc_ret_10s", 0.0)
+        if abs(r10) < prm["min_btc_move"] or (r3 > 0) != (r10 > 0):
+            return None
+        if prm.get("require_breakout") and p.get("btc_breakout", 0) == 0:
+            return None
+        return "YES" if r10 > 0 else "NO"
+
+    if family == "btc_reversal":
+        # short BTC move REVERSES the 30s trend, PM still stale -> trade the reversal
+        r5, r30 = p.get("btc_ret_5s", 0.0), p.get("btc_ret_30s", 0.0)
+        if abs(r5) < prm["min_btc_move"] or (r5 > 0) == (r30 > 0):
+            return None
+        if abs(p.get("pm_momentum", 0.0)) > prm["max_pm_move"]:
+            return None
+        return "YES" if r5 > 0 else "NO"
 
     if family == "fade_overreaction":
         # YES far from 0.5 but BTC barely moved -> PM overreacted -> fade
@@ -384,8 +542,9 @@ def _trade_pnl(direction: str, yes: float, spread: float, label_up: bool, slippa
     return profit, pe, win
 
 
-def backtest(points: list[dict], family: str, prm: dict, *, slippage: float = 0.0) -> dict:
-    """Backtest a strategy over decision-point dicts. Pure."""
+def backtest(points: list[dict], family: str, prm: dict, *, slippage: float = 0.0, latency: int = 0) -> dict:
+    """Backtest a strategy over decision-point dicts. Pure. `latency` (s) enters at
+    the YES price `latency` seconds later (yes_lat_L) to measure entry-latency cost."""
     profits, costs, wins, edges, spreads, drifts = [], [], [], [], [], []
     by_regime: dict[str, list] = {}
     by_dur: dict[str, list] = {}
@@ -394,7 +553,9 @@ def backtest(points: list[dict], family: str, prm: dict, *, slippage: float = 0.
         d = evaluate_strategy(p, family, prm)
         if d is None:
             continue
-        profit, cost, win = _trade_pnl(d, p["pm_yes"], p.get("spread", 0.0), p["label_up"], slippage)
+        entry_yes = p.get(f"yes_lat_{latency}", p["pm_yes"]) if latency else p["pm_yes"]
+        profit, cost, win = _trade_pnl(d, entry_yes if entry_yes is not None else p["pm_yes"],
+                                       p.get("spread", 0.0), p["label_up"], slippage)
         profits.append(profit); costs.append(cost); wins.append(1 if win else 0)
         edges.append(profit / cost if cost else 0.0)
         spreads.append((p.get("spread") or 0.0) / 2)
@@ -428,8 +589,12 @@ def _grid(family: str) -> list[dict]:
     base = dict(max_spread=[0.02, 0.05, 0.10], entry_min=[20, 40], entry_max=[150, 300],
                 min_secs_left=[30, 60])
     if family == "btc_lead":
-        space = {**base, "min_lag": [0.08, 0.15, 0.25], "min_btc_move": [0.0003, 0.0008],
-                 "require_momentum": [False, True]}
+        space = {**base, "horizon": [2, 3, 5], "min_btc_move": [0.0002, 0.0005, 0.001],
+                 "max_pm_move": [0.02, 0.05], "require_lag": [False, True]}
+    elif family == "btc_momentum":
+        space = {**base, "min_btc_move": [0.0003, 0.0008, 0.0015], "require_breakout": [False, True]}
+    elif family == "btc_reversal":
+        space = {**base, "min_btc_move": [0.0003, 0.0008], "max_pm_move": [0.02, 0.05]}
     elif family == "fade_overreaction":
         space = {**base, "min_yes_dev": [0.15, 0.25, 0.35], "max_btc_move": [0.0003, 0.0006]}
     else:  # flow_confirm
@@ -579,6 +744,43 @@ def edge_decay(db: Session) -> dict:
     return {"strategy": best.name, "buckets": buckets}
 
 
+def btc_source_quality(db: Session) -> dict:
+    st = _state(db)
+    return {"source": st.btc_price_source, "resolution_s": st.btc_resolution_s,
+            "coverage_pct": st.btc_coverage_pct, "missing_s": st.btc_missing_s,
+            "stale_s": st.btc_stale_s, "fetch_error": st.btc_fetch_error,
+            "is_true_1s": st.btc_resolution_s == 1}
+
+
+def lag_report(db: Session) -> dict:
+    """BTC -> Polymarket lead/lag from the 1s cross-correlation profile: at which
+    lag (seconds) does BTC's recent move best predict the YES price change?"""
+    st = _state(db)
+    prof = {int(k): v for k, v in (st.lag_profile or {}).items()}
+    if not prof:
+        return {"profile": {}, "peak_lag_s": None, "peak_corr": None, "btc_leads": False}
+    peak_lag = max(prof, key=lambda k: prof[k])
+    peak_corr = prof[peak_lag]
+    # BTC leads if the cross-corr peaks at a POSITIVE lag with a meaningful corr,
+    # and that peak beats the contemporaneous (lag 0) value.
+    btc_leads = peak_lag > 0 and peak_corr >= 0.05 and peak_corr > prof.get(0, 0) + 0.01
+    return {"profile": {str(k): prof[k] for k in sorted(prof)},
+            "peak_lag_s": peak_lag, "peak_corr": round(peak_corr, 4),
+            "lag0_corr": round(prof.get(0, 0), 4), "btc_leads": btc_leads,
+            "resolution_s": st.btc_resolution_s,
+            "interpretation": "peak cross-corr at lag k>0 => BTC's move predicts YES's move k seconds later => BTC leads"}
+
+
+def latency_curve(db: Session, strat) -> list[dict]:
+    """Holdout ROI of a strategy entering 0/1/2/3/5 seconds late (entry-latency cost)."""
+    hold = _point_dicts(db, "holdout")
+    out = []
+    for L in (0, 1, 2, 3, 5):
+        m = backtest(hold, strat.family, strat.params, slippage=0.01, latency=L)
+        out.append({"latency_s": L, "roi": m["roi"], "trades": m["trades"], "avg_edge": m["avg_edge"]})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # report — which opportunity is best?
 # ---------------------------------------------------------------------------
@@ -588,38 +790,45 @@ def build_report(db: Session) -> dict:
     lag = lag_analysis(db)
     large = large_trade_analysis(db)
     flow = flow_imbalance_analysis(db)
+    src_q = btc_source_quality(db)
+    lagr = lag_report(db)
     best = accepted[0] if accepted else None
     by_family = {}
     for s in accepted:
         by_family.setdefault(s.family, []).append(s.robust_score)
     fam_best = {k: max(v) for k, v in by_family.items()}
 
-    # classify
-    verdicts = []
-    if best is None:
-        code, headline = 5, "no durable edge found (no strategy survived holdout with positive edge)"
+    # 4-option verdict: btc_lead_edge / order_flow_edge_only / no_durable_edge /
+    # data_insufficient.
+    btc_families = {"btc_lead", "btc_momentum", "btc_reversal"}
+    if not src_q["is_true_1s"] or src_q["coverage_pct"] < 70 or (_state(db).points_built or 0) < 60:
+        code, verdict = 4, "data still insufficient"
+        headline = (f"data still insufficient — BTC source {src_q['source']} "
+                    f"({src_q['resolution_s']}s res, {src_q['coverage_pct']}% coverage)")
+    elif best is None:
+        code, verdict, headline = 3, "no durable edge", \
+            "no durable edge found (no strategy survived holdout with positive edge after costs)"
+    elif best.family in btc_families:
+        code, verdict = 1, "BTC-lead edge found"
+        headline = (f"BTC-lead edge: '{best.name}' (holdout ROI {best.roi:.1%}, {best.trades} trades); "
+                    f"BTC leads PM by ~{lagr.get('peak_lag_s')}s (peak corr {lagr.get('peak_corr')})")
+    elif best.family == "flow_confirm":
+        code, verdict, headline = 2, "order-flow edge only", \
+            f"order-flow edge only: '{best.name}' (holdout ROI {best.roi:.1%})"
     else:
-        fam = best.family
-        if fam == "btc_lead" and lag["lag_vs_resolution_corr"] > 0.1:
-            code, headline = 1, "BTC price leads Polymarket repricing"
-        elif fam == "flow_confirm" and flow["flow_vs_resolution_corr"] > 0.1:
-            code, headline = 2, "Polymarket order flow predicts resolution"
-        elif large["large_trade_dir_hit_rate"] > large["baseline_dir_hit_rate"] + 0.08:
-            code, headline = 3, "large trades predict short-term movement"
-        elif fam == "fade_overreaction":
-            code, headline = 4, "mean reversion after overreaction"
-        elif fam == "btc_lead":
-            code, headline = 1, "BTC price leads Polymarket repricing"
-        elif fam == "flow_confirm":
-            code, headline = 2, "Polymarket order flow predicts resolution"
-        else:
-            code, headline = 5, "edge present but not cleanly attributable"
+        code, verdict, headline = 3, "no durable edge", \
+            f"edge present but not a BTC-lead/flow edge ('{best.family}')"
+
     report = {
-        "verdict_code": code, "headline": headline,
+        "verdict_code": code, "verdict": verdict, "headline": headline,
+        "btc_source_quality": src_q,
+        "lag_report": lagr,
         "best_strategy": ({"name": best.name, "family": best.family, "params": best.params,
                            "holdout_roi": best.roi, "holdout_trades": best.trades,
                            "win_rate": best.win_rate, "profit_factor": best.profit_factor,
-                           "robust_score": best.robust_score} if best else None),
+                           "max_drawdown": best.max_drawdown, "avg_edge": best.avg_edge,
+                           "robust_score": best.robust_score, "metrics": best.metrics,
+                           "latency_curve": latency_curve(db, best)} if best else None),
         "family_best_scores": fam_best,
         "lag_analysis": lag, "large_trade_analysis": large, "flow_imbalance_analysis": flow,
         "n_accepted": len(accepted),
@@ -669,6 +878,10 @@ def status(db: Session) -> dict:
     return {
         "markets_built": st.markets_built, "points_built": n_pts, "by_split": by_split,
         "by_duration": by_dur, "btc_price_source": st.btc_price_source, "btc_fetch_error": st.btc_fetch_error,
+        "btc_source_quality": {"source": st.btc_price_source, "resolution_s": st.btc_resolution_s,
+                               "coverage_pct": st.btc_coverage_pct, "missing_s": st.btc_missing_s,
+                               "stale_s": st.btc_stale_s, "is_true_1s": st.btc_resolution_s == 1},
+        "lag_profile": st.lag_profile or {},
         "dataset_built_at": st.dataset_built_at.isoformat() if st.dataset_built_at else None,
         "strategies_tested": st.strategies_tested, "strategies_accepted": st.strategies_accepted,
         "last_search_at": st.last_search_at.isoformat() if st.last_search_at else None,

@@ -35,40 +35,57 @@ def test_pm_flow_features_and_lag():
 def _point(**over):
     base = dict(pm_yes=0.55, spread=0.0, t_offset_s=60, secs_to_expiry=240, duration_minutes=5,
                 regime="mixed", btc_ret_sofar=0.0008, btc_momentum=0.5, lag=0.18,
-                recent_flow_imbalance=0.6, has_large_trade=1, flow_imbalance=0.6,
-                pm_momentum=0.02, label_up=True)
+                btc_ret_1s=0.0003, btc_ret_2s=0.0006, btc_ret_3s=0.0008, btc_ret_5s=0.001,
+                btc_ret_10s=0.0012, btc_ret_20s=0.0014, btc_ret_30s=0.0015, btc_ret_60s=0.0015,
+                btc_acceleration=0.1, btc_breakout=1, pm_momentum=0.0,
+                yes_lat_1=0.55, yes_lat_2=0.55, yes_lat_3=0.55, yes_lat_5=0.56,
+                recent_flow_imbalance=0.6, has_large_trade=1, flow_imbalance=0.6, label_up=True)
     base.update(over)
     return base
 
 
+_BL = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
+           horizon=3, min_btc_move=0.0003, max_pm_move=0.05, require_lag=False)
+
+
 # --- strategy families + backtest -------------------------------------------
 def test_evaluate_btc_lead():
-    prm = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
-               min_lag=0.1, min_btc_move=0.0003, require_momentum=False)
-    assert lab.evaluate_strategy(_point(), "btc_lead", prm) == "YES"          # BTC up + lag
-    assert lab.evaluate_strategy(_point(btc_ret_sofar=-0.001, lag=-0.2), "btc_lead", prm) == "NO"
-    assert lab.evaluate_strategy(_point(lag=0.02), "btc_lead", prm) is None    # no lag
-    assert lab.evaluate_strategy(_point(spread=0.2), "btc_lead", prm) is None  # spread filter
+    assert lab.evaluate_strategy(_point(), "btc_lead", _BL) == "YES"            # BTC up (3s) + PM not moved
+    assert lab.evaluate_strategy(_point(btc_ret_3s=-0.001), "btc_lead", _BL) == "NO"
+    assert lab.evaluate_strategy(_point(btc_ret_3s=0.0001), "btc_lead", _BL) is None  # BTC barely moved
+    assert lab.evaluate_strategy(_point(pm_momentum=0.2), "btc_lead", _BL) is None     # YES already repriced
+    assert lab.evaluate_strategy(_point(spread=0.2), "btc_lead", _BL) is None          # spread filter
+
+
+def test_evaluate_momentum_reversal():
+    pm = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
+              min_btc_move=0.0003, require_breakout=False)
+    assert lab.evaluate_strategy(_point(btc_ret_3s=0.001, btc_ret_10s=0.0012), "btc_momentum", pm) == "YES"
+    assert lab.evaluate_strategy(_point(btc_ret_3s=0.001, btc_ret_10s=-0.0012), "btc_momentum", pm) is None  # not aligned
+    rv = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30, min_btc_move=0.0003, max_pm_move=0.05)
+    # 5s up reverses 30s down, PM stale -> YES
+    assert lab.evaluate_strategy(_point(btc_ret_5s=0.001, btc_ret_30s=-0.001), "btc_reversal", rv) == "YES"
 
 
 def test_evaluate_fade_and_flow():
     prm_f = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
                  min_yes_dev=0.2, max_btc_move=0.0003)
-    # YES far from 0.5 (0.8) but BTC flat -> fade -> NO
     assert lab.evaluate_strategy(_point(pm_yes=0.8, btc_ret_sofar=0.0001), "fade_overreaction", prm_f) == "NO"
     prm_fl = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
                   min_imbalance=0.3, require_btc_confirm=True, require_large=False)
     assert lab.evaluate_strategy(_point(recent_flow_imbalance=0.6, btc_ret_sofar=0.001), "flow_confirm", prm_fl) == "YES"
 
 
-def test_backtest_metrics():
-    prm = dict(max_spread=0.1, entry_min=20, entry_max=150, min_secs_left=30,
-               min_lag=0.1, min_btc_move=0.0003, require_momentum=False)
+def test_backtest_metrics_and_latency():
     wins = [_point() for _ in range(8)]                       # YES @0.55, up -> win
-    losses = [_point(label_up=False) for _ in range(2)]       # YES @0.55, down -> lose
-    m = lab.backtest(wins + losses, "btc_lead", prm, slippage=0.01)
+    losses = [_point(label_up=False) for _ in range(2)]
+    m = lab.backtest(wins + losses, "btc_lead", _BL, slippage=0.01)
     assert m["trades"] == 10 and m["win_rate"] == 0.8 and m["roi"] > 0
     assert m["profit_factor"] > 1 and "5" in m["by_duration"]
+    # latency: entering 5s late pays yes_lat_5 (0.56 vs 0.55) -> slightly worse ROI
+    m0 = lab.backtest(wins + losses, "btc_lead", _BL, slippage=0.01, latency=0)
+    m5 = lab.backtest(wins + losses, "btc_lead", _BL, slippage=0.01, latency=5)
+    assert m5["roi"] <= m0["roi"]
 
 
 # --- dataset build (injected BTC price) -------------------------------------
@@ -127,12 +144,27 @@ def test_build_dataset_creates_points_and_splits(in_memory_db):
 
 # --- search: real edge accepted, overfit rejected ---------------------------
 def _insert_point(db, *, split, label_up, **f):
+    if "btc_ret_sofar" in f:                              # keep all BTC horizons aligned in sign
+        for k in ("btc_ret_1s", "btc_ret_2s", "btc_ret_3s", "btc_ret_5s",
+                  "btc_ret_10s", "btc_ret_20s", "btc_ret_30s", "btc_ret_60s"):
+            f.setdefault(k, f["btc_ret_sofar"])
     feats = _point(**f)
     db.add(lm.Btc5mLabPoint(market_id=f.get("market_id", "mx"), duration_minutes=5,
                             t_offset_s=feats["t_offset_s"], secs_to_expiry=feats["secs_to_expiry"],
                             regime="mixed", features=feats, pm_yes=feats["pm_yes"], spread=feats["spread"],
-                            btc_ret_30s=0.0, flow_imbalance=feats["flow_imbalance"],
+                            btc_ret_30s=feats.get("btc_ret_30s", 0.0), flow_imbalance=feats["flow_imbalance"],
                             label_up=label_up, split=split))
+
+
+def _set_quality(db):
+    """Mark the dataset as true-1s with good coverage so the report verdict is not
+    'data insufficient' (direct-insert tests don't go through build_dataset)."""
+    st = lab._state(db)
+    st.btc_resolution_s = 1
+    st.btc_coverage_pct = 99.0
+    st.points_built = db.scalar(select(func.count()).select_from(lm.Btc5mLabPoint)) or 0
+    st.lag_profile = {"0": 0.02, "1": 0.05, "2": 0.12, "3": 0.09, "4": 0.06}
+    db.commit()
 
 
 def test_search_accepts_real_edge_and_rejects_overfit(in_memory_db):
@@ -155,7 +187,7 @@ def test_search_accepts_real_edge_and_rejects_overfit(in_memory_db):
     lb = lab.leaderboard(db)
     assert len(lb["accepted"]) >= 1
     top = lb["accepted"][0]
-    assert top["family"] == "btc_lead" and top["roi"] > 0 and not top["overfit"]
+    assert top["family"] in ("btc_lead", "btc_momentum") and top["roi"] > 0 and not top["overfit"]
 
 
 def test_search_no_edge_finds_nothing(in_memory_db):
@@ -202,8 +234,11 @@ def test_report_classifies_btc_lead(in_memory_db):
                           btc_ret_sofar=-0.001, lag=-0.2)
     db.commit()
     lab.run_search(db, min_train_trades=5)
+    _set_quality(db)                                      # mark as true-1s w/ good coverage
     rep = lab.build_report(db)
-    assert rep["verdict_code"] == 1 and "BTC" in rep["headline"]
+    assert rep["verdict_code"] == 1 and "BTC-lead" in rep["headline"]
+    assert rep["btc_source_quality"]["is_true_1s"] is True
+    assert rep["lag_report"]["peak_lag_s"] == 2           # injected peak at lag 2
     assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0   # paper-only
 
 

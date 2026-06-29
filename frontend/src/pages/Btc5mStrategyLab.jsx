@@ -13,36 +13,64 @@ const ago = (iso) => {
 }
 
 const VERDICT = {
-  1: { kind: 'yes', label: 'BTC leads Polymarket repricing' },
-  2: { kind: 'yes', label: 'Order flow predicts resolution' },
-  3: { kind: 'open', label: 'Large trades predict movement' },
-  4: { kind: 'open', label: 'Mean reversion after overreaction' },
-  5: { kind: 'bad', label: 'No durable edge found' },
+  1: { kind: 'yes', label: 'BTC-lead edge found' },
+  2: { kind: 'open', label: 'Order-flow edge only' },
+  3: { kind: 'bad', label: 'No durable edge' },
+  4: { kind: 'warn', label: 'Data still insufficient' },
+  5: { kind: 'bad', label: 'No durable edge' },
 }
 
 // Pure presentational report — exported for tests.
 export function LabReport({ report }) {
   if (!report) return <Empty>No report yet — build the dataset and run the search.</Empty>
-  const v = VERDICT[report.verdict_code] || VERDICT[5]
+  const v = VERDICT[report.verdict_code] || VERDICT[3]
   const b = report.best_strategy
+  const sq = report.btc_source_quality || {}
+  const lr = report.lag_report || {}
   return (
     <div data-testid="lab-report">
-      <div className={`diag-strip ${v.kind === 'bad' ? 'neg' : ''}`} data-testid="verdict-banner">
-        🏁 Verdict #{report.verdict_code}: <b>{report.headline}</b>
+      <div className={`diag-strip ${['bad', 'warn'].includes(v.kind) ? 'neg' : ''}`} data-testid="verdict-banner">
+        🏁 Verdict #{report.verdict_code} ({v.label}): <b>{report.headline}</b>
       </div>
       <div className="cards">
-        <div className="card"><div className="label">Best independent strategy</div>
+        <div className="card"><div className="label">BTC source</div>
+          <div className={`value ${sq.is_true_1s ? 'pos' : 'neg'}`}>{sq.source || '—'}</div>
+          <div className="sub">{sq.resolution_s}s res · {pct((sq.coverage_pct ?? 0) / 100)} coverage · {sq.stale_s ?? 0} stale s</div></div>
+        <div className="card"><div className="label">BTC leads PM by</div>
+          <div className={`value ${lr.btc_leads ? 'pos' : ''}`} data-testid="lag-peak">{lr.peak_lag_s == null ? '—' : `${lr.peak_lag_s}s`}</div>
+          <div className="sub">peak corr {num(lr.peak_corr, 3)} {lr.btc_leads ? '· BTC LEADS' : ''}</div></div>
+        <div className="card"><div className="label">Best strategy</div>
           <div className="value">{b ? b.name : '—'}</div>
           <div className="sub">{b ? `${b.family} · holdout ROI ${pct(b.holdout_roi)} · ${b.holdout_trades} trades` : 'none survived holdout'}</div></div>
         <div className="card"><div className="label">Accepted strategies</div><div className="value">{report.n_accepted ?? 0}</div></div>
-        <div className="card"><div className="label">BTC→PM lag corr</div>
-          <div className={`value ${report.lag_analysis?.lag_vs_resolution_corr > 0.1 ? 'pos' : ''}`}>{num(report.lag_analysis?.lag_vs_resolution_corr, 3)}</div>
-          <div className="sub">BTC leads when &gt; 0.1</div></div>
         <div className="card"><div className="label">Flow→resolution corr</div>
           <div className={`value ${report.flow_imbalance_analysis?.flow_vs_resolution_corr > 0.1 ? 'pos' : ''}`}>{num(report.flow_imbalance_analysis?.flow_vs_resolution_corr, 3)}</div></div>
-        <div className="card"><div className="label">Large-trade hit vs base</div>
-          <div className="value">{pct(report.large_trade_analysis?.large_trade_dir_hit_rate)} / {pct(report.large_trade_analysis?.baseline_dir_hit_rate)}</div></div>
       </div>
+
+      {lr.profile && Object.keys(lr.profile).length > 0 && (
+        <div className="panel" style={{ marginTop: 8 }}>
+          <div className="label">BTC→Polymarket lag profile (cross-corr by lag seconds)</div>
+          <div className="small mono" data-testid="lag-profile">
+            {Object.entries(lr.profile).map(([k, val]) => (
+              <span key={k} style={{ marginRight: 10 }} className={val === lr.peak_corr ? 'pos' : ''}>{k}s:{num(val, 3)}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {b?.latency_curve?.length > 0 && (
+        <div className="panel" style={{ marginTop: 8 }}>
+          <div className="label">Entry-latency sensitivity — {b.name} (holdout ROI)</div>
+          <div className="table-wrap"><table data-testid="latency-curve">
+            <thead><tr><th>Latency (s)</th><th className="right">ROI</th><th className="right">Trades</th><th className="right">Avg edge</th></tr></thead>
+            <tbody>{b.latency_curve.map((c) => (
+              <tr key={c.latency_s}><td>{c.latency_s}s</td><td className={`right ${c.roi > 0 ? 'pos' : 'neg'}`}>{pct(c.roi)}</td>
+                <td className="right">{c.trades}</td><td className="right">{num(c.avg_edge, 3)}</td></tr>
+            ))}</tbody>
+          </table></div>
+        </div>
+      )}
+
       <div className="cards" style={{ marginTop: 8 }}>
         {Object.entries(report.family_best_scores || {}).map(([f, s]) => (
           <div key={f} className="card"><div className="label">{f}</div><div className="value">{num(s, 1)}</div><div className="sub">best robust score</div></div>

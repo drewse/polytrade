@@ -101,6 +101,13 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "stats_updated": "BOOLEAN DEFAULT 0",
     },
     "ingest_status": {"last_discovery_at": "DATETIME"},
+    "btc5m_lab_state": {
+        "btc_resolution_s": "INTEGER",
+        "btc_coverage_pct": "FLOAT DEFAULT 0",
+        "btc_missing_s": "INTEGER DEFAULT 0",
+        "btc_stale_s": "INTEGER DEFAULT 0",
+        "lag_profile": "JSON",
+    },
     # BTC 5M on-chain detector read-only diagnostics added after the table shipped.
     "btc5m_onchain_state": {
         "blocks_scanned": "BIGINT DEFAULT 0",
