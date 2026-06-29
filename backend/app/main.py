@@ -8,7 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_micro_test_worker, btc5m_models, btc5m_onchain_models, btc5m_onchain_source, btc5m_strategy_lab, btc5m_strategy_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
+from . import attribution, auto_worker, btc5m, btc5m_micro_test, btc5m_micro_test_models, btc5m_micro_test_worker, btc5m_models, btc5m_onchain_models, btc5m_onchain_source, btc5m_strategy_models, challenger, challenger_models, deep_backfill, discovery, live, market_intel, market_intel_models, research, research_models, services, top20, wallet_approval, wallet_approval_models, wallet_audit, wallet_audit_models  # noqa: F401  (model imports register tables for create_all)
+# aliased: the btc5m research module already defines an endpoint function named
+# `btc5m_strategy_lab` (for /api/btc5m/strategy-lab), which would shadow the module.
+from . import btc5m_strategy_lab as strat_lab  # noqa: E402
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -768,43 +771,43 @@ def _lab_safe(fn, db):
 
 @app.get("/api/btc5m/lab/status", response_model=MessageOut)
 def btc5m_lab_status(db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut(message="btc5m strategy lab status", detail=_lab_safe(btc5m_strategy_lab.status, db))
+    return MessageOut(message="btc5m strategy lab status", detail=_lab_safe(strat_lab.status, db))
 
 
 @app.post("/api/btc5m/lab/build-dataset", response_model=MessageOut)
 def btc5m_lab_build(limit_markets: int = 80, db: Session = Depends(get_db)) -> MessageOut:
     """Build the synchronized BTC-spot + Polymarket + order-flow dataset. Paper-only."""
     return MessageOut(message="btc5m lab build",
-                      detail=_lab_safe(lambda d: btc5m_strategy_lab.build_dataset(d, limit_markets=limit_markets), db))
+                      detail=_lab_safe(lambda d: strat_lab.build_dataset(d, limit_markets=limit_markets), db))
 
 
 @app.post("/api/btc5m/lab/search", response_model=MessageOut)
 def btc5m_lab_search(db: Session = Depends(get_db)) -> MessageOut:
     """Generate + backtest strategies (train/val/holdout), reject overfit, rank robust."""
     def _run(d):
-        res = btc5m_strategy_lab.run_search(d)
-        btc5m_strategy_lab.build_report(d)
+        res = strat_lab.run_search(d)
+        strat_lab.build_report(d)
         return res
     return MessageOut(message="btc5m lab search", detail=_lab_safe(_run, db))
 
 
 @app.get("/api/btc5m/lab/leaderboard", response_model=MessageOut)
 def btc5m_lab_leaderboard(limit: int = 40, db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut(message="btc5m lab leaderboard", detail=btc5m_strategy_lab.leaderboard(db, limit=limit))
+    return MessageOut(message="btc5m lab leaderboard", detail=strat_lab.leaderboard(db, limit=limit))
 
 
 @app.get("/api/btc5m/lab/analyses", response_model=MessageOut)
 def btc5m_lab_analyses(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m lab analyses", detail={
-        "lag": btc5m_strategy_lab.lag_analysis(db),
-        "large_trade": btc5m_strategy_lab.large_trade_analysis(db),
-        "flow_imbalance": btc5m_strategy_lab.flow_imbalance_analysis(db),
-        "edge_decay": btc5m_strategy_lab.edge_decay(db)})
+        "lag": strat_lab.lag_analysis(db),
+        "large_trade": strat_lab.large_trade_analysis(db),
+        "flow_imbalance": strat_lab.flow_imbalance_analysis(db),
+        "edge_decay": strat_lab.edge_decay(db)})
 
 
 @app.get("/api/btc5m/lab/report", response_model=MessageOut)
 def btc5m_lab_report(db: Session = Depends(get_db)) -> MessageOut:
-    return MessageOut(message="btc5m lab report", detail=btc5m_strategy_lab.build_report(db))
+    return MessageOut(message="btc5m lab report", detail=strat_lab.build_report(db))
 
 
 # ===========================================================================
