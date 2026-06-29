@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import btc5m_alpha_research as ph1
@@ -123,7 +123,7 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
         for tr in trades_by.get(r.market_id, []):
             d = (tr.seconds_from_creation or 0) - t
             if 0 < d <= horizon:
-                future.append((d, _yes_price(tr)))
+                future.append((d, _yes_price(tr), float(tr.usd_value or 0.0)))   # carry trade SIZE for queue sim
         signals.append({
             "market_id": r.market_id, "t": t, "mid": m, "half": half, "side": side,
             "model_prob": p, "edge": abs(edge), "up": bool(r.label_up),
@@ -131,6 +131,8 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
             "duration_minutes": r.duration_minutes or 5,
             "btc_vol": _num(f.get("btc_vol")), "volume_usd": _num(f.get("volume_usd")),
             "flow_imbalance": _num(f.get("flow_imbalance")), "btc_ret_sofar": _num(f.get("btc_ret_sofar")),
+            "spread_w": 2 * half, "has_large_trade": _num(f.get("has_large_trade")),
+            "lag": _num(f.get("lag")), "hour": int(_num(f.get("hour"))),
             "future": future,
         })
     return signals
@@ -141,13 +143,52 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
 # ---------------------------------------------------------------------------
 def _first_cross(sig: dict, target: float, *, up_cross: bool, timeout: float) -> float | None:
     """Delay (s) of the first subsequent trade that crosses `target`. up_cross=True ⇒
-    a NO bid needs yes-price to rise to target; False ⇒ a YES bid needs it to fall."""
-    for d, yp in sig["future"]:
+    a NO bid needs yes-price to rise to target; False ⇒ a YES bid needs it to fall.
+    This is the BEST-CASE (touch / front-of-queue) fill."""
+    for e in sig["future"]:
+        d, yp = e[0], e[1]
         if d > timeout:
             break
         if (up_cross and yp >= target) or (not up_cross and yp <= target):
             return d
     return None
+
+
+# --- queue-position models (NO L2 book in the data → bracket reality) --------
+# best  : touch-fill — we are at the FRONT of the queue, fill on first touch.
+# mid   : proportional — fill only after `queue_ahead_usd` of volume clears at our
+#         level (one typical resting order ahead of us), then our 5-share order fills.
+# worst : behind-all — fill only when a trade prints THROUGH our price (≥1 tick past),
+#         i.e. the whole level (including us) was swept.
+QUEUE_MODES = ("best", "mid", "worst")
+
+
+def _queue_fill(sig: dict, target: float, *, up_cross: bool, timeout: float, mode: str,
+                our_usd: float, queue_ahead_usd: float, tick: float = DEFAULT_TICK):
+    """Returns (fill_delay or None, fill_fraction). Uses the historical trade SIZE
+    stream as a proxy for queue consumption (we have no L2 book)."""
+    cum = 0.0
+    for e in sig["future"]:
+        d, yp = e[0], e[1]
+        sz = e[2] if len(e) > 2 else our_usd
+        if d > timeout:
+            break
+        crosses = (up_cross and yp >= target) or (not up_cross and yp <= target)
+        through = (up_cross and yp >= target + tick) or (not up_cross and yp <= target - tick)
+        if mode == "best":
+            if crosses:
+                return d, 1.0
+        elif mode == "worst":
+            if through:
+                return d, 1.0
+        else:  # mid — cumulative volume must clear the queue ahead, then fill us
+            if crosses:
+                cum += sz
+                if cum >= queue_ahead_usd:
+                    frac = min(1.0, max(0.0, (cum - queue_ahead_usd) / our_usd))
+                    if frac > 0:
+                        return d, frac
+    return None, 0.0
 
 
 def _passive_entry(sig: dict, *, improve_ticks: int = 0):
@@ -236,6 +277,54 @@ def simulate_method(sig: dict, method: str, *, timeout: float | None = 2.0, ev_t
         return out                                              # missed fill
     pnl = _pnl(side, entry, up)
     out.update(filled=True, entry=entry, pnl=pnl, delay=delay, win=pnl > 0,
+               spread_captured=round(m - entry if side == "YES" else (1 - m) - entry, 4))
+    return out
+
+
+def simulate_queue(sig: dict, policy: str, *, timeout: float | None, mode: str,
+                   our_shares: float = 5.0, queue_ahead_usd: float = 25.0, ev_threshold: float = 0.0):
+    """Queue-position-aware simulation for the maker policies. Same result shape as
+    simulate_method, plus `frac` (fill fraction) — best/mid/worst bracket where our
+    5-share order sits in an unobservable queue."""
+    side, up, m, h = sig["side"], sig["up"], sig["mid"], sig["half"]
+    to = _eff_timeout(sig, timeout)
+    out = {"side": side, "up": up, "taker_pnl": _pnl(side, _taker_entry(sig), up),
+           "regime": sig["regime"], "btc_vol": sig["btc_vol"], "volume_usd": sig["volume_usd"],
+           "secs_to_expiry": sig["secs_to_expiry"], "duration_minutes": sig.get("duration_minutes", 5),
+           "mid": m, "filled": False, "entry": None, "pnl": 0.0, "delay": None,
+           "spread_captured": 0.0, "win": None, "matched": False, "frac": 0.0}
+
+    if policy == "two_sided":
+        ybid, yask = _clip(m - h, .01, .99), _clip(m + h, .01, .99)
+        ub = our_shares * ybid
+        db_, fb = _queue_fill(sig, ybid, up_cross=False, timeout=to, mode=mode, our_usd=ub, queue_ahead_usd=queue_ahead_usd)
+        da_, fa = _queue_fill(sig, yask, up_cross=True, timeout=to, mode=mode, our_usd=our_shares * yask, queue_ahead_usd=queue_ahead_usd)
+        if db_ is not None and da_ is not None:
+            out.update(filled=True, matched=True, entry=round((ybid + yask) / 2, 4), pnl=round(yask - ybid, 4),
+                       win=True, delay=max(db_, da_), spread_captured=round(yask - ybid, 4), frac=min(fb, fa))
+        elif db_ is not None:
+            pnl = _pnl("YES", ybid, up)
+            out.update(filled=True, side="YES", entry=ybid, pnl=pnl, win=pnl > 0, delay=db_,
+                       spread_captured=round(m - ybid, 4), frac=fb)
+        elif da_ is not None:
+            pnl = _pnl("NO", _clip(1 - yask, .01, .99), up)
+            out.update(filled=True, side="NO", entry=_clip(1 - yask, .01, .99), pnl=pnl, win=pnl > 0,
+                       delay=da_, spread_captured=round(yask - m, 4), frac=fa)
+        return out
+
+    improve = 1 if policy == "improve_bid" else 0
+    entry, target, up_cross = _passive_entry(sig, improve_ticks=improve)
+    if policy == "fair_value_maker":
+        bid_edge = (sig["model_prob"] - entry) if side == "YES" else ((1 - entry) - (1 - sig["model_prob"]))
+        if bid_edge <= ev_threshold:
+            return out
+    eff = min(to, 1.0) if policy == "adaptive" else to
+    delay, frac = _queue_fill(sig, target, up_cross=up_cross, timeout=eff, mode=mode,
+                              our_usd=our_shares * entry, queue_ahead_usd=queue_ahead_usd)
+    if delay is None:
+        return out
+    pnl = _pnl(side, entry, up)
+    out.update(filled=True, entry=entry, pnl=pnl, delay=delay, win=pnl > 0, frac=frac,
                spread_captured=round(m - entry if side == "YES" else (1 - m) - entry, 4))
     return out
 
@@ -591,6 +680,7 @@ def execution_status(db: Session) -> dict:
     return {"execution": st.execution,
             "execution_built_at": st.execution_built_at.isoformat() if st.execution_built_at else None,
             "sweep": (st.execution or {}).get("sweep") if isinstance(st.execution, dict) else None,
+            "queue_study": (st.execution or {}).get("queue_study") if isinstance(st.execution, dict) else None,
             "safety": _safety()}
 
 
@@ -687,6 +777,183 @@ def run_rest_window_sweep(db: Session) -> dict:
     st.execution_built_at = datetime.utcnow()
     db.commit()
     return sweep
+
+
+def data_availability(db: Session) -> dict:
+    """What execution-realism data do we actually have? (Checked, not assumed.)"""
+    n_book = db.scalar(select(func.count()).select_from(bm.Btc5mMarket)
+                       .where(bm.Btc5mMarket.orderbook_snapshot.isnot(None))) or 0
+    durs = sorted({d for (d,) in db.execute(select(lm.Btc5mLabPoint.duration_minutes).distinct()).all() if d})
+    return {
+        "l2_book_depth": "NONE — orderbook_snapshot is never populated; no time-series book",
+        "markets_with_any_book_snapshot": n_book,
+        "trade_stream": "YES — 1-second trades with price + size (usd_value) — used as queue proxy",
+        "assets": "BTC only (indexer regex matches btc/bitcoin; no ETH/SOL markets indexed)",
+        "durations_present_min": durs,
+        "hourly_available": 60 in durs,
+        "consequence": "queue position cannot be measured directly → bracket with best/mid/worst assumptions; "
+                       "sample cannot expand beyond BTC 5m+15m without indexing new markets",
+    }
+
+
+def _fills_per_day_frac(sigs: list[dict], results: list[dict]) -> float:
+    """Operational fills/day in full-order-equivalents (scaled by partial-fill fraction)."""
+    by_dur: dict = {}
+    for s, r in zip(sigs, results):
+        by_dur.setdefault(s["duration_minutes"], [0, 0.0])
+        by_dur[s["duration_minutes"]][0] += 1
+        by_dur[s["duration_minutes"]][1] += (r.get("frac", 1.0) if r["filled"] else 0.0)
+    fpd = 0.0
+    for dur, (n, feq) in by_dur.items():
+        fpd += MARKETS_PER_DAY.get(dur, 0) * (feq / n if n else 0.0)
+    return round(fpd, 1)
+
+
+QUEUE_TIMEOUTS = (1, 2, 3, 5, 8, 10, 15)
+QUEUE_POLICIES = ("join_bid", "improve_bid", "fair_value_maker", "adaptive", "two_sided")
+
+
+def _queue_gate_row(uname, policy, to, mode, sigs, q_usd) -> dict:
+    res = [simulate_queue(s, policy, timeout=to, mode=mode, queue_ahead_usd=q_usd) for s in sigs]
+    m = _metrics(res)
+    fpd = _fills_per_day_frac(sigs, res)
+    ev = m["ev_after_cost"]
+    hold = _mean([r["secs_to_expiry"] * 0.5 for r in res if r["filled"]]) or 0.0
+    conc = round(fpd * hold / 86400.0, 3)
+    return {"universe": uname, "policy": policy, "timeout_s": to, "queue": mode,
+            "quote_opportunities": m["signals"], "fills": m["fills"], "fill_rate": m["fill_rate"],
+            "fills_per_day": fpd, "ev_per_fill": ev, "ev_per_day": round(fpd * ev, 4), "roi": m["roi"],
+            "profit_factor": m["profit_factor"], "sharpe": m["sharpe"], "max_drawdown": m["max_drawdown"],
+            "t_stat": m["t_stat"], "ci": m["ci"], "significant": m["significant"],
+            "adverse_selection_cost": m["adverse_selection_cost"], "spread_captured": m["avg_spread_captured"],
+            "avg_concurrent_positions": conc, "capital_required_usd": round(conc * STAKE_USD, 2),
+            "avg_fill_delay_s": m["avg_fill_delay_s"]}
+
+
+def _queue_breakdown(sigs, q_usd) -> dict:
+    """Regime breakdown for the headline config (join_bid, 5s) under best vs worst queue."""
+    def buckets(keyfn, mode):
+        res = [(s, simulate_queue(s, "join_bid", timeout=5, mode=mode, queue_ahead_usd=q_usd)) for s in sigs]
+        groups: dict = {}
+        for s, r in res:
+            groups.setdefault(keyfn(s), []).append(r)
+        out = {}
+        for k, v in sorted(groups.items(), key=lambda kv: str(kv[0])):
+            mm = _metrics(v)
+            out[str(k)] = {"n": mm["signals"], "fills": mm["fills"], "fill_rate": mm["fill_rate"],
+                           "ev_per_fill": mm["ev_after_cost"], "adverse": mm["adverse_selection_cost"],
+                           "significant": mm["significant"]}
+        return out
+    def age(s): return "young<120s_left" if s["secs_to_expiry"] > 120 else "old"
+    def vol(s): return "hi_vol" if s["btc_vol"] > 0.0009 else ("lo_vol" if s["btc_vol"] < 0.0004 else "mid_vol")
+    def spr(s): return "wide" if s.get("spread_w", 0) > 0.06 else "tight"
+    def flow(s): return "yes_heavy" if s["flow_imbalance"] > 0.2 else ("no_heavy" if s["flow_imbalance"] < -0.2 else "balanced")
+    def lead(s): return "btc_ahead" if abs(s.get("lag", 0)) > 0.08 else "in_line"
+    def liq(s): return "deep" if s["volume_usd"] > 400 else ("thin" if s["volume_usd"] < 100 else "mid")
+    def dur(s): return f"{s['duration_minutes']}m"
+    def large(s): return "has_large" if s.get("has_large_trade") else "no_large"
+    def hod(s):
+        hh = s.get("hour", 0)
+        return "00-06" if hh < 6 else ("06-12" if hh < 12 else ("12-18" if hh < 18 else "18-24"))
+    axes = {"market_age": age, "btc_volatility": vol, "spread_width": spr, "flow_imbalance": flow,
+            "btc_lead": lead, "liquidity": liq, "duration": dur, "large_trade": large, "time_of_day": hod}
+    return {ax: {"best_queue": buckets(fn, "best"), "worst_queue": buckets(fn, "worst")}
+            for ax, fn in axes.items()}
+
+
+def run_queue_study(db: Session) -> dict:
+    """Queue-position realism study for the 5s passive-maker edge. With no L2 book, it
+    brackets queue position (best/mid/worst), expands the sample as far as the data
+    allows (BTC 5m+15m only), sweeps timeouts 1–15s, breaks down by regime, compares
+    policies and a vol-adaptive timeout, and returns a queue-realistic verdict.
+    Paper/research only — promotes nothing, places no orders."""
+    avail = data_availability(db)
+    spec = next(iter(_models_to_test(db)), None)
+    if spec is None:
+        return {"ok": False, "error": "no model / dataset too small", "data_availability": avail}
+    sigs = []
+    for s in ("train", "val", "holdout"):
+        sigs += build_signals(db, s, spec["model"], spec["feats"], max_future=None)
+    if len(sigs) < MIN_TRADES:
+        return {"ok": False, "error": "too few signals", "data_availability": avail, "n": len(sigs)}
+    # queue-ahead estimate = median crossing-trade size (one typical resting order ahead)
+    sizes = [e[2] for s in sigs for e in s["future"] if len(e) > 2 and e[2] > 0]
+    q_usd = round(sorted(sizes)[len(sizes) // 2], 2) if sizes else 25.0
+
+    univ = {"5m": [5], "5m+15m": [5, 15]}
+    rows = []
+    for uname, durs in univ.items():
+        usigs = [s for s in sigs if s["duration_minutes"] in durs]
+        if len(usigs) < MIN_TRADES:
+            continue
+        for policy in QUEUE_POLICIES:
+            for to in QUEUE_TIMEOUTS:
+                for mode in QUEUE_MODES:
+                    rows.append(_queue_gate_row(uname, policy, to, mode, usigs, q_usd))
+
+    # headline 5s comparison: join_bid / improve_bid across queue modes, biggest universe
+    u = "5m+15m" if any(r["universe"] == "5m+15m" for r in rows) else "5m"
+    def at(policy, to, mode):
+        return next((r for r in rows if r["universe"] == u and r["policy"] == policy
+                     and r["timeout_s"] == to and r["queue"] == mode), None)
+    headline = {f"{pol}@5s": {mode: at(pol, 5, mode) for mode in QUEUE_MODES}
+                for pol in ("join_bid", "improve_bid")}
+
+    # vol-adaptive timeout: short rest in high vol, long rest in low vol
+    adaptive = {}
+    for mode in QUEUE_MODES:
+        res = [simulate_queue(s, "join_bid", timeout=(2 if s["btc_vol"] > 0.0009 else 8),
+                              mode=mode, queue_ahead_usd=q_usd) for s in [x for x in sigs if x["duration_minutes"] in (5, 15)]]
+        mm = _metrics(res)
+        adaptive[mode] = {"ev_per_fill": mm["ev_after_cost"], "fills": mm["fills"], "t_stat": mm["t_stat"],
+                          "significant": mm["significant"], "adverse": mm["adverse_selection_cost"]}
+
+    breakdown = _queue_breakdown([s for s in sigs if s["duration_minutes"] in (5, 15)], q_usd)
+    analysis = _queue_verdict(rows, headline, u)
+    out = {"ok": True, "generated_at": datetime.utcnow().isoformat(),
+           "data_availability": avail, "queue_ahead_usd_estimate": q_usd, "our_order_shares": 5,
+           "n_signals": len(sigs), "rows": rows, "headline_5s": headline,
+           "vol_adaptive_timeout": adaptive, "regime_breakdown": breakdown,
+           "unsupported_adaptive_cancels": [
+               "cancel-if-BTC-moves-against / FV-deteriorates / flow-flips / book-imbalance-turns: need "
+               "intra-window BTC + order-flow + L2-book series we do not store (only decision-time snapshot "
+               "+ the trade-price stream). 'cancel-if-price-trades-through' ≈ the worst-queue model.",
+               "midpoint quoting: needs a live two-sided book (no L2 book stored)",
+           ],
+           **analysis, "safety": _safety()}
+    st = _state(db)
+    base = dict(st.execution) if isinstance(st.execution, dict) else {}
+    base["queue_study"] = out
+    st.execution = base
+    st.execution_built_at = datetime.utcnow()
+    db.commit()
+    return out
+
+
+def _queue_verdict(rows: list[dict], headline: dict, u: str) -> dict:
+    sig_worst = [r for r in rows if r["queue"] == "worst" and r["significant"] and r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES]
+    sig_mid = [r for r in rows if r["queue"] == "mid" and r["significant"] and r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES]
+    sig_best = [r for r in rows if r["queue"] == "best" and r["significant"] and r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES]
+    pos_any = [r for r in rows if r["ev_per_fill"] > 0 and r["fills"] >= MIN_TRADES]
+    pos_best_only = [r for r in rows if r["queue"] == "best" and r["ev_per_fill"] > 0]
+    if sig_worst:
+        code, verdict = 1, "Profitable under conservative (worst-case) queue assumptions"
+    elif sig_best or sig_mid:
+        code, verdict = 2, "Profitable only under optimistic queue assumptions"
+    elif pos_any:
+        code, verdict = 3, "Promising but needs more data (positive EV, not significant under realistic queue)"
+    elif pos_best_only:
+        code, verdict = 4, "Not profitable after realistic queue assumptions (only the touch-fill best case is +EV)"
+    else:
+        code, verdict = 4, "Not profitable after realistic queue assumptions"
+    jb = headline.get("join_bid@5s", {})
+    headline_txt = ("5s join_bid EV/fill — best:%s mid:%s worst:%s (sig best:%s mid:%s worst:%s)" % (
+        (jb.get("best") or {}).get("ev_per_fill"), (jb.get("mid") or {}).get("ev_per_fill"),
+        (jb.get("worst") or {}).get("ev_per_fill"), (jb.get("best") or {}).get("significant"),
+        (jb.get("mid") or {}).get("significant"), (jb.get("worst") or {}).get("significant")))
+    return {"verdict_code": code, "verdict": verdict, "headline": headline_txt,
+            "n_significant_positive": {"best": len(sig_best), "mid": len(sig_mid), "worst": len(sig_worst)},
+            "best_config_overall": max(pos_any, key=lambda r: r["ev_per_day"], default=None)}
 
 
 def _sweep_analysis(rows: list[dict]) -> dict:

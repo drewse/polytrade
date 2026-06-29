@@ -257,3 +257,52 @@ def test_fills_per_day_uses_cadence(in_memory_db):
     fpd = ex._fills_per_day(sigs, res)
     # all seeded markets are 5m (288/day); fills/day = 288 * fill_rate <= 288
     assert 0 <= fpd <= 288
+
+
+# --- queue-position study ---------------------------------------------------
+def test_queue_modes_bracket_fills():
+    # YES bid at 0.47; trades: touch at 0.47 (size 5), then through at 0.45 (size 50)
+    s = _sig(side="YES", up=True, mid=0.5, half=0.03,
+             future=[(1.0, 0.47, 5.0), (2.0, 0.45, 50.0)])
+    best = ex.simulate_queue(s, "join_bid", timeout=5, mode="best", queue_ahead_usd=10)
+    worst = ex.simulate_queue(s, "join_bid", timeout=5, mode="worst", queue_ahead_usd=10)
+    # best fills on the touch; worst only fills when price prints THROUGH the level
+    assert best["filled"] and best["delay"] == 1.0
+    assert worst["filled"] and worst["delay"] == 2.0          # had to wait for the sweep
+    # mid needs cumulative volume to clear the queue-ahead first
+    mid_big = ex.simulate_queue(s, "join_bid", timeout=5, mode="mid", queue_ahead_usd=10)
+    mid_huge = ex.simulate_queue(s, "join_bid", timeout=5, mode="mid", queue_ahead_usd=1000)
+    assert mid_big["filled"] and not mid_huge["filled"]       # never enough volume to reach us
+
+
+def test_queue_worst_no_through_no_fill():
+    # price only touches, never trades through -> worst-case never fills
+    s = _sig(side="YES", up=True, mid=0.5, half=0.03, future=[(1.0, 0.47, 5.0)])
+    assert ex.simulate_queue(s, "join_bid", timeout=5, mode="worst", queue_ahead_usd=10)["filled"] is False
+
+
+def test_data_availability_reports_no_book(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    av = ex.data_availability(db)
+    assert "NONE" in av["l2_book_depth"] and av["markets_with_any_book_snapshot"] == 0
+    assert av["hourly_available"] is False
+
+
+def test_run_queue_study_structure_and_verdict(in_memory_db):
+    db = in_memory_db
+    _seed(db)
+    qs = ex.run_queue_study(db)
+    assert qs["ok"] and qs["verdict_code"] in (1, 2, 3, 4)
+    assert qs["data_availability"]["assets"].startswith("BTC only")
+    # grid over policies × timeouts × queue modes
+    assert len(qs["rows"]) >= len(ex.QUEUE_POLICIES) * len(ex.QUEUE_TIMEOUTS) * len(ex.QUEUE_MODES) - 5
+    r = qs["rows"][0]
+    for k in ("queue", "timeout_s", "ev_per_fill", "fills_per_day", "adverse_selection_cost",
+              "capital_required_usd", "significant"):
+        assert k in r
+    assert "join_bid@5s" in qs["headline_5s"] and "regime_breakdown" in qs
+    assert "n_significant_positive" in qs and set(qs["n_significant_positive"]) == {"best", "mid", "worst"}
+    # persisted + nothing traded
+    assert ex.execution_status(db)["queue_study"]["verdict_code"] == qs["verdict_code"]
+    assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0

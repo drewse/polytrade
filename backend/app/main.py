@@ -919,6 +919,15 @@ def btc5m_execution_sweep(db: Session = Depends(get_db)) -> MessageOut:
                       detail=_lab_safe(execution_lab.run_rest_window_sweep, db))
 
 
+@app.post("/api/btc5m/execution/queue-study", response_model=MessageOut)
+def btc5m_execution_queue_study(db: Session = Depends(get_db)) -> MessageOut:
+    """Queue-position realism study for the 5s passive-maker edge: best/mid/worst queue
+    assumptions, timeout sweep, regime breakdown, policy comparison, verdict. Paper/
+    research only — promotes nothing, places no orders."""
+    return MessageOut(message="btc5m execution queue study",
+                      detail=_lab_safe(execution_lab.run_queue_study, db))
+
+
 # ===========================================================================
 # Research Platform V1 — isolated PAPER-ONLY research on top of the BTC 5M Lab.
 # Never places orders, changes production rankings/eligibility/discovery, or
