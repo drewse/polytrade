@@ -93,6 +93,24 @@ def _btc_fetch(up=True):
     return fn
 
 
+def test_build_dataset_assigns_splits_with_autoflush_off():
+    """Prod sessions use autoflush=False — _assign_splits must flush so the SELECT
+    sees the just-added points (regression: splits were all NULL on prod)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.db import Base
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(eng)
+    db = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False)()
+    for i in range(12):
+        _seed_market(db, f"m{i}", up=(i % 2 == 0), created=datetime(2026, 6, 28, 12, i, 0))
+    lab.build_dataset(db, limit_markets=12, fetch_fn=_btc_fetch(up=True))
+    counts = {s: db.scalar(select(func.count()).select_from(lm.Btc5mLabPoint)
+                           .where(lm.Btc5mLabPoint.split == s)) for s in ("train", "val", "holdout")}
+    assert counts["train"] > 0 and counts["holdout"] > 0    # splits actually assigned
+    db.close()
+
+
 def test_build_dataset_creates_points_and_splits(in_memory_db):
     db = in_memory_db
     for i in range(12):

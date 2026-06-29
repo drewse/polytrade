@@ -300,6 +300,7 @@ def build_dataset(db: Session, *, limit_markets: int = 80, fetch_fn=None,
 
 def _assign_splits(db: Session) -> None:
     """Chronological train/val/holdout split BY MARKET (no leakage)."""
+    db.flush()                                           # prod session is autoflush=False
     mids = [m for (m,) in db.execute(
         select(lm.Btc5mLabPoint.market_id).distinct()).all()]
     # order markets by their created_time
