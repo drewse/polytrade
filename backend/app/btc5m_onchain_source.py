@@ -962,6 +962,7 @@ def _signal_dict(s: om.Btc5mOnchainSignal) -> dict:
             "block_timestamp": s.block_timestamp.isoformat() if s.block_timestamp else None,
             "detected_at": s.detected_at.isoformat() if s.detected_at else None,
             "watched_wallet": s.watched_wallet, "wallet_role": s.wallet_role, "exchange": s.exchange_address,
+            "token_id": s.token_id,
             "market_id": s.market_id, "question": s.question, "outcome": s.outcome, "direction": s.direction,
             "side": s.side, "price": s.price, "shares": s.shares, "usd_amount": s.usd_amount,
             "duration_minutes": s.duration_minutes, "seconds_until_expiry": s.seconds_until_expiry,
