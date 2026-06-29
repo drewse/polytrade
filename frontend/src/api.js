@@ -188,6 +188,11 @@ export const api = {
   // BTC 5M Execution Research Lab (Phase 3: passive-vs-market execution; paper only)
   btc5mExecutionStatus: () => request('/api/btc5m/execution/status'),
   btc5mExecutionRun: () => request('/api/btc5m/execution/run', { method: 'POST' }),
+  // BTC Passive-Maker PAPER harness (forward collection; research only, no orders)
+  btc5mPmPaperStatus: () => request('/api/btc5m/passive-maker-paper/status'),
+  btc5mPmPaperRunOnce: () => request('/api/btc5m/passive-maker-paper/run-once', { method: 'POST' }),
+  btc5mPmPaperQuotes: (limit = 50) => request(`/api/btc5m/passive-maker-paper/quotes?limit=${limit}`),
+  btc5mPmPaperFills: (limit = 50) => request(`/api/btc5m/passive-maker-paper/fills?limit=${limit}`),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

@@ -16,6 +16,8 @@ from . import btc5m_alpha_research as research_lab  # noqa: E402
 from . import btc5m_alpha_discovery as discovery_lab  # noqa: E402
 from . import btc5m_execution_lab as execution_lab  # noqa: E402
 from . import btc5m_maker_validation as maker_validation  # noqa: E402
+from . import btc5m_passive_maker as passive_maker  # noqa: E402
+from . import btc5m_passive_maker_models  # noqa: F401,E402  (register paper tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -115,6 +117,11 @@ def _startup() -> None:
     # writes a research report; no live-trading path exists in it).
     from . import btc5m_research_worker
     btc5m_research_worker.start()
+    # Start the BTC passive-maker PAPER worker (separate daemon; inert unless
+    # BTC_PASSIVE_MAKER_PAPER_ENABLED; forward-collects paper quotes/fills from the
+    # historical trade stream — never places orders or touches live execution).
+    from . import btc5m_passive_maker_worker
+    btc5m_passive_maker_worker.start()
 
 
 @app.get("/api/health")
@@ -942,6 +949,34 @@ def btc5m_maker_validate(db: Session = Depends(get_db)) -> MessageOut:
     no promotion, no live path."""
     return MessageOut(message="btc5m maker validation run",
                       detail=_lab_safe(maker_validation.run_validation, db))
+
+
+# --- BTC 5M Passive-Maker PAPER harness (forward collection; research only) ---
+# Simulates 5s passive quotes/fills from the historical trade stream to forward-grow
+# the sample. INERT unless BTC_PASSIVE_MAKER_PAPER_ENABLED=true. NO endpoint places
+# an order; there is no live execution path anywhere in this feature.
+@app.get("/api/btc5m/passive-maker-paper/status", response_model=MessageOut)
+def btc5m_passive_maker_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m passive-maker paper status", detail=_lab_safe(passive_maker.status, db))
+
+
+@app.post("/api/btc5m/passive-maker-paper/run-once", response_model=MessageOut)
+def btc5m_passive_maker_run_once(db: Session = Depends(get_db)) -> MessageOut:
+    """Run one paper cycle. No-op unless BTC_PASSIVE_MAKER_PAPER_ENABLED=true. Places
+    NO orders — paper fills are inferred from the historical trade stream."""
+    return MessageOut(message="btc5m passive-maker paper run-once", detail=_lab_safe(passive_maker.run_once, db))
+
+
+@app.get("/api/btc5m/passive-maker-paper/quotes", response_model=MessageOut)
+def btc5m_passive_maker_quotes(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m passive-maker paper quotes",
+                      detail=_lab_safe(lambda d: passive_maker.quotes(d, limit=limit), db))
+
+
+@app.get("/api/btc5m/passive-maker-paper/fills", response_model=MessageOut)
+def btc5m_passive_maker_fills(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m passive-maker paper fills",
+                      detail=_lab_safe(lambda d: passive_maker.fills(d, limit=limit), db))
 
 
 # ===========================================================================
