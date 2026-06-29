@@ -806,8 +806,13 @@ def build_report(db: Session) -> dict:
         headline = (f"data still insufficient — BTC source {src_q['source']} "
                     f"({src_q['resolution_s']}s res, {src_q['coverage_pct']}% coverage)")
     elif best is None:
-        code, verdict, headline = 3, "no durable edge", \
-            "no durable edge found (no strategy survived holdout with positive edge after costs)"
+        code, verdict = 3, "no durable edge"
+        if lagr.get("btc_leads"):
+            headline = (f"BTC leads Polymarket by ~{lagr.get('peak_lag_s')}s (cross-corr rises to "
+                        f"{lagr.get('peak_corr')} at lag {lagr.get('peak_lag_s')}s, ~0 contemporaneous) — a REAL "
+                        "lead, but too weak to overcome spread/slippage: no durable tradeable edge")
+        else:
+            headline = "no durable edge found (no strategy survived holdout with positive edge after costs)"
     elif best.family in btc_families:
         code, verdict = 1, "BTC-lead edge found"
         headline = (f"BTC-lead edge: '{best.name}' (holdout ROI {best.roi:.1%}, {best.trades} trades); "
