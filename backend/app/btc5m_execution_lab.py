@@ -93,6 +93,15 @@ def _trades_by_market(db: Session, market_ids: set[str]) -> dict:
     return out
 
 
+def _market_times(db: Session, market_ids: set[str]) -> dict:
+    """market_id -> created_time (for month/weekday/walk-forward temporal validation)."""
+    if not market_ids:
+        return {}
+    rows = db.execute(select(bm.Btc5mMarket.market_id, bm.Btc5mMarket.created_time)
+                      .where(bm.Btc5mMarket.market_id.in_(market_ids))).all()
+    return {mid: ct for mid, ct in rows}
+
+
 def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge: float = 0.01,
                   max_future: float | None = None) -> list[dict]:
     """One signal per decision point where the model takes a directional view. Carries
@@ -107,6 +116,7 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
     X = [[_num((r.features or {}).get(f)) for f in feats] for r in rows]
     probs = model.predict_proba(X)
     trades_by = _trades_by_market(db, {r.market_id for r in rows})
+    times = _market_times(db, {r.market_id for r in rows})
     signals = []
     for r, p in zip(rows, probs):
         m = r.pm_yes
@@ -135,6 +145,12 @@ def build_signals(db: Session, split: str, model, feats: list[str], *, min_edge:
             "lag": _num(f.get("lag")), "hour": int(_num(f.get("hour"))),
             "future": future,
         })
+        ct = times.get(r.market_id)
+        signals[-1].update(
+            created_ts=(ct.timestamp() if ct else 0.0),
+            month=(ct.strftime("%Y-%m") if ct else "?"),
+            weekday=(ct.weekday() if ct else -1),
+            day_type=("weekend" if (ct and ct.weekday() >= 5) else "weekday") if ct else "?")
     return signals
 
 

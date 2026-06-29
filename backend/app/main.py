@@ -15,6 +15,7 @@ from . import btc5m_strategy_lab as strat_lab  # noqa: E402
 from . import btc5m_alpha_research as research_lab  # noqa: E402
 from . import btc5m_alpha_discovery as discovery_lab  # noqa: E402
 from . import btc5m_execution_lab as execution_lab  # noqa: E402
+from . import btc5m_maker_validation as maker_validation  # noqa: E402
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -926,6 +927,21 @@ def btc5m_execution_queue_study(db: Session = Depends(get_db)) -> MessageOut:
     research only — promotes nothing, places no orders."""
     return MessageOut(message="btc5m execution queue study",
                       detail=_lab_safe(execution_lab.run_queue_study, db))
+
+
+@app.get("/api/btc5m/execution/validation", response_model=MessageOut)
+def btc5m_maker_validation_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m maker validation",
+                      detail=_lab_safe(maker_validation.validation_status, db))
+
+
+@app.post("/api/btc5m/execution/validate", response_model=MessageOut)
+def btc5m_maker_validate(db: Session = Depends(get_db)) -> MessageOut:
+    """Rigorously validate the fixed 5s passive-maker edge: stability, walk-forward,
+    bootstrap P(EV>0), failure analysis, sensitivity. Paper/research only — no orders,
+    no promotion, no live path."""
+    return MessageOut(message="btc5m maker validation run",
+                      detail=_lab_safe(maker_validation.run_validation, db))
 
 
 # ===========================================================================
