@@ -104,27 +104,28 @@ def mutual_information(xs: list[float], ys: list[int], bins: int = 5) -> float:
     return max(0.0, round(mi, 5))
 
 
-def permutation_importance(feats: list[str], vals: dict, train, holdout) -> dict:
-    """SHAP-style model-agnostic importance: train a logistic fair-value model on the
-    surviving features, then measure the holdout-AUC drop when each feature column is
-    shuffled (a deterministic half-roll, so runs are reproducible)."""
+def permutation_importance(feats: list[str], vals: dict, train, eval_pts, *, eval_split: str = "val") -> dict:
+    """SHAP-style model-agnostic importance: train a logistic model on the surviving
+    features (TRAIN), then measure the AUC drop on an EVALUATION split (validation by
+    default — NEVER holdout, to keep holdout untouched for the final EV test) when each
+    feature column is shuffled (a deterministic half-roll, so runs are reproducible)."""
     trX = [[vals["train"][f][i] for f in feats] for i in range(len(train))]
-    hoX = [[vals["holdout"][f][i] for f in feats] for i in range(len(holdout))]
+    evX = [[vals[eval_split][f][i] for f in feats] for i in range(len(eval_pts))]
     trY = [p["_label"] for p in train]
-    hoY = [p["_label"] for p in holdout]
-    if len(trX) < 20 or len(hoX) < 8:
+    evY = [p["_label"] for p in eval_pts]
+    if len(trX) < 20 or len(evX) < 8:
         return {f: 0.0 for f in feats}
     model = ml.LogisticRegression().fit(trX, trY)
-    base = ph1.auc_score(model.predict_proba(hoX), hoY)
+    base = ph1.auc_score(model.predict_proba(evX), evY)
     out = {}
-    shift = max(1, len(hoX) // 2)
+    shift = max(1, len(evX) // 2)
     for j, f in enumerate(feats):
-        col = [row[j] for row in hoX]
+        col = [row[j] for row in evX]
         perm = col[shift:] + col[:shift]
-        Xp = [row[:] for row in hoX]
+        Xp = [row[:] for row in evX]
         for i in range(len(Xp)):
             Xp[i][j] = perm[i]
-        out[f] = round(base - ph1.auc_score(model.predict_proba(Xp), hoY), 4)
+        out[f] = round(base - ph1.auc_score(model.predict_proba(Xp), evY), 4)
     return out
 
 
@@ -264,12 +265,17 @@ def mine_features(db: Session, *, top_survivors: int = 40) -> dict:
         xv = [fn(p) for p in val]
         xh = [fn(p) for p in hold]
         ic_val = spearman_ic(xv, vaY) if val else 0.0
-        ic_hold = spearman_ic(xh, hoY)
+        ic_hold = spearman_ic(xh, hoY)            # REPORTED ONLY — never used to select
         mi = mutual_information(xt, trY)
         if mi < MIN_MI:
             continue
         sign = ic
-        stab_splits = _stability({"val": ic_val, "holdout": ic_hold}, sign)
+        # stability is judged on TRAIN folds + VALIDATION only (holdout stays untouched
+        # so the final EV test isn't biased by selecting features that fit the holdout).
+        half = len(train) // 2
+        ic_tr_a = spearman_ic(xt[:half], trY[:half])
+        ic_tr_b = spearman_ic(xt[half:], trY[half:])
+        stab_splits = _stability({"tr_a": ic_tr_a, "tr_b": ic_tr_b, "val": ic_val}, sign)
         # by regime
         reg_ic = {}
         for rg in set(p["_regime"] for p in train):
@@ -282,7 +288,8 @@ def mine_features(db: Session, *, top_survivors: int = 40) -> dict:
             seg = [(fn(p), p["_label"]) for p in train if p["_month"] == mo]
             mon_ic[mo] = spearman_ic([a for a, _ in seg], [b for _, b in seg]) if len(seg) >= 10 else None
         stab_month = _stability(mon_ic, sign)
-        decay = round(1.0 - (abs(ic_hold) / abs(ic)) if abs(ic) > 1e-9 else 1.0, 3)
+        # decay = degradation from train to VALIDATION (leakage-free; holdout stays clean)
+        decay = round(1.0 - (abs(ic_val) / abs(ic)) if abs(ic) > 1e-9 else 1.0, 3)
         scored.append({
             "name": name, "category": cat, "ic": round(ic, 4), "ic_pearson": round(_corr(xt, trY), 4),
             "ic_val": round(ic_val, 4), "ic_hold": round(ic_hold, 4), "mutual_info": mi,
@@ -308,9 +315,9 @@ def mine_features(db: Session, *, top_survivors: int = 40) -> dict:
         survivors.append(s)
         if len(survivors) >= top_survivors:
             break
-    # SHAP-style permutation importance for survivors
+    # SHAP-style permutation importance for survivors — on VALIDATION, never holdout
     surv_names = [s["name"] for s in survivors]
-    shap = permutation_importance(surv_names, vals, train, hold) if surv_names else {}
+    shap = permutation_importance(surv_names, vals, train, val, eval_split="val") if surv_names else {}
     for s in survivors:
         s["shap_importance"] = shap.get(s["name"], 0.0)
     survivors.sort(key=lambda s: (-s["shap_importance"], -s["abs_ic"]))

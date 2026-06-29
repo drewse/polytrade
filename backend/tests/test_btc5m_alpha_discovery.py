@@ -34,10 +34,10 @@ def test_spearman_and_mutual_information():
 def test_permutation_importance_ranks_informative_feature():
     # f1 perfectly separates the label; f2 is noise
     train = [{"_label": i % 2} for i in range(40)]
-    hold = [{"_label": i % 2} for i in range(20)]
+    ev = [{"_label": i % 2} for i in range(20)]
     vals = {"train": {"f1": [p["_label"] for p in train], "f2": [0.0] * 40},
-            "holdout": {"f1": [p["_label"] for p in hold], "f2": [0.0] * 20}}
-    imp = disc.permutation_importance(["f1", "f2"], vals, train, hold)
+            "val": {"f1": [p["_label"] for p in ev], "f2": [0.0] * 20}}
+    imp = disc.permutation_importance(["f1", "f2"], vals, train, ev, eval_split="val")
     assert imp["f1"] >= imp["f2"]
 
 
