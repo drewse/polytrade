@@ -165,6 +165,13 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "move_close": "FLOAT", "mfe": "FLOAT", "mae": "FLOAT",
         "quality_updated_at": "DATETIME",
     },
+    # BTC passive-maker forward pipeline: market-family / quote-kind tagging added
+    # after the paper-quote table shipped (keeps BTC / broad / multi-point separate).
+    "btc5m_paper_quotes": {
+        "market_family": "VARCHAR DEFAULT 'btc'",
+        "quote_kind": "VARCHAR DEFAULT 'independent'",
+        "decision_index": "INTEGER DEFAULT 0",
+    },
 }
 
 

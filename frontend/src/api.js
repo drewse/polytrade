@@ -193,6 +193,8 @@ export const api = {
   btc5mPmPaperRunOnce: () => request('/api/btc5m/passive-maker-paper/run-once', { method: 'POST' }),
   btc5mPmPaperQuotes: (limit = 50) => request(`/api/btc5m/passive-maker-paper/quotes?limit=${limit}`),
   btc5mPmPaperFills: (limit = 50) => request(`/api/btc5m/passive-maker-paper/fills?limit=${limit}`),
+  btc5mPmForwardDiagnostics: () => request('/api/btc5m/passive-maker-forward/diagnostics'),
+  btc5mPmForwardRunOnce: () => request('/api/btc5m/passive-maker-forward/run-once', { method: 'POST' }),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),

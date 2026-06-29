@@ -51,7 +51,8 @@ def _truthy(v: str) -> bool:
 def get_config() -> dict:
     return {"enabled": _truthy(os.getenv("BTC_PASSIVE_MAKER_PAPER_ENABLED", "false")),
             "max_quotes_per_run": int(os.getenv("BTC_PASSIVE_MAKER_MAX_PER_RUN", "300")),
-            "capture_book": _truthy(os.getenv("BTC_PASSIVE_MAKER_CAPTURE_BOOK", "false"))}
+            "capture_book": _truthy(os.getenv("BTC_PASSIVE_MAKER_CAPTURE_BOOK", "false")),
+            "multi_point": _truthy(os.getenv("BTC_PASSIVE_MAKER_MULTI_POINT_QUOTES", "false"))}
 
 
 def _state(db: Session) -> pm.Btc5mPaperMakerState:
@@ -74,43 +75,60 @@ def _iso_week(ts: float) -> str:
 # ---------------------------------------------------------------------------
 # forward collection: one cycle (scan → quote → 5s cancel → fill → settle)
 # ---------------------------------------------------------------------------
-def run_once(db: Session, *, force: bool = False) -> dict:
+def run_once(db: Session, *, force: bool = False, multi_point: bool | None = None,
+             only_market_ids=None) -> dict:
     """One paper cycle. INERT (no-op) unless enabled, or `force` for direct tests.
-    Creates paper quotes for not-yet-quoted BTC 5m/15m markets, infers worst-case
-    paper fills from the trade stream, settles resolved ones, recomputes stats + the
-    gate. Places NO orders."""
+    Creates ONE independent paper quote per not-yet-quoted BTC 5m/15m market (the
+    earliest decision point), infers worst-case paper fills from the trade stream,
+    settles resolved ones, recomputes stats + the gate. With `multi_point`, also adds
+    up to 4 extra CORRELATED quotes per market (tagged separately so the gate never
+    mixes them). Places NO orders. `only_market_ids` restricts to specific markets
+    (forward pipeline incremental mode)."""
     cfg = get_config()
     if not cfg["enabled"] and not force:
         return {"ran": False, "skipped": "disabled (BTC_PASSIVE_MAKER_PAPER_ENABLED is false)"}
+    multi_point = cfg["multi_point"] if multi_point is None else multi_point
     spec = next(iter(ex._models_to_test(db)), None)
     if spec is None:
         return {"ran": False, "skipped": "dataset too small / no model"}
 
-    # signals across all splits, one quote per (not-yet-quoted) market — earliest offset
+    # signals across all splits, grouped by market and ordered by decision offset
     sigs = []
     for s in ("train", "val", "holdout"):
         sigs += ex.build_signals(db, s, spec["model"], spec["feats"], max_future=None)
     sigs = [s for s in sigs if s["duration_minutes"] in DURATIONS]
+    if only_market_ids is not None:
+        ids = set(only_market_ids)
+        sigs = [s for s in sigs if s["market_id"] in ids]
     by_market: dict = {}
     for s in sigs:
-        cur = by_market.get(s["market_id"])
-        if cur is None or s["t"] < cur["t"]:
-            by_market[s["market_id"]] = s
-    already = {q for (q,) in db.execute(select(pm.Btc5mPaperQuote.market_id).distinct()).all()}
+        by_market.setdefault(s["market_id"], []).append(s)
+    for v in by_market.values():
+        v.sort(key=lambda s: s["t"])
+    have_indep = {q for (q,) in db.execute(select(pm.Btc5mPaperQuote.market_id)
+                  .where(pm.Btc5mPaperQuote.market_family == "btc",
+                         pm.Btc5mPaperQuote.quote_kind == "independent").distinct()).all()}
+    have_mp = {(m, di) for (m, di) in db.execute(select(pm.Btc5mPaperQuote.market_id, pm.Btc5mPaperQuote.decision_index)
+               .where(pm.Btc5mPaperQuote.quote_kind == "multi_point").distinct()).all()}
     q_usd = _queue_ahead_estimate(sigs)
 
     created = filled = 0
-    for mid, sig in list(by_market.items())[: cfg["max_quotes_per_run"] + len(already)]:
-        if mid in already:
-            continue
-        row = _quote_and_settle(db, sig, q_usd)
-        created += 1
-        filled += 1 if row.filled else 0
+    for mid, points in by_market.items():
+        if mid not in have_indep:
+            row = _quote_and_settle(db, points[0], q_usd, kind="independent", decision_index=0)
+            created += 1
+            filled += 1 if row.filled else 0
+        if multi_point:
+            for di, sig in enumerate(points[1:5], start=1):
+                if (mid, di) not in have_mp:
+                    row = _quote_and_settle(db, sig, q_usd, kind="multi_point", decision_index=di)
+                    created += 1
+                    filled += 1 if row.filled else 0
         if created >= cfg["max_quotes_per_run"]:
             break
 
     if cfg["capture_book"]:
-        _capture_books(db, list(by_market.values())[:5])
+        _capture_books(db, [p[0] for p in by_market.values()][:5])
 
     stats = recompute_stats(db)
     st = _state(db)
@@ -125,9 +143,11 @@ def _queue_ahead_estimate(sigs: list[dict]) -> float:
     return round(sorted(sizes)[len(sizes) // 2], 2) if sizes else 25.0
 
 
-def _quote_and_settle(db: Session, sig: dict, q_usd: float) -> pm.Btc5mPaperQuote:
+def _quote_and_settle(db: Session, sig: dict, q_usd: float, *, kind: str = "independent",
+                      decision_index: int = 0, family: str = "btc") -> pm.Btc5mPaperQuote:
     """Record a paper quote and settle it against the trade stream (worst-case queue).
-    NO order is placed — `simulate_queue` only reads historical trades."""
+    NO order is placed — `simulate_queue` only reads historical trades. `kind`/`family`
+    keep correlated multi-point + broad-universe quotes OUT of the BTC gate."""
     res = ex.simulate_queue(sig, POLICY, timeout=TIMEOUT_S, mode=QUEUE, queue_ahead_usd=q_usd)
     m, half = sig["mid"], sig["half"]
     mk = db.get(bm.Btc5mMarket, sig["market_id"])
@@ -144,6 +164,7 @@ def _quote_and_settle(db: Session, sig: dict, q_usd: float) -> pm.Btc5mPaperQuot
         spread=round(2 * half, 4), quote_t_offset_s=sig["t"], cancel_t_offset_s=sig["t"] + TIMEOUT_S,
         quote_lifetime_s=float(TIMEOUT_S), queue_assumption=QUEUE, queue_ahead_usd=q_usd,
         regime=sig.get("regime"), week=_iso_week(sig.get("created_ts", 0)),
+        market_family=family, quote_kind=kind, decision_index=decision_index,
         market_resolved=resolved, resolved_up=sig.get("up"))
     if res["filled"]:
         row.status = "filled"
@@ -206,9 +227,17 @@ def capture_book(db: Session, market_id: str) -> pm.Btc5mPaperBookSnapshot:
 # ---------------------------------------------------------------------------
 # cumulative stats + the PRE-REGISTERED validation gate
 # ---------------------------------------------------------------------------
-def _settled_fills(db: Session) -> list[dict]:
-    rows = db.scalars(select(pm.Btc5mPaperQuote).where(pm.Btc5mPaperQuote.filled.is_(True),
-                      pm.Btc5mPaperQuote.settled.is_(True))).all()
+def _settled_fills(db: Session, *, family: str = "btc", kind: str = "independent") -> list[dict]:
+    """Settled paper fills for ONE market family + quote kind. The BTC gate uses only
+    family='btc', kind='independent' — correlated multi-point and broad-universe fills
+    are never mixed in."""
+    q = select(pm.Btc5mPaperQuote).where(pm.Btc5mPaperQuote.filled.is_(True),
+                                         pm.Btc5mPaperQuote.settled.is_(True))
+    if family is not None:
+        q = q.where(pm.Btc5mPaperQuote.market_family == family)
+    if kind is not None:
+        q = q.where(pm.Btc5mPaperQuote.quote_kind == kind)
+    rows = db.scalars(q).all()
     return [{"pnl": r.realized_pnl or 0.0, "spread_captured": r.spread_captured or 0.0,
              "won": bool(r.won), "regime": r.regime or "?", "week": r.week or "?",
              "resolved_up": r.resolved_up, "side": r.side} for r in rows]
@@ -257,13 +286,18 @@ def evaluate_gate(fills: list[dict]) -> tuple[str, dict]:
 
 
 def recompute_stats(db: Session) -> dict:
+    """Recompute the canonical BTC gate (family='btc', kind='independent' ONLY).
+    Correlated multi-point + broad-universe results are tracked separately and never
+    enter this gate."""
     st = _state(db)
-    n_quotes = db.scalar(select(func.count()).select_from(pm.Btc5mPaperQuote)) or 0
+    base = pm.Btc5mPaperQuote.market_family == "btc"
+    indep = base & (pm.Btc5mPaperQuote.quote_kind == "independent")
+    n_quotes = db.scalar(select(func.count()).select_from(pm.Btc5mPaperQuote).where(indep)) or 0
     n_fills = db.scalar(select(func.count()).select_from(pm.Btc5mPaperQuote)
-                        .where(pm.Btc5mPaperQuote.filled.is_(True))) or 0
+                        .where(indep, pm.Btc5mPaperQuote.filled.is_(True))) or 0
     n_skip = db.scalar(select(func.count()).select_from(pm.Btc5mPaperQuote)
                        .where(pm.Btc5mPaperQuote.status == "skipped")) or 0
-    fills = _settled_fills(db)
+    fills = _settled_fills(db, family="btc", kind="independent")
     pnls = [f["pnl"] for f in fills]
     caps = [f["spread_captured"] for f in fills]
     boot = mv.phase_d_bootstrap(fills) if len(fills) >= 4 else {"ok": False}
@@ -275,9 +309,6 @@ def recompute_stats(db: Session) -> dict:
     fr = (n_fills / n_quotes) if n_quotes else 0.0
     fpd = round(sum(MARKETS_PER_DAY.values()) * fr, 1)
     status, gate = evaluate_gate(fills)
-    queue_break = {}
-    for mode in ex.QUEUE_MODES:
-        queue_break[mode] = mode  # placeholder; queue breakdown is studied in the lab, harness fixes worst
 
     st.status = status
     st.quotes = n_quotes
@@ -302,13 +333,38 @@ def recompute_stats(db: Session) -> dict:
 # ---------------------------------------------------------------------------
 # read APIs
 # ---------------------------------------------------------------------------
+def _cohort_summary(db: Session, family, kind) -> dict:
+    """Independent stats + an INDEPENDENT gate for one (family, kind) cohort. Used to
+    report BTC-multi-point and broad-universe SEPARATELY from the canonical BTC gate."""
+    n_q = db.scalar(select(func.count()).select_from(pm.Btc5mPaperQuote)
+                    .where(pm.Btc5mPaperQuote.market_family == family,
+                           pm.Btc5mPaperQuote.quote_kind == kind)) or 0
+    fills = _settled_fills(db, family=family, kind=kind)
+    pnls = [f["pnl"] for f in fills]
+    boot = mv.phase_d_bootstrap(fills) if len(fills) >= 4 else {"ok": False}
+    g_status, gate = evaluate_gate(fills)
+    return {"family": family, "kind": kind, "quotes": n_q, "fills": len(fills),
+            "ev_per_fill": round(_mean(pnls), 5) if pnls else 0.0,
+            "prob_ev_positive": boot.get("prob_true_ev_positive", 0.0) if boot.get("ok") else 0.0,
+            "gate_status": g_status, "gate_passed": sum(1 for v in gate.values() if v), "gate_total": len(gate) or 7}
+
+
+def family_breakdown(db: Session) -> dict:
+    """Every (family, kind) cohort, each with its OWN gate. The BTC edge is judged ONLY
+    by ('btc','independent'); broad universe and multi-point get independent verdicts."""
+    pairs = db.execute(select(pm.Btc5mPaperQuote.market_family, pm.Btc5mPaperQuote.quote_kind).distinct()).all()
+    return {f"{fam}:{kind}": _cohort_summary(db, fam, kind) for (fam, kind) in sorted(pairs)}
+
+
 def status(db: Session) -> dict:
     cfg = get_config()
     st = _state(db)
     gate = st.gate or {}
     return {
         "enabled": cfg["enabled"], "status": st.status,
-        "config": {"policy": POLICY, "timeout_s": TIMEOUT_S, "queue": QUEUE, "durations": list(DURATIONS)},
+        "config": {"policy": POLICY, "timeout_s": TIMEOUT_S, "queue": QUEUE, "durations": list(DURATIONS),
+                   "multi_point": cfg["multi_point"], "capture_book": cfg["capture_book"]},
+        "gate_cohort": "btc:independent",
         "quotes": st.quotes, "fills": st.fills, "skipped": st.skipped, "fill_rate": st.fill_rate,
         "ev_per_fill": st.ev_per_fill, "ev_per_day_estimate": st.ev_per_day_estimate,
         "prob_ev_positive": st.prob_ev_positive, "ci95": [st.ci_low, st.ci_high],
@@ -316,6 +372,7 @@ def status(db: Session) -> dict:
         "weeks_covered": st.weeks_covered,
         "gate": gate, "gate_progress": {"passed": sum(1 for v in gate.values() if v), "total": len(gate) or 7},
         "fills_target": GATE_MIN_FILLS,
+        "family_breakdown": family_breakdown(db),
         "l2_book": _book_status(db),
         "last_run_at": st.last_run_at.isoformat() if st.last_run_at else None,
         "safety": ("BTC 5M Passive-Maker PAPER harness — research/paper only; simulates quotes/fills from the "

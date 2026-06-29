@@ -17,6 +17,7 @@ from . import btc5m_alpha_discovery as discovery_lab  # noqa: E402
 from . import btc5m_execution_lab as execution_lab  # noqa: E402
 from . import btc5m_maker_validation as maker_validation  # noqa: E402
 from . import btc5m_passive_maker as passive_maker  # noqa: E402
+from . import btc5m_passive_maker_forward as passive_maker_forward  # noqa: E402
 from . import btc5m_passive_maker_models  # noqa: F401,E402  (register paper tables for create_all)
 from .db import get_db, init_db
 from .models import (
@@ -122,6 +123,11 @@ def _startup() -> None:
     # historical trade stream — never places orders or touches live execution).
     from . import btc5m_passive_maker_worker
     btc5m_passive_maker_worker.start()
+    # Start the forward conversion pipeline worker (separate daemon; inert unless
+    # BTC_PASSIVE_MAKER_FORWARD_ENABLED; chains index->build->quote->settle on ingested
+    # markets — research/paper only, never places orders).
+    from . import btc5m_passive_maker_forward_worker
+    btc5m_passive_maker_forward_worker.start()
 
 
 @app.get("/api/health")
@@ -977,6 +983,22 @@ def btc5m_passive_maker_quotes(limit: int = 50, db: Session = Depends(get_db)) -
 def btc5m_passive_maker_fills(limit: int = 50, db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m passive-maker paper fills",
                       detail=_lab_safe(lambda d: passive_maker.fills(d, limit=limit), db))
+
+
+# --- Forward conversion pipeline (research-only; converts ingested -> paper) --
+@app.get("/api/btc5m/passive-maker-forward/diagnostics", response_model=MessageOut)
+def btc5m_passive_maker_forward_diag(db: Session = Depends(get_db)) -> MessageOut:
+    """Full data-funnel diagnostics — shows exactly where the pipeline stalls."""
+    return MessageOut(message="btc5m passive-maker forward diagnostics",
+                      detail=_lab_safe(passive_maker_forward.diagnostics, db))
+
+
+@app.post("/api/btc5m/passive-maker-forward/run-once", response_model=MessageOut)
+def btc5m_passive_maker_forward_run_once(db: Session = Depends(get_db)) -> MessageOut:
+    """Run one forward cycle (index new → build new points → quote → settle). No-op
+    unless BTC_PASSIVE_MAKER_FORWARD_ENABLED=true. Places NO orders."""
+    return MessageOut(message="btc5m passive-maker forward run-once",
+                      detail=_lab_safe(passive_maker_forward.run_forward_cycle, db))
 
 
 # ===========================================================================

@@ -393,12 +393,17 @@ def _market_lag_profile(btc_series, trades, life, max_lag: int = 10) -> dict:
 
 
 def build_dataset(db: Session, *, limit_markets: int = 40, fetch_fn=None,
-                  decision_fractions=DECISION_FRACTIONS) -> dict:
+                  decision_fractions=DECISION_FRACTIONS, only_market_ids=None) -> dict:
     """Build synchronized decision-point rows for resolved BTC 5m/15m markets, with
     a true 1s BTC series. Idempotent per market. Also computes the BTC->YES lag
-    profile + source-quality coverage."""
-    markets = db.scalars(select(bm.Btc5mMarket).where(bm.Btc5mMarket.resolved.is_(True))
-                         .order_by(bm.Btc5mMarket.created_time.desc()).limit(limit_markets)).all()
+    profile + source-quality coverage. `only_market_ids` (a set) restricts the build
+    to specific markets — used by the forward pipeline to process ONLY newly resolved
+    markets incrementally instead of reprocessing the whole dataset every cycle."""
+    q = select(bm.Btc5mMarket).where(bm.Btc5mMarket.resolved.is_(True))
+    if only_market_ids:
+        markets = db.scalars(q.where(bm.Btc5mMarket.market_id.in_(set(only_market_ids)))).all()
+    else:
+        markets = db.scalars(q.order_by(bm.Btc5mMarket.created_time.desc()).limit(limit_markets)).all()
     st = _state(db)
     n_markets = n_points = 0
     source = None

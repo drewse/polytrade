@@ -66,6 +66,26 @@ class Btc5mPaperQuote(Base):
     settled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     regime: Mapped[str | None] = mapped_column(String(40), nullable=True)
     week: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)   # ISO YYYY-Www
+    # forward-pipeline tagging — keep market families + quote kinds SEPARATE so the
+    # BTC gate never mixes correlated multi-point quotes or broad-universe markets.
+    market_family: Mapped[str] = mapped_column(String(24), default="btc", index=True)  # btc | sports | politics | ...
+    quote_kind: Mapped[str] = mapped_column(String(16), default="independent", index=True)  # independent | multi_point
+    decision_index: Mapped[int] = mapped_column(Integer, default=0)                  # 0 = earliest/market-level
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class Btc5mForwardState(Base):
+    """Singleton state for the forward conversion pipeline: per-stage diagnostics so we
+    can see exactly where the funnel stalls. No money state."""
+    __tablename__ = "btc5m_forward_state"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runs: Mapped[int] = mapped_column(Integer, default=0)
+    # per-stage snapshots: {stage: {total, new_since_last, latest_ts, last_run_at, last_error, blocked}}
+    funnel: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_summary: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 

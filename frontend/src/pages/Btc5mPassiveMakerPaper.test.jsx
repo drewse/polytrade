@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import { PaperReport, GateProgress, QuotesTable } from './Btc5mPassiveMakerPaper.jsx'
+import { PaperReport, GateProgress, QuotesTable, FunnelDiagnostics, FamilyBreakdown } from './Btc5mPassiveMakerPaper.jsx'
 
 const status = (over = {}) => ({
   enabled: false, status: 'research_only_not_validated',
@@ -56,6 +56,58 @@ describe('GateProgress', () => {
     expect(screen.getByTestId('gate-progress')).toHaveTextContent('15/100 fills')
     expect(screen.getAllByTestId('gate-row')).toHaveLength(7)
     expect(screen.getByTestId('gate-progress')).toHaveTextContent('P(EV>0) ≥ 0.95')
+  })
+})
+
+const diag = (over = {}) => ({
+  forward_enabled: false, pipeline_blocked: true, blocked_stages: ['4_paper_quotes'],
+  main_ingest: { running: true }, last_run_at: new Date().toISOString(),
+  last_summary: { new_indexed: 0, new_quotes: 0 },
+  funnel: {
+    '1_btc_markets_in_main': { total: 400, new_since_last: 0, latest_ts: null, blocked: false },
+    '2_btc5m_indexed': { total: 246, new_since_last: 0, latest_ts: null, blocked: true },
+    '3_lab_markets': { total: 226, new_since_last: 0, latest_ts: null, blocked: false },
+    '4_paper_quotes': { total: 0, new_since_last: 0, latest_ts: null, blocked: true },
+    '5_paper_fills': { total: 0, new_since_last: 0, latest_ts: null, blocked: false },
+    '6_settled_fills': { total: 0, new_since_last: 0, latest_ts: null, blocked: false },
+  },
+  ...over,
+})
+
+describe('FunnelDiagnostics', () => {
+  it('renders funnel stages + stall warning', () => {
+    render(<FunnelDiagnostics diag={diag()} />)
+    expect(screen.getByTestId('funnel-table')).toBeInTheDocument()
+    expect(screen.getAllByTestId('funnel-row').length).toBeGreaterThanOrEqual(6)
+    expect(screen.getByTestId('stall-warning')).toHaveTextContent('STALLED')
+  })
+
+  it('no stall warning when pipeline healthy', () => {
+    render(<FunnelDiagnostics diag={diag({ pipeline_blocked: false, blocked_stages: [] })} />)
+    expect(screen.queryByTestId('stall-warning')).toBeNull()
+  })
+
+  it('renders empty without diag', () => {
+    render(<FunnelDiagnostics diag={null} />)
+    expect(screen.getByText(/No forward-pipeline diagnostics/)).toBeInTheDocument()
+  })
+})
+
+describe('FamilyBreakdown — BTC vs broad separation', () => {
+  const bd = {
+    'btc:independent': { quotes: 220, fills: 7, ev_per_fill: 0.017, prob_ev_positive: 0.55, gate_passed: 1, gate_total: 7, gate_status: 'research_only_not_validated' },
+    'btc:multi_point': { quotes: 400, fills: 15, ev_per_fill: 0.1, prob_ev_positive: 0.8, gate_passed: 2, gate_total: 7, gate_status: 'research_only_not_validated' },
+    'sports:independent': { quotes: 120, fills: 30, ev_per_fill: -0.02, prob_ev_positive: 0.3, gate_passed: 1, gate_total: 7, gate_status: 'research_only_not_validated' },
+  }
+  it('renders each cohort with its own gate, BTC marked', () => {
+    render(<FamilyBreakdown breakdown={bd} />)
+    expect(screen.getByTestId('family-breakdown')).toHaveTextContent('btc:independent')
+    expect(screen.getByTestId('family-breakdown')).toHaveTextContent('THE gate')
+    expect(screen.getAllByTestId('cohort-row')).toHaveLength(3)
+  })
+  it('renders empty', () => {
+    render(<FamilyBreakdown breakdown={{}} />)
+    expect(screen.getByText(/No cohorts yet/)).toBeInTheDocument()
   })
 })
 

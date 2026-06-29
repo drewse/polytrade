@@ -88,6 +88,71 @@ export function PaperReport({ status }) {
   )
 }
 
+const STAGE_LABEL = {
+  '1_btc_markets_in_main': 'BTC markets in Market table',
+  '2_btc5m_indexed': 'btc5m indexed markets',
+  '2b_btc5m_resolved': '  ↳ resolved',
+  '3_lab_markets': 'Lab dataset markets',
+  '3b_lab_points': '  ↳ lab points',
+  '4_paper_quotes': 'Paper quotes',
+  '5_paper_fills': 'Paper fills',
+  '6_settled_fills': 'Settled fills',
+}
+
+// Pure presentational — exported for tests.
+export function FunnelDiagnostics({ diag }) {
+  if (!diag) return <Empty>No forward-pipeline diagnostics yet.</Empty>
+  const f = diag.funnel || {}
+  const blocked = diag.blocked_stages || []
+  return (
+    <div className="panel" data-testid="funnel-diag">
+      <div className="label">Data funnel — forward worker {diag.forward_enabled ? 'ENABLED' : 'DISABLED'} ·
+        main ingest {diag.main_ingest?.running ? 'running' : 'idle'} · last run {diag.last_run_at ? ago(diag.last_run_at) : 'never'}</div>
+      {diag.pipeline_blocked && (
+        <div className="diag-strip neg" data-testid="stall-warning" style={{ margin: '6px 0' }}>
+          ⛔ Pipeline STALLED at: <b>{blocked.map((b) => STAGE_LABEL[b] || b).join(', ')}</b> — upstream data isn't converting downstream.
+        </div>
+      )}
+      <div className="table-wrap"><table data-testid="funnel-table">
+        <thead><tr><th>Stage</th><th className="right">Total</th><th className="right">New</th><th>Latest</th><th>Status</th></tr></thead>
+        <tbody>{Object.entries(f).map(([k, v]) => (
+          <tr key={k} data-testid="funnel-row" className={v.blocked ? 'neg' : ''}>
+            <td className="small">{STAGE_LABEL[k] || k}</td>
+            <td className="right"><b>{v.total}</b></td>
+            <td className={`right ${v.new_since_last > 0 ? 'pos' : 'muted'}`}>{v.new_since_last > 0 ? `+${v.new_since_last}` : '—'}</td>
+            <td className="small muted">{v.latest_ts ? ago(v.latest_ts) : '—'}</td>
+            <td className="small">{v.blocked ? <span className="neg">⛔ blocked</span> : <span className="pos">ok</span>}</td>
+          </tr>
+        ))}</tbody>
+      </table></div>
+      {diag.last_summary && Object.keys(diag.last_summary).length > 0 && (
+        <div className="small muted" style={{ marginTop: 4 }}>last cycle: {JSON.stringify(diag.last_summary)}</div>
+      )}
+    </div>
+  )
+}
+
+export function FamilyBreakdown({ breakdown }) {
+  const entries = Object.entries(breakdown || {})
+  if (!entries.length) return <Empty>No cohorts yet.</Empty>
+  return (
+    <div className="table-wrap"><table data-testid="family-breakdown">
+      <thead><tr><th>Cohort (family:kind)</th><th className="right">Quotes</th><th className="right">Fills</th>
+        <th className="right">EV/fill</th><th className="right">P(EV&gt;0)</th><th>Gate</th></tr></thead>
+      <tbody>{entries.map(([k, v]) => (
+        <tr key={k} data-testid="cohort-row" className={k === 'btc:independent' ? 'pos' : ''}>
+          <td className="small mono">{k}{k === 'btc:independent' ? ' ★ (THE gate)' : ''}</td>
+          <td className="right">{v.quotes}</td>
+          <td className="right">{v.fills}</td>
+          <td className={`right ${v.ev_per_fill > 0 ? 'pos' : (v.ev_per_fill < 0 ? 'neg' : '')}`}>{num(v.ev_per_fill, 4)}</td>
+          <td className="right">{num(v.prob_ev_positive, 3)}</td>
+          <td className="small">{v.gate_passed}/{v.gate_total} · {v.gate_status === 'paper_validated' ? <span className="pos">validated</span> : (v.gate_status === 'failed_validation' ? <span className="neg">failed</span> : 'open')}</td>
+        </tr>
+      ))}</tbody>
+    </table></div>
+  )
+}
+
 export function QuotesTable({ rows, testid = 'pm-quotes', kind = 'quotes' }) {
   if (!rows?.length) return <Empty>No {kind} yet.</Empty>
   return (
@@ -115,6 +180,7 @@ export function QuotesTable({ rows, testid = 'pm-quotes', kind = 'quotes' }) {
 
 export default function Btc5mPassiveMakerPaper() {
   const [status, setStatus] = useState(null)
+  const [diag, setDiag] = useState(null)
   const [quotes, setQuotes] = useState(null)
   const [fills, setFills] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -123,20 +189,21 @@ export default function Btc5mPassiveMakerPaper() {
 
   const load = useCallback(async () => {
     try {
-      const [st, q, f] = await Promise.all([
+      const [st, dg, q, f] = await Promise.all([
         api.btc5mPmPaperStatus().then((r) => r?.detail || r),
+        api.btc5mPmForwardDiagnostics().then((r) => r?.detail || r).catch(() => null),
         api.btc5mPmPaperQuotes(30).then((r) => r?.detail || r).catch(() => null),
         api.btc5mPmPaperFills(30).then((r) => r?.detail || r).catch(() => null),
       ])
-      setStatus(st); setQuotes(q?.quotes || []); setFills(f?.fills || [])
+      setStatus(st); setDiag(dg); setQuotes(q?.quotes || []); setFills(f?.fills || [])
     } catch (e) { setToast(e.message) } finally { setLoading(false) }
   }, [])
   useEffect(() => { load() }, [load])
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 6000); return () => clearTimeout(t) }, [toast])
 
-  const runOnce = async () => {
+  const act = async (fn) => {
     setBusy(true)
-    try { const r = await api.btc5mPmPaperRunOnce().then((x) => x?.detail || x); setToast(JSON.stringify(r).slice(0, 140)); await load() }
+    try { const r = await fn().then((x) => x?.detail || x); setToast(JSON.stringify(r).slice(0, 140)); await load() }
     catch (e) { setToast(e.message) } finally { setBusy(false) }
   }
 
@@ -155,7 +222,8 @@ export default function Btc5mPassiveMakerPaper() {
           </p>
         </div>
         <div className="toolbar" style={{ gap: 6 }}>
-          <button onClick={runOnce} disabled={busy} data-testid="run-btn">{busy ? 'Running…' : 'Run once'}</button>
+          <button onClick={() => act(api.btc5mPmPaperRunOnce)} disabled={busy} data-testid="run-btn">{busy ? 'Running…' : 'Run quote cycle'}</button>
+          <button className="secondary" onClick={() => act(api.btc5mPmForwardRunOnce)} disabled={busy} data-testid="fwd-btn">Run forward cycle</button>
           <button className="secondary" onClick={load} disabled={busy}>↻ Refresh</button>
         </div>
       </div>
@@ -163,11 +231,17 @@ export default function Btc5mPassiveMakerPaper() {
       {!s.enabled && (
         <div className="panel" style={{ marginBottom: 8 }} data-testid="disabled-note">
           <div className="small muted">Harness is <b>DISABLED</b> (default). Set <code>BTC_PASSIVE_MAKER_PAPER_ENABLED=true</code>
-            to forward-collect. Run-once is a no-op while disabled. There is no live-execution path.</div>
+            (and <code>BTC_PASSIVE_MAKER_FORWARD_ENABLED=true</code> for auto-conversion) to forward-collect.
+            Run-once is a no-op while disabled. There is no live-execution path.</div>
         </div>
       )}
 
+      <FunnelDiagnostics diag={diag} />
+
       <PaperReport status={status} />
+
+      <h3 style={{ margin: '14px 0 4px' }}>Cohorts — BTC gate vs broad universe vs multi-point (each gated separately)</h3>
+      <FamilyBreakdown breakdown={s.family_breakdown} />
 
       <h3 style={{ margin: '14px 0 4px' }}>Latest paper fills</h3>
       <QuotesTable rows={fills} testid="pm-fills" kind="fills" />
