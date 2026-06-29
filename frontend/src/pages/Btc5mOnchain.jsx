@@ -13,6 +13,64 @@ const VERDICT = {
   insufficient_data: { kind: 'neutral', label: '… INSUFFICIENT DATA' },
 }
 
+// diagnosis code -> tone (answers "why 0 signals?")
+const DIAGNOSIS_TONE = {
+  detecting: '', not_started: 'warn', rpc_not_configured: 'warn',
+  rpc_log_issue: 'neg', no_watched_trade: 'warn', token_map_issue: 'neg', all_ignored: 'warn',
+}
+const ago = (iso) => {
+  if (!iso) return 'never'
+  const s = (Date.now() - new Date(iso).getTime()) / 1000
+  if (s < 60) return `${Math.floor(s)}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  return `${Math.floor(s / 3600)}h ago`
+}
+
+// Read-only diagnostics — pure presentational, exported for tests.
+export function DiagnosticsPanel({ diagnostics, diagnosis }) {
+  const d = diagnostics || {}
+  const dg = diagnosis || {}
+  const tm = d.token_map || {}
+  const ignored = Object.entries(d.ignored_by_reason || {}).sort((a, b) => b[1] - a[1])
+  return (
+    <div data-testid="diagnostics-panel">
+      <h4 style={{ margin: '12px 0 4px' }}>Diagnostics <span className="badge sharp">read-only</span></h4>
+      <div className={`diag-strip ${DIAGNOSIS_TONE[dg.code] || ''}`} data-testid="diagnosis-banner" style={{ marginBottom: 8 }}>
+        🔎 <b>{(dg.code || 'unknown').replace(/_/g, ' ')}</b> — {dg.message}
+      </div>
+      <div className="cards">
+        <div className="card"><div className="label">Blocks scanned</div><div className="value">{d.blocks_scanned ?? 0}</div>
+          <div className="sub">last block {d.last_block_scanned ?? '—'}</div></div>
+        <div className="card"><div className="label">OrderFilled seen</div><div className="value">{d.logs_scanned ?? 0}</div>
+          <div className="sub">all wallets (chain health)</div></div>
+        <div className="card"><div className="label">Decoded (watched filter)</div><div className="value">{d.orderfilled_decoded ?? 0}</div></div>
+        <div className="card"><div className="label">Matching watched wallets</div><div className={`value ${d.events_matching_watched ? 'pos' : ''}`}>{d.events_matching_watched ?? 0}</div></div>
+        <div className="card"><div className="label">BTC token-map matches</div><div className={`value ${d.btc_token_map_matches ? 'pos' : ''}`}>{d.btc_token_map_matches ?? 0}</div></div>
+        <div className="card"><div className="label">Detector errors</div><div className={`value ${d.error_count ? 'neg' : ''}`}>{d.error_count ?? 0}</div>
+          <div className="sub" title={d.last_error || ''}>{d.last_error ? String(d.last_error).slice(0, 24) : 'none'}</div></div>
+      </div>
+
+      <div className="cards" style={{ marginTop: 10 }}>
+        <div className="card" style={{ flex: 1, minWidth: 300 }}>
+          <div className="label">Last events</div>
+          <div className="small"><b>OrderFilled:</b> {d.last_orderfilled || '—'} <span className="muted">{ago(d.last_orderfilled_at)}</span></div>
+          <div className="small"><b>Watched-wallet:</b> {d.last_watched_event || '—'} <span className="muted">{ago(d.last_watched_event_at)}</span></div>
+          <div className="small"><b>BTC market:</b> {d.last_btc_market_event || '—'} <span className="muted">{ago(d.last_btc_market_event_at)}</span></div>
+        </div>
+        <div className="card" style={{ flex: 1, minWidth: 240 }}>
+          <div className="label">Token map</div>
+          <div className="small">size <b>{tm.size ?? 0}</b> · refreshed {ago(tm.refreshed_at)}</div>
+          {tm.error && <div className="small neg">⚠ {tm.error}</div>}
+          <div className="label" style={{ marginTop: 8 }}>Ignored by reason</div>
+          {ignored.length
+            ? ignored.map(([r, n]) => <div key={r} className="small"><span className="badge neutral">{n}</span> {r}</div>)
+            : <div className="small muted">none</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function SignalsTable({ rows, testid, empty }) {
   if (!rows?.length) return <Empty>{empty}</Empty>
   return (
@@ -99,6 +157,8 @@ export function OnchainPanel({ status, signals, onStart, onStop, onRunOnce, busy
           {s.last_error && <div className="small neg" style={{ marginTop: 4 }}>err: {String(s.last_error).slice(0, 50)}</div>}
         </div>
       </div>
+
+      <DiagnosticsPanel diagnostics={s.diagnostics} diagnosis={s.diagnosis} />
 
       <h4 style={{ margin: '12px 0 4px' }}>Detected signals ({signals?.signals?.length ?? 0})</h4>
       <SignalsTable rows={signals?.signals} testid="onchain-signals" empty="No watched-wallet BTC up/down BUY signals detected yet." />

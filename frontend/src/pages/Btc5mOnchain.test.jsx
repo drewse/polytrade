@@ -1,6 +1,18 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { OnchainPanel } from './Btc5mOnchain.jsx'
+import { OnchainPanel, DiagnosticsPanel } from './Btc5mOnchain.jsx'
+
+const diagnostics = (over = {}) => ({
+  blocks_scanned: 1200, logs_scanned: 350, orderfilled_decoded: 4, events_matching_watched: 4,
+  btc_token_map_matches: 3, ignored_by_reason: { 'price > max entry': 2 }, error_count: 0,
+  last_block_scanned: 99887766, last_orderfilled: 'block 99887766 0x12ab…→0x34cd…',
+  last_orderfilled_at: new Date(Date.now() - 5000).toISOString(),
+  last_watched_event: 'block 99887766 0x4c94…  buy 12345678…',
+  last_watched_event_at: new Date(Date.now() - 8000).toISOString(),
+  last_btc_market_event: 'Bitcoin Up or Down 5m buy @ 0.5',
+  last_btc_market_event_at: new Date(Date.now() - 9000).toISOString(),
+  last_error: null, token_map: { size: 8, refreshed_at: new Date().toISOString(), error: null }, ...over,
+})
 
 const status = (over = {}) => ({
   enabled: true, paper_only: true, live_execution: false, running: false,
@@ -13,7 +25,9 @@ const status = (over = {}) => ({
     worst_latency_s: 6.1, best_latency_s: 2.0, pct_under_5s: 86, pct_under_10s: 100,
     avg_abs_drift: 0.012, est_roi_loss_to_latency: 0.024, target_latency_s: 5,
     verdict: 'viable', recommendation: 'proceed to live micro-test V4',
-  }, ...over,
+  },
+  diagnostics: diagnostics(), diagnosis: { code: 'detecting', message: 'detecting actionable signals (4)' },
+  ...over,
 })
 
 const signals = {
@@ -76,5 +90,41 @@ describe('OnchainPanel', () => {
   it('disables Start when env-disabled', () => {
     render(<OnchainPanel status={status({ enabled: false })} signals={signals} />)
     expect(screen.getByTestId('onchain-start')).toBeDisabled()
+  })
+
+  it('renders the diagnostics panel', () => {
+    render(<OnchainPanel status={status()} signals={signals} />)
+    expect(screen.getByTestId('diagnostics-panel')).toBeInTheDocument()
+  })
+})
+
+describe('DiagnosticsPanel', () => {
+  it('shows the diagnosis banner and counters', () => {
+    render(<DiagnosticsPanel diagnostics={diagnostics()} diagnosis={{ code: 'detecting', message: 'detecting actionable signals (4)' }} />)
+    expect(screen.getByTestId('diagnosis-banner')).toHaveTextContent('detecting')
+    expect(screen.getByText('1200')).toBeInTheDocument()   // blocks scanned
+    expect(screen.getByText('350')).toBeInTheDocument()    // OrderFilled seen
+  })
+
+  it('surfaces "no watched trade" diagnosis', () => {
+    render(<DiagnosticsPanel
+      diagnostics={diagnostics({ events_matching_watched: 0, btc_token_map_matches: 0, orderfilled_decoded: 0 })}
+      diagnosis={{ code: 'no_watched_trade', message: 'chain active but none from watched wallets' }} />)
+    expect(screen.getByTestId('diagnosis-banner')).toHaveTextContent('no watched trade')
+  })
+
+  it('surfaces "token map issue" diagnosis and ignored reasons', () => {
+    render(<DiagnosticsPanel
+      diagnostics={diagnostics({ btc_token_map_matches: 0, ignored_by_reason: { 'token not in BTC up/down map': 3 } })}
+      diagnosis={{ code: 'token_map_issue', message: 'watched traded but token not in BTC map' }} />)
+    expect(screen.getByTestId('diagnosis-banner')).toHaveTextContent('token map issue')
+    expect(screen.getByText(/token not in BTC up\/down map/)).toBeInTheDocument()
+  })
+
+  it('shows token-map error when present', () => {
+    render(<DiagnosticsPanel
+      diagnostics={diagnostics({ token_map: { size: 0, refreshed_at: null, error: 'gamma timeout' } })}
+      diagnosis={{ code: 'rpc_log_issue', message: 'x' }} />)
+    expect(screen.getByText(/gamma timeout/)).toBeInTheDocument()
   })
 })

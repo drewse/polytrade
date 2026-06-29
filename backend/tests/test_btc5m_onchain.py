@@ -148,6 +148,8 @@ def test_run_once_advances_cursor_and_isolated(in_memory_db, monkeypatch):
     out = oc.run_once(db, now=now,
                       latest_block_fn=lambda cfg: 100,
                       fetch_logs_fn=lambda cfg, a, b: [_log(maker=PRIMARY, taker=OTHER)],
+                      fetch_all_logs_fn=lambda cfg, a, b: [_log(maker=PRIMARY, taker=OTHER),
+                                                           _log(maker=OTHER, taker="0x2222222222222222222222222222222222222222", tx="0xz")],
                       token_fetch_fn=lambda: GAMMA,
                       price_fn=lambda t: 0.5,
                       block_ts_fn=lambda b: now - timedelta(seconds=2))
@@ -155,7 +157,8 @@ def test_run_once_advances_cursor_and_isolated(in_memory_db, monkeypatch):
     assert oc.get_state(db).last_processed_block == 100
     # second cycle, new block, no new logs -> cursor advances, no dup
     oc.run_once(db, now=now, latest_block_fn=lambda cfg: 101,
-                fetch_logs_fn=lambda cfg, a, b: [], token_fetch_fn=lambda: GAMMA)
+                fetch_logs_fn=lambda cfg, a, b: [], fetch_all_logs_fn=lambda cfg, a, b: [],
+                token_fetch_fn=lambda: GAMMA)
     assert oc.get_state(db).last_processed_block == 101
     # ISOLATION: no production execution / bankroll change ever
     assert db.scalar(select(func.count()).select_from(LiveExecution)) == 0
@@ -193,3 +196,80 @@ def test_latency_metrics_and_verdict(in_memory_db, monkeypatch):
     assert s["median_latency_s"] is not None and s["median_latency_s"] < 5
     assert s["pct_under_10s"] == 100.0
     assert s["verdict"] == "viable"
+
+
+# --- read-only diagnostics --------------------------------------------------
+def test_process_logs_emits_diagnostics(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    logs = [
+        _log(maker=PRIMARY, taker=OTHER, tx="0x1"),                       # watched BTC buy (actionable)
+        _log(maker=OTHER, taker="0x2222222222222222222222222222222222222222", tx="0x2"),  # not watched
+        _log(maker=PRIMARY, taker=OTHER, taker_asset="99999", tx="0x3"),  # watched, token not in map
+    ]
+    out = _proc(db, logs)
+    d = out["diag"]
+    assert d["decoded"] == 3 and d["watched"] == 2 and d["btc_matches"] == 1
+    assert d["ignored_by_reason"].get("token not in BTC up/down map") == 1
+    assert d["last_watched"] and d["last_btc"]
+
+
+def _run(db, now, *, all_logs, watched_logs=None, token=GAMMA, block=100):
+    return oc.run_once(db, now=now, latest_block_fn=lambda cfg: block,
+                       fetch_logs_fn=lambda cfg, a, b: watched_logs if watched_logs is not None else [],
+                       fetch_all_logs_fn=lambda cfg, a, b: all_logs,
+                       token_fetch_fn=lambda: token, price_fn=lambda t: 0.5,
+                       block_ts_fn=lambda b: now - timedelta(seconds=3))
+
+
+def test_diagnosis_no_watched_trade(in_memory_db, monkeypatch):
+    """Chain active (OrderFilled seen) but none from watched wallets."""
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    _run(db, now, all_logs=[_log(maker=OTHER, taker="0x2222222222222222222222222222222222222222", tx="0xa")],
+         watched_logs=[])
+    diag = oc.status(db)["diagnosis"]
+    assert diag["code"] == "no_watched_trade"
+    d = oc.status(db)["diagnostics"]
+    assert d["logs_scanned"] >= 1 and d["events_matching_watched"] == 0
+
+
+def test_diagnosis_rpc_log_issue_when_no_orderfilled(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    _run(db, now, all_logs=[], watched_logs=[])          # blocks scanned but ZERO OrderFilled
+    assert oc.status(db)["diagnosis"]["code"] == "rpc_log_issue"
+
+
+def test_diagnosis_token_map_issue(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    # watched wallet traded a token that is NOT in the BTC map
+    wl = [_log(maker=PRIMARY, taker=OTHER, taker_asset="99999", tx="0xb")]
+    _run(db, now, all_logs=wl, watched_logs=wl)
+    assert oc.status(db)["diagnosis"]["code"] == "token_map_issue"
+
+
+def test_diagnosis_all_ignored_by_gates(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    # watched BTC buy but price 0.75 > 0.60 ceiling -> ignored by gate
+    wl = [_log(maker=PRIMARY, taker=OTHER, usd=3_750_000, shares=5_000_000, tx="0xc")]
+    _run(db, now, all_logs=wl, watched_logs=wl)
+    diag = oc.status(db)["diagnosis"]
+    assert diag["code"] == "all_ignored" and "max entry" in diag["message"]
+
+
+def test_diagnosis_not_started(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    assert oc.status(db)["diagnosis"]["code"] == "not_started"
+
+
+def test_diagnostics_accumulate_across_cycles(in_memory_db, monkeypatch):
+    db = in_memory_db; _enable(monkeypatch)
+    now = datetime.utcnow()
+    wl = [_log(maker=PRIMARY, taker=OTHER, tx="0xd")]
+    _run(db, now, all_logs=wl, watched_logs=wl, block=100)
+    _run(db, now, all_logs=[_log(maker=PRIMARY, taker=OTHER, tx="0xe")],
+         watched_logs=[_log(maker=PRIMARY, taker=OTHER, tx="0xe")], block=101)
+    d = oc.status(db)["diagnostics"]
+    assert d["blocks_scanned"] >= 2 and d["events_matching_watched"] == 2 and d["btc_token_map_matches"] == 2

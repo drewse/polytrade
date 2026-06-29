@@ -101,6 +101,24 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "stats_updated": "BOOLEAN DEFAULT 0",
     },
     "ingest_status": {"last_discovery_at": "DATETIME"},
+    # BTC 5M on-chain detector read-only diagnostics added after the table shipped.
+    "btc5m_onchain_state": {
+        "blocks_scanned": "BIGINT DEFAULT 0",
+        "logs_scanned": "BIGINT DEFAULT 0",
+        "events_decoded": "BIGINT DEFAULT 0",
+        "events_watched": "BIGINT DEFAULT 0",
+        "btc_matches": "BIGINT DEFAULT 0",
+        "ignored_by_reason": "JSON",
+        "error_count": "INTEGER DEFAULT 0",
+        "last_orderfilled_at": "DATETIME",
+        "last_orderfilled_desc": "TEXT",
+        "last_watched_event_at": "DATETIME",
+        "last_watched_desc": "TEXT",
+        "last_btc_event_at": "DATETIME",
+        "last_btc_desc": "TEXT",
+        "token_map_refreshed_at": "DATETIME",
+        "token_map_error": "TEXT",
+    },
     # BTC 5M Micro-Test V2 — latency instrumentation + price-drift columns added
     # after the V1 table shipped (ALTER preserves the existing empty table).
     "btc5m_micro_test_trades": {

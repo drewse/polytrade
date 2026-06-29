@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -78,4 +78,22 @@ class Btc5mOnchainState(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- read-only diagnostics (cumulative counters + last-seen markers) -----
+    blocks_scanned: Mapped[int] = mapped_column(BigInteger, default=0)
+    logs_scanned: Mapped[int] = mapped_column(BigInteger, default=0)        # all OrderFilled on exchanges
+    events_decoded: Mapped[int] = mapped_column(BigInteger, default=0)      # watched-filtered, decoded
+    events_watched: Mapped[int] = mapped_column(BigInteger, default=0)      # decoded + maker/taker is watched
+    btc_matches: Mapped[int] = mapped_column(BigInteger, default=0)         # token resolved to a BTC market
+    ignored_by_reason: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_orderfilled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_orderfilled_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_watched_event_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_watched_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_btc_event_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_btc_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_map_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    token_map_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

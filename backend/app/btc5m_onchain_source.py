@@ -68,6 +68,7 @@ def _cfg() -> dict:
         "max_signals": int(os.getenv("BTC5M_ONCHAIN_MAX_SIGNALS", "50")),
         "target_latency_s": float(os.getenv("BTC5M_ONCHAIN_TARGET_LATENCY_SECONDS", "5")),
         "poll_seconds": max(1, int(os.getenv("BTC5M_ONCHAIN_POLL_SECONDS", "2"))),
+        "diag_blocks": max(1, int(os.getenv("BTC5M_ONCHAIN_DIAG_BLOCKS", "5"))),
         "watched": watched,
         "max_entry_price": mt["max_entry_price"],
         "min_seconds_remaining": mt["min_seconds_remaining"],
@@ -271,6 +272,15 @@ def rpc_get_logs(cfg: dict, from_block: int, to_block: int) -> list[dict]:
     return out
 
 
+def rpc_get_logs_all(cfg: dict, from_block: int, to_block: int) -> list[dict]:
+    """ALL OrderFilled logs on the configured exchanges in [from_block, to_block]
+    (no wallet filter). Read-only diagnostic: lets us see whether the chain is
+    producing OrderFilled at all (RPC + contract addresses + topic0 healthy) even
+    when no WATCHED wallet has traded. Bounded by the caller to a small window."""
+    return _rpc(cfg, "eth_getLogs", [{"fromBlock": hex(from_block), "toBlock": hex(to_block),
+                                      "address": cfg["exchanges"], "topics": [ORDERFILLED_TOPIC0]}]) or []
+
+
 _BLOCK_TS_CACHE: dict[int, datetime] = {}
 
 
@@ -325,6 +335,11 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
     now = now or datetime.utcnow()
     watched, exchanges = cfg["watched"], set(cfg["exchanges"])
     created = ignored = skipped = 0
+    # per-cycle read-only diagnostics
+    diag = {"decoded": 0, "watched": 0, "btc_matches": 0, "ignored_by_reason": {},
+            "last_orderfilled": None, "last_orderfilled_at": None,
+            "last_watched": None, "last_watched_at": None,
+            "last_btc": None, "last_btc_at": None}
     for log in logs:
         topics = log.get("topics") or []
         if not topics or str(topics[0]).lower() != ORDERFILLED_TOPIC0:
@@ -332,13 +347,23 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
         if str(log.get("address", "")).lower() not in exchanges:
             continue
         dec = decode_order_filled(log)
+        diag["decoded"] += 1
+        diag["last_orderfilled"] = f"block {dec['block_number']} {dec['maker'][:10]}…→{dec['taker'][:10]}…"
+        diag["last_orderfilled_at"] = now
         if _exists(db, dec["tx_hash"], dec["log_index"]):        # dedup (gap-fill safe)
             skipped += 1
             continue
         cl = classify_fill(dec, watched, exchanges)
         if cl is None:                                           # not a watched-wallet fill
             continue
+        diag["watched"] += 1
+        diag["last_watched"] = f"block {dec['block_number']} {cl['watched'][:10]}… {cl['side']} {cl['token_id'][:8]}…"
+        diag["last_watched_at"] = now
         meta = tmap.get(str(cl["token_id"]))
+        if meta is not None:
+            diag["btc_matches"] += 1
+            diag["last_btc"] = f"{(meta.get('question') or '')[:32]} {cl['side']} @ {cl['price']}"
+            diag["last_btc_at"] = now
         block_ts = (block_ts_fn or (lambda b: rpc_block_timestamp(cfg, b)))(dec["block_number"])
         latency_ms = round((now - block_ts).total_seconds() * 1000, 1) if block_ts else None
         secs = _seconds_until_expiry(meta.get("end_date") if meta else None, now)
@@ -385,8 +410,9 @@ def process_logs(db: Session, logs: list[dict], *, cfg: dict, tmap: dict, now: d
         created += 1
         if ignored_reason:
             ignored += 1
+            diag["ignored_by_reason"][ignored_reason] = diag["ignored_by_reason"].get(ignored_reason, 0) + 1
     db.commit()
-    return {"signals_created": created, "ignored": ignored, "deduped": skipped}
+    return {"signals_created": created, "ignored": ignored, "deduped": skipped, "diag": diag}
 
 
 def _safe_price(token_id: str) -> float | None:
@@ -399,8 +425,29 @@ def _safe_price(token_id: str) -> float | None:
 # ---------------------------------------------------------------------------
 # one poll cycle (reconnect/gap-fill safe)
 # ---------------------------------------------------------------------------
+def _accumulate_diag(st: om.Btc5mOnchainState, *, blocks: int, logs_all: int, res: dict) -> None:
+    """Fold a cycle's read-only diagnostics into the persisted detector state."""
+    d = res.get("diag", {}) if res else {}
+    st.blocks_scanned = (st.blocks_scanned or 0) + max(0, blocks)
+    st.logs_scanned = (st.logs_scanned or 0) + max(0, logs_all)
+    st.events_decoded = (st.events_decoded or 0) + d.get("decoded", 0)
+    st.events_watched = (st.events_watched or 0) + d.get("watched", 0)
+    st.btc_matches = (st.btc_matches or 0) + d.get("btc_matches", 0)
+    if d.get("ignored_by_reason"):
+        merged = dict(st.ignored_by_reason or {})
+        for k, v in d["ignored_by_reason"].items():
+            merged[k] = merged.get(k, 0) + v
+        st.ignored_by_reason = merged
+    if d.get("last_orderfilled"):
+        st.last_orderfilled_at = d["last_orderfilled_at"]; st.last_orderfilled_desc = d["last_orderfilled"]
+    if d.get("last_watched"):
+        st.last_watched_event_at = d["last_watched_at"]; st.last_watched_desc = d["last_watched"]
+    if d.get("last_btc"):
+        st.last_btc_event_at = d["last_btc_at"]; st.last_btc_desc = d["last_btc"]
+
+
 def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, latest_block_fn=None,
-             token_fetch_fn=None, price_fn=None, block_ts_fn=None) -> dict:
+             token_fetch_fn=None, price_fn=None, block_ts_fn=None, fetch_all_logs_fn=None) -> dict:
     now = now or datetime.utcnow()
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -409,8 +456,15 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
         return {"ran": False, "reason": "no watched wallets configured"}
     st = get_state(db)
     try:
-        tmap = fetch_token_map(token_fetch_fn)
-        st.token_map_size = len(tmap)
+        # token-map refresh (with read-only status)
+        try:
+            tmap = fetch_token_map(token_fetch_fn)
+            st.token_map_size = len(tmap)
+            st.token_map_refreshed_at = now
+            st.token_map_error = None if tmap else "token map empty (no BTC up/down markets found)"
+        except Exception as exc:  # noqa: BLE001  (token map is best-effort)
+            tmap = {}
+            st.token_map_error = f"{type(exc).__name__}: {exc}"
         latest = (latest_block_fn or rpc_block_number)(cfg)
         confirmed = max(0, latest - cfg["confirmations"])
         # cursor: resume from last_processed_block+1; first run starts at the tip
@@ -422,15 +476,29 @@ def run_once(db: Session, *, now: datetime | None = None, fetch_logs_fn=None, la
                     "signals_created": 0, "ignored": 0, "deduped": 0, "no_new_blocks": True}
         logs = (fetch_logs_fn or rpc_get_logs)(cfg, from_block, confirmed)
         res = process_logs(db, logs, cfg=cfg, tmap=tmap, now=now, price_fn=price_fn, block_ts_fn=block_ts_fn)
+
+        # read-only diagnostic: count ALL OrderFilled (any wallet) over a bounded
+        # recent window, to tell "no watched-wallet trade" apart from "RPC/contract
+        # issue". Fail-soft — never affects detection.
+        logs_all = 0
+        try:
+            diag_from = max(from_block, confirmed - cfg["diag_blocks"] + 1)
+            logs_all = len((fetch_all_logs_fn or rpc_get_logs_all)(cfg, diag_from, confirmed))
+        except Exception:  # noqa: BLE001
+            logs_all = max(logs_all, len(logs))      # at least the watched logs we did see
+
+        _accumulate_diag(st, blocks=(confirmed - from_block + 1), logs_all=logs_all, res=res)
         st.last_processed_block = confirmed
         st.last_poll_at = now
         st.rpc_connected = True
         st.last_error = None
         st.signals_captured = db.scalar(select(func.count()).select_from(om.Btc5mOnchainSignal)) or 0
         db.commit()
-        return {"ran": True, "from_block": from_block, "to_block": confirmed, **res}
+        return {"ran": True, "from_block": from_block, "to_block": confirmed,
+                "logs_scanned": logs_all, **res}
     except Exception as exc:  # noqa: BLE001  (fail-soft: record, keep cursor, retry next poll)
         st.rpc_connected = False
+        st.error_count = (st.error_count or 0) + 1
         st.last_error = f"{type(exc).__name__}: {exc}"
         db.commit()
         return {"ran": False, "reason": st.last_error}
@@ -566,8 +634,62 @@ def is_running() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# dashboard payload
+# read-only diagnostics + derived diagnosis (answers: why 0 signals?)
 # ---------------------------------------------------------------------------
+def _diagnostics(st: om.Btc5mOnchainState, cfg: dict) -> dict:
+    return {
+        "blocks_scanned": st.blocks_scanned or 0,
+        "logs_scanned": st.logs_scanned or 0,                 # all OrderFilled on exchanges
+        "orderfilled_decoded": st.events_decoded or 0,        # watched-filtered, decoded
+        "events_matching_watched": st.events_watched or 0,
+        "btc_token_map_matches": st.btc_matches or 0,
+        "ignored_by_reason": st.ignored_by_reason or {},
+        "error_count": st.error_count or 0,
+        "last_block_scanned": st.last_processed_block,
+        "last_orderfilled": st.last_orderfilled_desc,
+        "last_orderfilled_at": st.last_orderfilled_at.isoformat() if st.last_orderfilled_at else None,
+        "last_watched_event": st.last_watched_desc,
+        "last_watched_event_at": st.last_watched_event_at.isoformat() if st.last_watched_event_at else None,
+        "last_btc_market_event": st.last_btc_desc,
+        "last_btc_market_event_at": st.last_btc_event_at.isoformat() if st.last_btc_event_at else None,
+        "last_error": st.last_error,
+        "token_map": {
+            "size": st.token_map_size or 0,
+            "refreshed_at": st.token_map_refreshed_at.isoformat() if st.token_map_refreshed_at else None,
+            "error": st.token_map_error,
+        },
+    }
+
+
+def _diagnosis(st: om.Btc5mOnchainState, cfg: dict, actionable: int) -> dict:
+    """Explain what 0 signals means, per the 4 scenarios. Read-only."""
+    if not cfg.get("rpc_url"):
+        return {"code": "rpc_not_configured", "message": "POLYGON_WS_RPC_URL is not set"}
+    if not (st.blocks_scanned or 0):
+        return {"code": "not_started", "message": "detector has not scanned any blocks yet — start it / run once"}
+    if (st.error_count or 0) and not st.rpc_connected:
+        return {"code": "rpc_log_issue", "message": f"RPC/log error: {st.last_error}"}
+    if not (st.logs_scanned or 0):
+        return {"code": "rpc_log_issue",
+                "message": ("no OrderFilled events seen on the configured exchanges across "
+                            f"{st.blocks_scanned} blocks — check exchange addresses / topic0 / RPC "
+                            "(or, far less likely, the whole venue was idle)")}
+    if not (st.events_watched or 0):
+        return {"code": "no_watched_trade",
+                "message": (f"chain is active ({st.logs_scanned} OrderFilled seen) but NONE involved a "
+                            "watched wallet — the watched wallets simply haven't traded")}
+    if not (st.btc_matches or 0):
+        return {"code": "token_map_issue",
+                "message": (f"watched wallets traded ({st.events_watched} events) but no token resolved to a "
+                            f"BTC up/down market — token-map issue (size {st.token_map_size}) or non-BTC trades")}
+    if not actionable:
+        top = sorted((st.ignored_by_reason or {}).items(), key=lambda kv: -kv[1])
+        why = ", ".join(f"{k}×{v}" for k, v in top[:4]) or "see ignored table"
+        return {"code": "all_ignored",
+                "message": f"watched BTC trades detected but all ignored by gates: {why}"}
+    return {"code": "detecting", "message": f"detecting actionable signals ({actionable})"}
+
+
 def _signal_dict(s: om.Btc5mOnchainSignal) -> dict:
     return {"id": s.id, "tx_hash": s.tx_hash, "log_index": s.log_index, "block_number": s.block_number,
             "block_timestamp": s.block_timestamp.isoformat() if s.block_timestamp else None,
@@ -595,6 +717,8 @@ def signals(db: Session, *, limit: int = 50) -> dict:
 def status(db: Session) -> dict:
     cfg = _cfg()
     st = get_state(db)
+    st_stats = stats(db)
+    actionable = st_stats.get("actionable_buys", 0)
     return {
         "enabled": cfg["enabled"],
         "paper_only": cfg["paper_only"],
@@ -614,7 +738,9 @@ def status(db: Session) -> dict:
                    "poll_gamma_seconds": cfg["poll_gamma_seconds"], "max_signals": cfg["max_signals"],
                    "target_latency_s": cfg["target_latency_s"], "max_entry_price": cfg["max_entry_price"],
                    "min_seconds_remaining": cfg["min_seconds_remaining"]},
-        "stats": stats(db),
+        "stats": st_stats,
+        "diagnostics": _diagnostics(st, cfg),
+        "diagnosis": _diagnosis(st, cfg, actionable),
         "safety": ("PAPER-ONLY on-chain latency measurement — never places orders, never touches "
                    "LiveExecution/bankroll/production copy trading"),
     }
