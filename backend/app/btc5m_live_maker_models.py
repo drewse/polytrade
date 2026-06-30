@@ -66,6 +66,7 @@ class Btc5mLiveMakerSession(Base):
     fills: Mapped[int] = mapped_column(Integer, default=0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     fees_paid: Mapped[float] = mapped_column(Float, default=0.0)
+    max_orders: Mapped[int] = mapped_column(Integer, default=0)                   # 0 = unlimited; smoke test = 1
     summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)             # auto research summary
 
 

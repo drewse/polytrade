@@ -182,7 +182,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "decision": "JSON",
         "counterfactual": "JSON",
     },
-    "btc5m_live_maker_sessions": {"summary": "JSON"},
+    "btc5m_live_maker_sessions": {"summary": "JSON", "max_orders": "INTEGER DEFAULT 0"},
     # BTC passive-maker forward pipeline: market-family / quote-kind tagging added
     # after the paper-quote table shipped (keeps BTC / broad / multi-point separate).
     "btc5m_paper_quotes": {

@@ -124,7 +124,7 @@ def reset_lock(db: Session) -> dict:
     return {"ok": True, "locked": False}
 
 
-def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None) -> dict:
+def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None, max_orders: int = 0) -> dict:
     cfg = get_config()
     st = _state(db)
     if st.locked:
@@ -140,7 +140,7 @@ def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None) -> d
         recon = reconcile_open_orders(db)
         log(db, "reconcile", {"context": "pre-arm", **recon})
     ttl = ttl_min if ttl_min is not None else cfg["session_ttl_min"]
-    sess = lm.Btc5mLiveMakerSession(mode=mode, caps={k: cfg[k] for k in (
+    sess = lm.Btc5mLiveMakerSession(mode=mode, max_orders=max_orders, caps={k: cfg[k] for k in (
         "per_order_usd", "max_concurrent", "max_exposure_usd", "max_experiment_capital_usd",
         "cumulative_loss_stop_usd", "session_loss_limit_usd", "queue_lifetime_s", "min_order_shares")}, status="active")
     db.add(sess)
@@ -153,9 +153,9 @@ def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None) -> d
     st.open_exposure_usd = 0.0
     st.session_realized_pnl = 0.0
     db.commit()
-    log(db, "arm", {"mode": mode, "ttl_min": ttl, "caps": sess.caps}, session_id=sess.id)
+    log(db, "arm", {"mode": mode, "ttl_min": ttl, "max_orders": max_orders, "caps": sess.caps}, session_id=sess.id)
     return {"ok": True, "armed": True, "mode": mode, "session_id": sess.id,
-            "expires_at": st.arm_expires_at.isoformat()}
+            "max_orders": max_orders, "expires_at": st.arm_expires_at.isoformat()}
 
 
 def disarm(db: Session, reason: str = "manual", *, client=None) -> dict:
@@ -367,12 +367,22 @@ def run_cycle(db: Session, *, client=None) -> dict:
     st.committed_capital_usd = committed_capital(db)
     st.last_cycle_at = datetime.utcnow()
     st.last_error = None
+    db.commit()
     # session loss auto-stop
     if st.session_realized_pnl <= -cfg["session_loss_limit_usd"]:
-        db.commit()
         disarm(db, reason="session_loss_limit", client=client)
         return {"ran": True, "reconciled": reconciled, "settled": settled, "posted": posted, "stopped": "session_loss_limit"}
-    db.commit()
+    # SINGLE-ORDER auto-disarm: once the order cap is reached AND that order has reached a
+    # terminal state (filled / cancelled / rejected / error), disarm immediately.
+    sess = db.get(lm.Btc5mLiveMakerSession, st.session_id) if st.session_id else None
+    if sess and sess.max_orders and sess.orders >= sess.max_orders:
+        live_n = db.scalar(select(func.count()).select_from(lm.Btc5mLiveMakerOrder).where(
+            lm.Btc5mLiveMakerOrder.session_id == sess.id,
+            lm.Btc5mLiveMakerOrder.status.in_(("intended", "submitted", "acked", "resting", "partial")))) or 0
+        if live_n == 0:                                # the single order is no longer working
+            disarm(db, reason="single_order_complete", client=client)
+            return {"ran": True, "reconciled": reconciled, "settled": settled, "posted": posted,
+                    "stopped": "single_order_complete"}
     return {"ran": True, "reconciled": reconciled, "settled": settled, "posted": posted, "mode": st.mode}
 
 
@@ -510,8 +520,9 @@ def _cancel_order(db, client, o, st):
     o.cancel_latency_ms = res.get("latency_ms")
     o.cancel_success = bool(res.get("cancelled", True))
     o.queue_lifetime_ms = (o.cancel_ack_at - o.quote_at).total_seconds() * 1000 if o.quote_at else None
-    if o.status != "partial":
-        o.status = "cancelled"
+    # terminal status after the remainder is cancelled: a partial keeps its filled
+    # position (settles at resolution); a fully-unfilled order is simply cancelled.
+    o.status = "filled" if (o.filled_shares and o.filled_shares > 0) else "cancelled"
     # free the resting exposure
     if o.mode != "shadow":
         st.open_exposure_usd = max(0.0, st.open_exposure_usd - o.notional_usd * (1 - o.filled_shares / o.size_shares))
@@ -520,6 +531,10 @@ def _cancel_order(db, client, o, st):
 
 def _maybe_post(db: Session, client, cfg: dict) -> dict | None:
     st = _state(db)
+    sess = db.get(lm.Btc5mLiveMakerSession, st.session_id) if st.session_id else None
+    # NO RE-ENTRY once the session's order cap is reached (smoke test = 1)
+    if sess and sess.max_orders and sess.orders >= sess.max_orders:
+        return None
     n_open = db.scalar(select(func.count()).select_from(lm.Btc5mLiveMakerOrder)
                        .where(lm.Btc5mLiveMakerOrder.status.in_(("acked", "resting", "partial")))) or 0
     if n_open >= cfg["max_concurrent"]:

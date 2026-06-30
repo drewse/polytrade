@@ -173,6 +173,34 @@ def test_run_cycle_noop_when_disarmed(in_memory_db, monkeypatch):
     assert r["ran"] is False and r["skipped"] == "disarmed"
 
 
+# --- single-order smoke-test controls ---------------------------------------
+def test_single_order_no_reentry_and_autodisarm(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_QUEUE_LIFETIME_S", "12")
+    _patch_book(monkeypatch, bid=0.40, ask=0.45)
+    r = mk.arm(db, mode="live", max_orders=1)
+    assert r["max_orders"] == 1
+    client = clob.MockClobClient(fill_after_polls=None)        # never fills -> will cancel at 12s
+    # cycle 1 posts THE one order
+    mk.run_cycle(db, client=client)
+    assert db.scalar(select(func.count()).select_from(lmm.Btc5mLiveMakerOrder)) == 1
+    # cycle 2 must NOT post a second order (no re-entry) while the first still rests
+    mk.run_cycle(db, client=client)
+    assert db.scalar(select(func.count()).select_from(lmm.Btc5mLiveMakerOrder)) == 1
+    assert mk.status(db)["armed"] is True                     # still armed (order working)
+    # age the order past the 12s lifetime → it cancels → auto-disarm fires
+    o = db.scalars(select(lmm.Btc5mLiveMakerOrder)).first()
+    o.quote_at = datetime.utcnow() - timedelta(seconds=20); db.commit()
+    res = mk.run_cycle(db, client=client)
+    assert res.get("stopped") == "single_order_complete"
+    assert mk.status(db)["armed"] is False                    # auto-disarmed
+    db.refresh(o)
+    assert o.status == "cancelled"                            # unfilled → cancelled
+    assert db.scalar(select(func.count()).select_from(lmm.Btc5mLiveMakerOrder)) == 1   # only ONE order ever
+
+
 # --- $100 experiment budget (software-enforced; ignores wallet balance) ------
 def _add_order(db, **kw):
     base = dict(session_id=1, client_id="x", market_id="M", token_id="T", outcome="YES", side="BUY",
