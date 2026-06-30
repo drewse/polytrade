@@ -32,6 +32,13 @@ class Btc5mLiveMakerState(Base):
     armed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     mode: Mapped[str] = mapped_column(String(8), default="shadow")   # shadow | live
     kill: Mapped[bool] = mapped_column(Boolean, default=False)        # emergency stop
+    # PERMANENT lock — latched when cumulative realized loss reaches the experiment
+    # budget. Disables the executor until an explicit manual reset.
+    locked: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    lock_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # software-enforced experiment ledger (ignores actual wallet balance entirely)
+    committed_capital_usd: Mapped[float] = mapped_column(Float, default=0.0)   # capital AT RISK now
+    cumulative_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)  # across ALL sessions
     armed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     arm_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     session_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -108,6 +115,9 @@ class Btc5mLiveMakerOrder(Base):
     adverse_5s: Mapped[float | None] = mapped_column(Float, nullable=True)        # signed mark-out vs fill
     fees_usd: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)      # at market resolution
+    won: Mapped[bool | None] = mapped_column(Boolean, nullable=True)              # did our side resolve in the money
+    market_window_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 5m window start (resolves +300)
+    position_settled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     cancel_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

@@ -77,6 +77,33 @@ def open_btc5m_markets(limit: int = 30) -> list[dict]:
     return out
 
 
+def get_resolution(window_ts: int) -> dict:
+    """Resolution of a BTC-5m market window (by its boundary slug). Returns
+    {resolved, won_yes} — won_yes True if the UP/YES outcome won. Read-only, fail-soft."""
+    try:
+        with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": "polytrade-research"}) as c:
+            r = c.get(f"{GAMMA}/markets", params={"slug": f"btc-updown-5m-{window_ts}"})
+            r.raise_for_status()
+            d = r.json()
+        if not isinstance(d, list) or not d:
+            return {"resolved": False, "won_yes": None}
+        m = d[0]
+        if not m.get("closed"):
+            return {"resolved": False, "won_yes": None}
+        prices = m.get("outcomePrices")
+        if isinstance(prices, str):
+            import json as _json
+            try:
+                prices = _json.loads(prices)
+            except Exception:  # noqa: BLE001
+                prices = None
+        if prices and len(prices) >= 1:
+            return {"resolved": True, "won_yes": float(prices[0]) >= 0.5}
+        return {"resolved": True, "won_yes": None}
+    except Exception:  # noqa: BLE001
+        return {"resolved": False, "won_yes": None}
+
+
 def get_book(token_id: str) -> dict:
     """Best bid/ask/mid for a token, timestamped. Read-only public CLOB book. Fail-soft."""
     wall, mono = _now()

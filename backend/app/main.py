@@ -1073,6 +1073,18 @@ def btc5m_live_maker_reset_kill(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m live maker reset-kill", detail=_lab_safe(live_maker.reset_kill, db))
 
 
+@app.post("/api/btc5m/live-maker/reset-lock", response_model=MessageOut)
+def btc5m_live_maker_reset_lock(db: Session = Depends(get_db)) -> MessageOut:
+    """Manually clear the PERMANENT cumulative-loss lock (operator action)."""
+    return MessageOut(message="btc5m live maker reset-lock", detail=_lab_safe(live_maker.reset_lock, db))
+
+
+@app.post("/api/btc5m/live-maker/reconcile", response_model=MessageOut)
+def btc5m_live_maker_reconcile(db: Session = Depends(get_db)) -> MessageOut:
+    """Detect + cancel any orphan open orders from a previous run (read/cancel only)."""
+    return MessageOut(message="btc5m live maker reconcile", detail=_lab_safe(live_maker.reconcile_open_orders, db))
+
+
 @app.post("/api/btc5m/live-maker/run-cycle", response_model=MessageOut)
 def btc5m_live_maker_run_cycle(db: Session = Depends(get_db)) -> MessageOut:
     """Drive one cycle manually (used for shadow dry-runs). No-op unless armed; live

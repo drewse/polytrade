@@ -207,6 +207,8 @@ export const api = {
   btc5mLiveMakerDisarm: () => request('/api/btc5m/live-maker/disarm', { method: 'POST' }),
   btc5mLiveMakerKill: () => request('/api/btc5m/live-maker/kill', { method: 'POST' }),
   btc5mLiveMakerResetKill: () => request('/api/btc5m/live-maker/reset-kill', { method: 'POST' }),
+  btc5mLiveMakerResetLock: () => request('/api/btc5m/live-maker/reset-lock', { method: 'POST' }),
+  btc5mLiveMakerReconcile: () => request('/api/btc5m/live-maker/reconcile', { method: 'POST' }),
   btc5mLiveMakerRunCycle: () => request('/api/btc5m/live-maker/run-cycle', { method: 'POST' }),
   btc5mLiveMakerEvents: (limit = 80) => request(`/api/btc5m/live-maker/events?limit=${limit}`),
   // Research Platform V1 — isolated paper research

@@ -61,8 +61,25 @@ def _safe_cycle() -> None:
         traceback.print_exc()
 
 
+def _startup_reconcile() -> None:
+    """MANDATORY: before the loop trades, cancel any orphan open orders left by a prior
+    run (crash/restart). Fail-soft."""
+    try:
+        from . import btc5m_live_maker as maker
+        from .db import session_scope
+        db = session_scope()
+        try:
+            r = maker.reconcile_open_orders(db)
+            print(f"[btc5m-live-maker-worker] startup reconcile: {r}")
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[btc5m-live-maker-worker] startup reconcile error: {exc}")
+
+
 def _loop(poll: int, delay: int) -> None:
     time.sleep(delay)
+    _startup_reconcile()                  # cancel orphans before any trading
     while True:
         _safe_cycle()
         time.sleep(poll)

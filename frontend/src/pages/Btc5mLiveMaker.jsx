@@ -9,15 +9,18 @@ const usd = (n) => (n == null ? '—' : `$${Number(n).toFixed(2)}`)
 // Pure presentational — exported for tests.
 export function StateBanner({ s }) {
   if (!s) return null
+  const locked = s.locked
   const killed = s.kill
   const armed = s.armed
   const live = s.live_path_reachable
-  const kind = killed ? 'neg' : (armed && live ? 'neg' : (armed ? 'warn' : ''))
-  const label = killed ? '🛑 KILLED' : (armed ? `🟢 ARMED · ${s.mode?.toUpperCase()}${live ? ' · LIVE-MONEY' : ''}` : '⚪ DISARMED')
+  const kind = (locked || killed) ? 'neg' : (armed && live ? 'neg' : (armed ? 'warn' : ''))
+  const label = locked ? '🔒 LOCKED (cumulative loss stop)' : (killed ? '🛑 KILLED'
+    : (armed ? `🟢 ARMED · ${s.mode?.toUpperCase()}${live ? ' · LIVE-MONEY' : ''}` : '⚪ DISARMED'))
   return (
     <div className={`diag-strip ${['neg', 'warn'].includes(kind) ? 'neg' : ''}`} data-testid="state-banner">
       {label} · master switch {s.enabled ? 'ENABLED' : 'OFF'} · key {s.has_key ? 'set' : 'absent'} ·
       live path {live ? <b className="neg">REACHABLE</b> : 'blocked'}
+      {locked && s.lock_reason ? ` · ${s.lock_reason}` : ''}
     </div>
   )
 }
@@ -25,18 +28,21 @@ export function StateBanner({ s }) {
 export function ExposureCards({ s }) {
   if (!s) return null
   const c = s.caps || {}
+  const eb = s.experiment_budget || {}
   return (
     <div className="cards" style={{ marginTop: 8 }}>
+      <div className="card"><div className="label">Experiment budget</div>
+        <div className="value" data-testid="budget">{usd(eb.committed_capital_usd)}<span className="sub"> / {usd(eb.max_experiment_capital_usd)}</span></div>
+        <div className="sub">{usd(eb.remaining_usd)} free · software cap (ignores wallet)</div></div>
       <div className="card"><div className="label">Open exposure</div>
         <div className="value" data-testid="exposure">{usd(s.open_exposure_usd)}</div>
         <div className="sub">cap {usd(c.max_exposure_usd)} · {s.open_orders ?? 0} open</div></div>
-      <div className="card"><div className="label">Deployed (cumulative)</div>
-        <div className="value">{usd(s.deployed_usd)}</div><div className="sub">cap {usd(c.total_cap_usd)}</div></div>
       <div className="card"><div className="label">Session P&L</div>
         <div className={`value ${(s.session_realized_pnl || 0) >= 0 ? 'pos' : 'neg'}`}>{usd(s.session_realized_pnl)}</div>
         <div className="sub">stop −{usd(c.session_loss_limit_usd)}</div></div>
-      <div className="card"><div className="label">Per-order / lifetime</div>
-        <div className="value">{usd(c.per_order_usd)}</div><div className="sub">{c.queue_lifetime_s}s rest</div></div>
+      <div className="card"><div className="label">Cumulative P&L</div>
+        <div className={`value ${(eb.cumulative_realized_pnl || 0) >= 0 ? 'pos' : 'neg'}`}>{usd(eb.cumulative_realized_pnl)}</div>
+        <div className="sub">LOCK at −{usd(eb.cumulative_loss_stop_usd)} · {usd(eb.loss_remaining_to_lock_usd)} left</div></div>
     </div>
   )
 }
@@ -119,6 +125,8 @@ export default function Btc5mLiveMaker() {
           <button className="secondary" onClick={() => act('disarm', api.btc5mLiveMakerDisarm)} disabled={busy}>Disarm</button>
           <button onClick={() => act('kill', api.btc5mLiveMakerKill, 'KILL: cancel all orders + latch the kill flag?')} disabled={busy} data-testid="kill"
             style={{ background: '#b00', color: '#fff', fontWeight: 700 }}>🛑 KILL</button>
+          {s?.locked && <button onClick={() => act('reset', api.btc5mLiveMakerResetLock, 'Clear the permanent cumulative-loss LOCK?')} disabled={busy} data-testid="reset-lock">Reset lock</button>}
+          <button className="secondary" onClick={() => act('reconcile', api.btc5mLiveMakerReconcile)} disabled={busy} data-testid="reconcile">Reconcile</button>
           <button className="secondary" onClick={load} disabled={busy}>↻</button>
         </div>
       </div>

@@ -34,21 +34,48 @@ def _truthy(v: str) -> bool:
 
 def get_config() -> dict:
     """Caps live in env so they're auditable, not hard-coded."""
+    # MAX_EXPERIMENT_CAPITAL is the SOFTWARE budget for this experiment. The executor
+    # ignores the wallet's actual balance entirely and only ever risks up to this much.
     return {
         "enabled": _truthy(os.getenv("BTC5M_LIVE_MAKER_ENABLED", "false")),
         "has_key": bool(os.getenv("BTC5M_LIVE_MAKER_PRIVATE_KEY")),
+        "max_experiment_capital_usd": float(os.getenv("BTC5M_LIVE_MAKER_MAX_EXPERIMENT_CAPITAL", "100")),
+        "cumulative_loss_stop_usd": float(os.getenv("BTC5M_LIVE_MAKER_CUMULATIVE_LOSS_STOP", "100")),
         # Polymarket's min order is ~5 shares, so the realistic per-order floor is
         # ~5 × price (≈ $2-3). Default $3 fits cheap-side (price ≤ 0.60) min orders.
         "per_order_usd": float(os.getenv("BTC5M_LIVE_MAKER_PER_ORDER_USD", "3.0")),
         "max_concurrent": int(os.getenv("BTC5M_LIVE_MAKER_MAX_CONCURRENT", "3")),
         "max_exposure_usd": float(os.getenv("BTC5M_LIVE_MAKER_MAX_EXPOSURE_USD", "8")),
-        "total_cap_usd": float(os.getenv("BTC5M_LIVE_MAKER_TOTAL_CAP_USD", "100")),
         "session_loss_limit_usd": float(os.getenv("BTC5M_LIVE_MAKER_SESSION_LOSS_USD", "10")),
         "queue_lifetime_s": float(os.getenv("BTC5M_LIVE_MAKER_QUEUE_LIFETIME_S", "12")),
         "session_ttl_min": float(os.getenv("BTC5M_LIVE_MAKER_SESSION_TTL_MIN", "20")),
         "min_order_shares": float(os.getenv("BTC5M_LIVE_MAKER_MIN_SHARES", "5")),
         "markout_5s": 5.0, "markout_30s": 30.0,
     }
+
+
+# ---------------------------------------------------------------------------
+# capital ledger — derived from the DB, ignores wallet balance entirely
+# ---------------------------------------------------------------------------
+def committed_capital(db: Session) -> float:
+    """USD currently AT RISK: notional resting in open orders + cost basis of filled,
+    not-yet-resolved positions. Recomputed from the DB so it can never drift."""
+    resting = db.scalars(select(lm.Btc5mLiveMakerOrder).where(
+        lm.Btc5mLiveMakerOrder.mode != "shadow",
+        lm.Btc5mLiveMakerOrder.status.in_(("acked", "resting")))).all()
+    positions = db.scalars(select(lm.Btc5mLiveMakerOrder).where(
+        lm.Btc5mLiveMakerOrder.mode != "shadow",
+        lm.Btc5mLiveMakerOrder.status.in_(("filled", "partial")),
+        lm.Btc5mLiveMakerOrder.position_settled.is_(False))).all()
+    rest = sum(o.notional_usd for o in resting)
+    pos = sum((o.filled_shares or 0) * (o.fill_price or o.price) for o in positions)
+    return round(rest + pos, 4)
+
+
+def cumulative_realized_pnl(db: Session) -> float:
+    rows = db.scalars(select(lm.Btc5mLiveMakerOrder.realized_pnl).where(
+        lm.Btc5mLiveMakerOrder.position_settled.is_(True))).all()
+    return round(sum(p or 0.0 for p in rows), 4)
 
 
 def _state(db: Session) -> lm.Btc5mLiveMakerState:
@@ -69,19 +96,48 @@ def log(db: Session, type_: str, payload: dict, *, session_id=None, order_client
 # ---------------------------------------------------------------------------
 # arm / disarm / kill
 # ---------------------------------------------------------------------------
+def lock(db: Session, reason: str) -> dict:
+    """Latch the PERMANENT lock (cumulative loss stop). Cancels all + disarms. Stays
+    locked across restarts until an explicit manual reset_lock()."""
+    st = _state(db)
+    st.locked = True
+    st.lock_reason = reason
+    db.commit()
+    disarm(db, reason="locked:" + reason)
+    log(db, "lock", {"reason": reason, "cumulative_pnl": cumulative_realized_pnl(db)})
+    return {"ok": True, "locked": True, "reason": reason}
+
+
+def reset_lock(db: Session) -> dict:
+    """Manual reset of the permanent lock (operator action). Does NOT clear realized P&L
+    history — the cumulative loss stop will re-trigger if losses remain past the stop."""
+    st = _state(db)
+    st.locked = False
+    st.lock_reason = None
+    db.commit()
+    log(db, "reset_lock", {})
+    return {"ok": True, "locked": False}
+
+
 def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None) -> dict:
     cfg = get_config()
+    st = _state(db)
+    if st.locked:
+        return {"ok": False, "error": f"executor LOCKED: {st.lock_reason} — reset-lock required"}
     if mode == "live" and not cfg["enabled"]:
         return {"ok": False, "error": "live arming refused: BTC5M_LIVE_MAKER_ENABLED is false"}
     if mode == "live" and not cfg["has_key"]:
         return {"ok": False, "error": "live arming refused: no private key configured"}
-    st = _state(db)
     if st.kill:
         return {"ok": False, "error": "kill switch is engaged — reset it before arming"}
+    # MANDATORY startup reconciliation before a LIVE session — cancel any orphan orders
+    if mode == "live":
+        recon = reconcile_open_orders(db)
+        log(db, "reconcile", {"context": "pre-arm", **recon})
     ttl = ttl_min if ttl_min is not None else cfg["session_ttl_min"]
     sess = lm.Btc5mLiveMakerSession(mode=mode, caps={k: cfg[k] for k in (
-        "per_order_usd", "max_concurrent", "max_exposure_usd", "total_cap_usd",
-        "session_loss_limit_usd", "queue_lifetime_s", "min_order_shares")}, status="active")
+        "per_order_usd", "max_concurrent", "max_exposure_usd", "max_experiment_capital_usd",
+        "cumulative_loss_stop_usd", "session_loss_limit_usd", "queue_lifetime_s", "min_order_shares")}, status="active")
     db.add(sess)
     db.commit()
     st.armed = True
@@ -154,6 +210,8 @@ def _cancel_all(db: Session, *, client=None) -> int:
 def risk_check(db: Session, *, notional: float, price: float, best_ask: float | None) -> tuple[bool, str]:
     cfg = get_config()
     st = _state(db)
+    if st.locked:
+        return False, f"executor LOCKED: {st.lock_reason or 'cumulative loss stop'} — manual reset required"
     if st.kill:
         return False, "kill switch engaged"
     if not st.armed:
@@ -169,8 +227,11 @@ def risk_check(db: Session, *, notional: float, price: float, best_ask: float | 
         return False, f"per-order cap (${notional:.2f} > ${cfg['per_order_usd']})"
     if st.open_exposure_usd + notional > cfg["max_exposure_usd"] + 1e-9:
         return False, f"max concurrent exposure (${st.open_exposure_usd + notional:.2f} > ${cfg['max_exposure_usd']})"
-    if st.deployed_usd + notional > cfg["total_cap_usd"] + 1e-9:
-        return False, f"total cap (${st.deployed_usd + notional:.2f} > ${cfg['total_cap_usd']})"
+    # HARD experiment budget: capital at risk can never exceed MAX_EXPERIMENT_CAPITAL,
+    # computed from our own ledger — the wallet balance is irrelevant.
+    committed = committed_capital(db)
+    if committed + notional > cfg["max_experiment_capital_usd"] + 1e-9:
+        return False, f"experiment budget (${committed + notional:.2f} > ${cfg['max_experiment_capital_usd']} MAX_EXPERIMENT_CAPITAL)"
     n_open = db.scalar(select(func.count()).select_from(lm.Btc5mLiveMakerOrder)
                        .where(lm.Btc5mLiveMakerOrder.status.in_(("submitted", "acked", "resting", "partial")))) or 0
     if n_open >= cfg["max_concurrent"]:
@@ -186,7 +247,7 @@ def risk_check(db: Session, *, notional: float, price: float, best_ask: float | 
 def _make_client(db: Session):
     cfg = get_config()
     st = _state(db)
-    if st.kill or not st.armed:
+    if st.locked or st.kill or not st.armed:
         return None
     if st.mode == "live":
         if not cfg["enabled"] or not cfg["has_key"]:
@@ -196,10 +257,40 @@ def _make_client(db: Session):
 
 
 # ---------------------------------------------------------------------------
+# startup reconciliation — cancel orphan open orders before trading
+# ---------------------------------------------------------------------------
+def reconcile_open_orders(db: Session, *, client=None) -> dict:
+    """Detect + cancel any open orders left from a previous run (crash/restart) BEFORE
+    trading. Cancels both exchange-side orphans and any of our DB orders still marked
+    active. Live-mode only needs the exchange sweep; shadow/mock is a DB sweep."""
+    cfg = get_config()
+    if client is None and cfg["enabled"] and cfg["has_key"]:
+        try:
+            client = clob.LiveClobClient(private_key=os.environ["BTC5M_LIVE_MAKER_PRIVATE_KEY"])
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"reconcile client: {exc}", "exchange_cancelled": 0, "db_cancelled": 0}
+    exch = 0
+    if client is not None and hasattr(client, "open_orders"):
+        try:
+            for oid in client.open_orders() or []:
+                client.cancel(oid)
+                exch += 1
+        except Exception as exc:  # noqa: BLE001
+            log(db, "error", {"stage": "reconcile", "error": str(exc)})
+    db_cancelled = _cancel_all(db, client=client)
+    st = _state(db)
+    st.open_exposure_usd = 0.0
+    db.commit()
+    return {"ok": True, "exchange_cancelled": exch, "db_cancelled": db_cancelled}
+
+
+# ---------------------------------------------------------------------------
 # one cycle: reconcile open orders → mark-outs → maybe post one new quote
 # ---------------------------------------------------------------------------
 def run_cycle(db: Session, *, client=None) -> dict:
     st = _state(db)
+    if st.locked:
+        return {"ran": False, "skipped": "locked"}
     if st.kill:
         return {"ran": False, "skipped": "kill"}
     if not st.armed:
@@ -215,16 +306,56 @@ def run_cycle(db: Session, *, client=None) -> dict:
 
     cfg = get_config()
     reconciled = _reconcile(db, client, cfg)
+    settled = _settle_positions(db, cfg)              # realize P&L + free committed capital
+    # PERMANENT cumulative loss stop — across ALL sessions
+    cum = cumulative_realized_pnl(db)
+    st.cumulative_realized_pnl = cum
+    if -cum >= cfg["cumulative_loss_stop_usd"] - 1e-9:
+        db.commit()
+        lock(db, reason=f"cumulative loss ${-cum:.2f} reached ${cfg['cumulative_loss_stop_usd']} stop")
+        return {"ran": True, "reconciled": reconciled, "settled": settled, "stopped": "cumulative_loss_lock"}
     posted = _maybe_post(db, client, cfg)
+    st.committed_capital_usd = committed_capital(db)
     st.last_cycle_at = datetime.utcnow()
     st.last_error = None
     # session loss auto-stop
     if st.session_realized_pnl <= -cfg["session_loss_limit_usd"]:
         db.commit()
         disarm(db, reason="session_loss_limit", client=client)
-        return {"ran": True, "reconciled": reconciled, "posted": posted, "stopped": "session_loss_limit"}
+        return {"ran": True, "reconciled": reconciled, "settled": settled, "posted": posted, "stopped": "session_loss_limit"}
     db.commit()
-    return {"ran": True, "reconciled": reconciled, "posted": posted, "mode": st.mode}
+    return {"ran": True, "reconciled": reconciled, "settled": settled, "posted": posted, "mode": st.mode}
+
+
+def _settle_positions(db: Session, cfg: dict) -> int:
+    """Settle filled positions whose 5-minute market has resolved: realize P&L, free the
+    committed capital, accumulate session + cumulative P&L."""
+    import time as _time
+    now_ts = int(_time.time())
+    pend = db.scalars(select(lm.Btc5mLiveMakerOrder).where(
+        lm.Btc5mLiveMakerOrder.mode != "shadow",
+        lm.Btc5mLiveMakerOrder.status.in_(("filled", "partial")),
+        lm.Btc5mLiveMakerOrder.position_settled.is_(False))).all()
+    st = _state(db)
+    n = 0
+    for o in pend:
+        if not o.market_window_ts or now_ts < o.market_window_ts + 300:
+            continue                                  # not resolved yet (window + 5m)
+        res = clob.get_resolution(o.market_window_ts)
+        if not res["resolved"] or res["won_yes"] is None:
+            continue
+        won = res["won_yes"] if o.outcome == "YES" else (not res["won_yes"])
+        cost = (o.filled_shares or 0) * (o.fill_price or o.price)
+        payout = (o.filled_shares or 0) if won else 0.0
+        o.realized_pnl = round(payout - cost, 4)
+        o.won = won
+        o.position_settled = True
+        st.session_realized_pnl = round(st.session_realized_pnl + o.realized_pnl, 4)
+        log(db, "settle", {"won": won, "pnl": o.realized_pnl, "cost": round(cost, 4)}, order_client_id=o.client_id)
+        n += 1
+    if n:
+        db.commit()
+    return n
 
 
 def _reconcile(db: Session, client, cfg: dict) -> int:
@@ -335,7 +466,8 @@ def _submit(db, client, mk, token, price, shares, notional, bk, detected, st) ->
     o = lm.Btc5mLiveMakerOrder(
         session_id=st.session_id, client_id=cid, market_id=mk["market_id"], token_id=token,
         outcome="YES", side="BUY", price=price, size_shares=shares, notional_usd=notional,
-        mode=st.mode, status="intended", detected_at=detected, quote_at=quote_at, mid_at_quote=bk["mid"])
+        mode=st.mode, status="intended", detected_at=detected, quote_at=quote_at, mid_at_quote=bk["mid"],
+        market_window_ts=mk.get("window_ts"))
     db.add(o)
     db.commit()
     log(db, "quote", {"market": mk["market_id"], "price": price, "shares": shares, "notional": notional,
@@ -412,19 +544,29 @@ def status(db: Session) -> dict:
     expired = bool(st.arm_expires_at and datetime.utcnow() > st.arm_expires_at)
     n_open = db.scalar(select(func.count()).select_from(lm.Btc5mLiveMakerOrder)
                        .where(lm.Btc5mLiveMakerOrder.status.in_(("acked", "resting", "partial")))) or 0
+    committed = committed_capital(db)
+    cum = cumulative_realized_pnl(db)
+    budget = cfg["max_experiment_capital_usd"]
     return {
         "enabled": cfg["enabled"], "has_key": cfg["has_key"], "armed": st.armed and not expired,
-        "mode": st.mode, "kill": st.kill, "session_id": st.session_id,
+        "mode": st.mode, "kill": st.kill, "locked": st.locked, "lock_reason": st.lock_reason,
+        "session_id": st.session_id,
         "arm_expires_at": st.arm_expires_at.isoformat() if st.arm_expires_at else None, "expired": expired,
         "caps": {k: cfg[k] for k in ("per_order_usd", "max_concurrent", "max_exposure_usd",
-                                     "total_cap_usd", "session_loss_limit_usd", "queue_lifetime_s")},
-        "deployed_usd": round(st.deployed_usd, 4), "open_exposure_usd": round(st.open_exposure_usd, 4),
+                                     "session_loss_limit_usd", "queue_lifetime_s")},
+        "experiment_budget": {"max_experiment_capital_usd": budget, "committed_capital_usd": committed,
+                              "remaining_usd": round(budget - committed, 4),
+                              "cumulative_realized_pnl": cum, "cumulative_loss_stop_usd": cfg["cumulative_loss_stop_usd"],
+                              "loss_remaining_to_lock_usd": round(cfg["cumulative_loss_stop_usd"] + min(0.0, cum), 4)},
+        "open_exposure_usd": round(st.open_exposure_usd, 4),
         "open_orders": n_open, "session_realized_pnl": round(st.session_realized_pnl, 4),
         "last_cycle_at": st.last_cycle_at.isoformat() if st.last_cycle_at else None,
         "last_error": st.last_error, "metrics": metrics(db, session_id=st.session_id),
-        "live_path_reachable": bool(cfg["enabled"] and st.armed and st.mode == "live" and cfg["has_key"] and not st.kill and not expired),
-        "safety": ("BTC 5M live-maker trial — DATA COLLECTION only; maker-only, capped, default-off; "
-                   "no order is sent unless ENABLED + armed(live) + key + caps pass"),
+        "live_path_reachable": bool(cfg["enabled"] and st.armed and st.mode == "live" and cfg["has_key"]
+                                    and not st.kill and not st.locked and not expired),
+        "safety": ("BTC 5M live-maker trial — DATA COLLECTION only; maker-only, $%g experiment budget (software-"
+                   "enforced, ignores wallet balance), permanent $%g cumulative-loss lock, default-off; no order "
+                   "is sent unless ENABLED + armed(live) + key + caps pass" % (budget, cfg["cumulative_loss_stop_usd"])),
     }
 
 

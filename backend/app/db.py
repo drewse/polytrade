@@ -165,6 +165,18 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "move_close": "FLOAT", "mfe": "FLOAT", "mae": "FLOAT",
         "quality_updated_at": "DATETIME",
     },
+    # BTC 5M live-maker capital safeguards added after the table shipped.
+    "btc5m_live_maker_state": {
+        "locked": "BOOLEAN DEFAULT 0",
+        "lock_reason": "VARCHAR",
+        "committed_capital_usd": "FLOAT DEFAULT 0",
+        "cumulative_realized_pnl": "FLOAT DEFAULT 0",
+    },
+    "btc5m_live_maker_orders": {
+        "won": "BOOLEAN",
+        "market_window_ts": "INTEGER",
+        "position_settled": "BOOLEAN DEFAULT 0",
+    },
     # BTC passive-maker forward pipeline: market-family / quote-kind tagging added
     # after the paper-quote table shipped (keeps BTC / broad / multi-point separate).
     "btc5m_paper_quotes": {

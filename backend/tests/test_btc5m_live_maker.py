@@ -171,3 +171,94 @@ def test_run_cycle_noop_when_disarmed(in_memory_db, monkeypatch):
     monkeypatch.delenv("BTC5M_LIVE_MAKER_ENABLED", raising=False)
     r = mk.run_cycle(db)
     assert r["ran"] is False and r["skipped"] == "disarmed"
+
+
+# --- $100 experiment budget (software-enforced; ignores wallet balance) ------
+def _add_order(db, **kw):
+    base = dict(session_id=1, client_id="x", market_id="M", token_id="T", outcome="YES", side="BUY",
+                price=0.4, size_shares=5, notional_usd=2.0, mode="live", status="resting")
+    base.update(kw)
+    o = lmm.Btc5mLiveMakerOrder(**base); db.add(o); db.commit(); return o
+
+
+def test_experiment_budget_caps_committed_capital(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_MAX_EXPERIMENT_CAPITAL", "100")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_MAX_CONCURRENT", "9")
+    mk.arm(db, mode="shadow")
+    _add_order(db, client_id="big", notional_usd=99.0)      # $99 already committed at risk
+    assert mk.committed_capital(db) == 99.0
+    ok, reason = mk.risk_check(db, notional=3.0, price=0.4, best_ask=0.45)   # 99+3 > 100
+    assert ok is False and "experiment budget" in reason
+    ok2, _ = mk.risk_check(db, notional=1.0, price=0.4, best_ask=0.45)       # 99+1 <= 100
+    assert ok2 is True
+
+
+def test_committed_capital_ignores_shadow_and_settled(in_memory_db):
+    db = in_memory_db
+    _add_order(db, mode="shadow", status="shadow", notional_usd=50.0)        # shadow: no capital
+    _add_order(db, status="filled", position_settled=True, notional_usd=50.0)  # settled: freed
+    assert mk.committed_capital(db) == 0.0
+
+
+# --- permanent cumulative-loss lock -----------------------------------------
+def test_cumulative_loss_lock_latches_and_blocks(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_CUMULATIVE_LOSS_STOP", "100")
+    mk.arm(db, mode="live")
+    # two settled positions totalling -$100 realized
+    _add_order(db, client_id="L1", status="filled", position_settled=True, realized_pnl=-50.0)
+    _add_order(db, client_id="L2", status="filled", position_settled=True, realized_pnl=-50.0)
+    assert mk.cumulative_realized_pnl(db) == -100.0
+    r = mk.run_cycle(db, client=clob.MockClobClient())
+    assert r.get("stopped") == "cumulative_loss_lock"
+    st = mk.status(db)
+    assert st["locked"] is True and st["live_path_reachable"] is False
+    # locked: cannot arm, cannot post, no client
+    assert mk.arm(db, mode="shadow")["ok"] is False
+    assert mk._make_client(db) is None
+    ok, reason = mk.risk_check(db, notional=1.0, price=0.4, best_ask=0.45)
+    assert ok is False and "LOCKED" in reason
+    # manual reset clears the lock flag
+    assert mk.reset_lock(db)["locked"] is False
+
+
+# --- position settlement at resolution --------------------------------------
+def test_settlement_computes_realized_pnl(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    mk.arm(db, mode="live")
+    import time
+    past = int(time.time()) - 1000                  # resolved long ago
+    _add_order(db, client_id="P1", status="filled", filled_shares=6, fill_price=0.40,
+               notional_usd=2.4, market_window_ts=past, position_settled=False)
+    monkeypatch.setattr(clob, "get_resolution", lambda ts: {"resolved": True, "won_yes": True})
+    mk.run_cycle(db, client=clob.MockClobClient())
+    o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.client_id == "P1")).first()
+    assert o.position_settled is True and o.won is True
+    assert abs(o.realized_pnl - (6 * 1.0 - 6 * 0.40)) < 1e-6      # +3.60 (won)
+
+
+# --- startup reconciliation -------------------------------------------------
+def test_reconcile_cancels_orphans(in_memory_db, monkeypatch):
+    db = in_memory_db
+    client = clob.MockClobClient()
+    client.post_limit(token_id="T", side="BUY", price=0.4, size=5)   # an orphan open order on the exchange
+    _add_order(db, client_id="orphan", exchange_order_id="mock-1", status="resting")
+    r = mk.reconcile_open_orders(db, client=client)
+    assert r["ok"] and r["exchange_cancelled"] >= 1 and r["db_cancelled"] >= 1
+    o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.client_id == "orphan")).first()
+    assert o.status == "cancelled"
+
+
+def test_status_surfaces_budget_and_lock(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_MAX_EXPERIMENT_CAPITAL", "100")
+    s = mk.status(db)
+    eb = s["experiment_budget"]
+    assert eb["max_experiment_capital_usd"] == 100 and eb["remaining_usd"] == 100
+    assert eb["cumulative_loss_stop_usd"] == 100
+    assert s["locked"] is False and "$100 experiment budget" in s["safety"]
