@@ -33,32 +33,47 @@ def _now():
 # read-only market data (public; no credentials)
 # ---------------------------------------------------------------------------
 def open_btc5m_markets(limit: int = 30) -> list[dict]:
-    """Currently-open BTC 5-minute up/down markets + their CLOB token ids. Read-only."""
+    """The CURRENT live BTC 5-minute up/down market(s) + their CLOB token ids. Read-only.
+
+    BTC-5m market slugs sit on exact 5-minute unix boundaries (`btc-updown-5m-<ts>`,
+    ts % 300 == 0). Gamma's market LIST won't surface the live one (it returns stale /
+    far-future markets first), so we COMPUTE the current boundary and fetch the
+    next/current/previous windows by exact slug — freshest (newest, fullest-life,
+    two-sided book) first."""
+    import json as _json
+    import time as _time
+    now = int(_time.time())
+    base = (now // 300) * 300
+    out = []
     try:
         with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": "polytrade-research"}) as c:
-            r = c.get(f"{GAMMA}/markets", params={"closed": "false", "active": "true",
-                                                  "limit": 200, "order": "endDate", "ascending": "true"})
-            r.raise_for_status()
-            rows = r.json()
+            for ts in (base + 300, base, base - 300):     # next (fresh), current, prev
+                try:
+                    r = c.get(f"{GAMMA}/markets", params={"slug": f"btc-updown-5m-{ts}"})
+                    r.raise_for_status()
+                    d = r.json()
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(d, list) or not d:
+                    continue
+                m = d[0]
+                if m.get("closed"):
+                    continue
+                toks = m.get("clobTokenIds") or m.get("clob_token_ids") or []
+                if isinstance(toks, str):
+                    try:
+                        toks = _json.loads(toks)
+                    except Exception:  # noqa: BLE001
+                        toks = []
+                if not toks:
+                    continue
+                out.append({"market_id": m.get("conditionId") or m.get("id"),
+                            "slug": (m.get("slug") or "").lower(), "question": m.get("question"),
+                            "token_ids": toks, "end_date": m.get("endDate"), "window_ts": ts})
+                if len(out) >= limit:
+                    break
     except Exception:  # noqa: BLE001
-        return []
-    out = []
-    for m in rows if isinstance(rows, list) else []:
-        slug = (m.get("slug") or "").lower()
-        if not slug.startswith("btc-updown-5m"):
-            continue
-        toks = m.get("clobTokenIds") or m.get("clob_token_ids") or []
-        if isinstance(toks, str):
-            import json as _json
-            try:
-                toks = _json.loads(toks)
-            except Exception:  # noqa: BLE001
-                toks = []
-        out.append({"market_id": m.get("conditionId") or m.get("id"), "slug": slug,
-                    "question": m.get("question"), "token_ids": toks,
-                    "end_date": m.get("endDate")})
-        if len(out) >= limit:
-            break
+        return out
     return out
 
 
