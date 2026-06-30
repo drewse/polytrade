@@ -362,13 +362,10 @@ def run_cycle(db: Session, *, client=None) -> dict:
 
     cfg = get_config()
     reconciled = _reconcile(db, client, cfg)
-    settled = _settle_positions(db, cfg)              # realize P&L + free committed capital
-    # PERMANENT cumulative loss stop — across ALL sessions
-    cum = cumulative_realized_pnl(db)
-    st.cumulative_realized_pnl = cum
-    if -cum >= cfg["cumulative_loss_stop_usd"] - 1e-9:
-        db.commit()
-        lock(db, reason=f"cumulative loss ${-cum:.2f} reached ${cfg['cumulative_loss_stop_usd']} stop")
+    # realize P&L + free committed capital + PERMANENT cumulative-loss lock (shared path)
+    sweep = settle_open_positions(db)
+    settled = sweep["settled"]
+    if sweep["locked"]:
         return {"ran": True, "reconciled": reconciled, "settled": settled, "stopped": "cumulative_loss_lock"}
     posted = _maybe_post(db, client, cfg)
     st.committed_capital_usd = committed_capital(db)
@@ -407,7 +404,7 @@ def _settle_positions(db: Session, cfg: dict) -> int:
     for o in pend:
         if not o.market_window_ts or now_ts < o.market_window_ts + 300:
             continue                                  # not resolved yet (window + 5m)
-        res = clob.get_resolution(o.market_window_ts)
+        res = clob.get_resolution(o.market_window_ts, o.market_id)
         if not res["resolved"] or res["won_yes"] is None:
             continue
         won = res["won_yes"] if o.outcome == "YES" else (not res["won_yes"])
@@ -425,6 +422,30 @@ def _settle_positions(db: Session, cfg: dict) -> int:
     if n:
         db.commit()
     return n
+
+
+def settle_open_positions(db: Session) -> dict:
+    """Settlement sweep that is INDEPENDENT of the armed loop. Resolves any filled
+    position whose market has closed, refreshes the DB-derived ledger on the state row,
+    and latches the permanent cumulative-loss lock if breached. Safe to call any time
+    (disarmed, between sessions, or on demand) — already-settled positions are skipped.
+
+    This decouples P&L realisation from arming: a 5-minute position that resolves AFTER
+    a session disarms still settles, frees its committed capital, and counts toward the
+    cumulative-loss guard."""
+    cfg = get_config()
+    settled = _settle_positions(db, cfg)
+    st = _state(db)
+    cum = cumulative_realized_pnl(db)
+    st.cumulative_realized_pnl = cum
+    st.committed_capital_usd = committed_capital(db)
+    db.commit()
+    if -cum >= cfg["cumulative_loss_stop_usd"] - 1e-9 and not st.locked:
+        lock(db, reason=f"cumulative loss ${-cum:.2f} reached ${cfg['cumulative_loss_stop_usd']} stop")
+        return {"settled": settled, "cumulative_realized_pnl": cum,
+                "committed_capital_usd": st.committed_capital_usd, "locked": True}
+    return {"settled": settled, "cumulative_realized_pnl": cum,
+            "committed_capital_usd": st.committed_capital_usd, "locked": st.locked}
 
 
 def _counterfactual(o: lm.Btc5mLiveMakerOrder, won: bool) -> dict:

@@ -1098,6 +1098,14 @@ def btc5m_live_maker_check_connection(db: Session = Depends(get_db)) -> MessageO
     return MessageOut(message="btc5m live maker check-connection", detail=_lab_safe(live_maker.check_connection, db))
 
 
+@app.post("/api/btc5m/live-maker/settle", response_model=MessageOut)
+def btc5m_live_maker_settle(db: Session = Depends(get_db)) -> MessageOut:
+    """Settle any resolved positions now — independent of arming. Realises P&L, frees
+    committed capital, refreshes the ledger, and latches the cumulative-loss lock if
+    breached. Read-only against the venue (resolution lookup only)."""
+    return MessageOut(message="btc5m live maker settle", detail=_lab_safe(live_maker.settle_open_positions, db))
+
+
 @app.post("/api/btc5m/live-maker/run-cycle", response_model=MessageOut)
 def btc5m_live_maker_run_cycle(db: Session = Depends(get_db)) -> MessageOut:
     """Drive one cycle manually (used for shadow dry-runs). No-op unless armed; live

@@ -263,11 +263,32 @@ def test_settlement_computes_realized_pnl(in_memory_db, monkeypatch):
     past = int(time.time()) - 1000                  # resolved long ago
     _add_order(db, client_id="P1", status="filled", filled_shares=6, fill_price=0.40,
                notional_usd=2.4, market_window_ts=past, position_settled=False)
-    monkeypatch.setattr(clob, "get_resolution", lambda ts: {"resolved": True, "won_yes": True})
+    monkeypatch.setattr(clob, "get_resolution", lambda ts, cid=None: {"resolved": True, "won_yes": True})
     mk.run_cycle(db, client=clob.MockClobClient())
     o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.client_id == "P1")).first()
     assert o.position_settled is True and o.won is True
     assert abs(o.realized_pnl - (6 * 1.0 - 6 * 0.40)) < 1e-6      # +3.60 (won)
+
+
+def test_settlement_runs_while_disarmed(in_memory_db, monkeypatch):
+    """A position that resolves AFTER the session disarms must still settle, free
+    committed capital, and update the cumulative ledger (settlement is decoupled from
+    arming)."""
+    db = in_memory_db
+    import time
+    past = int(time.time()) - 1000
+    _add_order(db, client_id="D1", status="filled", filled_shares=5, fill_price=0.50,
+               notional_usd=2.5, market_window_ts=past, position_settled=False)
+    assert mk.status(db)["armed"] is False                       # never armed
+    assert mk.committed_capital(db) == 2.5                        # at risk before settle
+    monkeypatch.setattr(clob, "get_resolution", lambda ts, cid=None: {"resolved": True, "won_yes": True})
+    out = mk.settle_open_positions(db)                            # no client, disarmed
+    assert out["settled"] == 1
+    o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.client_id == "D1")).first()
+    assert o.position_settled is True and o.won is True
+    assert abs(o.realized_pnl - (5 * 1.0 - 5 * 0.50)) < 1e-6      # +2.50
+    assert mk.committed_capital(db) == 0.0                        # capital freed
+    assert abs(mk.cumulative_realized_pnl(db) - 2.5) < 1e-6
 
 
 # --- startup reconciliation -------------------------------------------------
@@ -328,7 +349,7 @@ def test_counterfactual_one_tick(in_memory_db, monkeypatch):
     o = _add_order(db, client_id="C1", status="filled", filled_shares=6, fill_price=0.40,
                    notional_usd=2.4, market_window_ts=past, position_settled=False,
                    quote_at=datetime.utcnow() - timedelta(seconds=1000))
-    monkeypatch.setattr(clob, "get_resolution", lambda ts: {"resolved": True, "won_yes": True})
+    monkeypatch.setattr(clob, "get_resolution", lambda ts, cid=None: {"resolved": True, "won_yes": True})
     # trade stream: price dipped to 0.39 within the window → a 0.39 bid (one tick lower) would fill
     monkeypatch.setattr(clob, "market_trades", lambda cid, limit=500: [
         {"ts": int((datetime.utcnow() - timedelta(seconds=1000)).timestamp()) + 2, "yes_price": 0.39, "size": 50}])

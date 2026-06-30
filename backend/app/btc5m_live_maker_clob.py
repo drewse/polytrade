@@ -99,9 +99,31 @@ def open_btc5m_markets(limit: int = 30) -> list[dict]:
     return out
 
 
-def get_resolution(window_ts: int) -> dict:
-    """Resolution of a BTC-5m market window (by its boundary slug). Returns
-    {resolved, won_yes} — won_yes True if the UP/YES outcome won. Read-only, fail-soft."""
+def get_resolution(window_ts: int, condition_id: str | None = None) -> dict:
+    """Resolution of a BTC-5m market window. Returns {resolved, won_yes} — won_yes True
+    if the UP/YES outcome won. Read-only, fail-soft.
+
+    Source priority: the CLOB market-by-condition endpoint is AUTHORITATIVE and keeps
+    serving *closed* BTC-5m markets (with tokens[].winner), whereas Gamma's slug endpoint
+    DROPS closed micro-markets and would leave a resolved position forever 'unresolved'.
+    Gamma-by-slug is only a fallback for still-open / very fresh windows."""
+    # 1) authoritative: CLOB market by condition id (works for CLOSED markets too)
+    if condition_id:
+        try:
+            with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": "polytrade-research"}) as c:
+                r = c.get(f"{CLOB}/markets/{condition_id}")
+                r.raise_for_status()
+                m = r.json()
+            toks = m.get("tokens") or []
+            up = next((t for t in toks if str(t.get("outcome", "")).strip().lower() in ("up", "yes")), None)
+            if up is not None:
+                if any(t.get("winner") for t in toks):              # a winner is decided
+                    return {"resolved": True, "won_yes": bool(up.get("winner"))}
+                if m.get("closed") and up.get("price") is not None:  # closed, decide by price
+                    return {"resolved": True, "won_yes": float(up["price"]) >= 0.5}
+        except Exception:  # noqa: BLE001
+            pass
+    # 2) fallback: Gamma by boundary slug (open / very recent windows only)
     try:
         with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": "polytrade-research"}) as c:
             r = c.get(f"{GAMMA}/markets", params={"slug": f"btc-updown-5m-{window_ts}"})
