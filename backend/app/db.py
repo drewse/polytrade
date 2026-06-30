@@ -183,6 +183,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "counterfactual": "JSON",
     },
     "btc5m_live_maker_sessions": {"summary": "JSON", "max_orders": "INTEGER DEFAULT 0"},
+    # Phase-0 favorite/under-reaction backtest cached on the longshot state row.
+    "btc5m_longshot_state": {"favorite_report": "JSON", "favorite_built_at": "DATETIME"},
     # BTC passive-maker forward pipeline: market-family / quote-kind tagging added
     # after the paper-quote table shipped (keeps BTC / broad / multi-point separate).
     "btc5m_paper_quotes": {

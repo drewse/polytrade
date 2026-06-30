@@ -21,4 +21,7 @@ class Btc5mLongshotState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Phase-0 favorite/under-reaction backtest result (separate research module, same table)
+    favorite_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    favorite_built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -23,6 +23,7 @@ from . import btc5m_drew_finds as drew_finds  # noqa: E402
 from . import btc5m_drew_finds_models  # noqa: F401,E402  (register table for create_all)
 from . import btc5m_longshot_lab as longshot_lab  # noqa: E402
 from . import btc5m_longshot_models  # noqa: F401,E402  (register table for create_all)
+from . import btc5m_favorite_lab as favorite_lab  # noqa: E402
 from . import btc5m_live_maker as live_maker  # noqa: E402
 from . import btc5m_live_maker_models  # noqa: F401,E402  (register tables for create_all)
 from .db import get_db, init_db
@@ -1036,6 +1037,18 @@ def btc5m_longshot_run(db: Session = Depends(get_db)) -> MessageOut:
     """Test whether buying the CHEAP side (favorite-longshot / value making) is +EV in
     our own data — calibration + mid/maker/taker × entry-threshold grid. Research only."""
     return MessageOut(message="btc5m longshot run", detail=_lab_safe(longshot_lab.run, db))
+
+
+@app.get("/api/btc5m/favorite/status", response_model=MessageOut)
+def btc5m_favorite_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m favorite lab", detail=_lab_safe(favorite_lab.status, db))
+
+
+@app.post("/api/btc5m/favorite/run", response_model=MessageOut)
+def btc5m_favorite_run(db: Session = Depends(get_db)) -> MessageOut:
+    """Phase-0 offline backtest: is the FAVORITE/under-reaction signal a durable, cost-
+    surviving, OOS, UP/DOWN-balanced edge — or just UP-drift? Research only, no live path."""
+    return MessageOut(message="btc5m favorite run", detail=_lab_safe(favorite_lab.run, db))
 
 
 # --- BTC 5M LIVE MAKER trial (capped, maker-only, default-off) ----------------
