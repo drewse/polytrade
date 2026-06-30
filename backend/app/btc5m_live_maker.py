@@ -39,6 +39,11 @@ def get_config() -> dict:
     return {
         "enabled": _truthy(os.getenv("BTC5M_LIVE_MAKER_ENABLED", "false")),
         "has_key": bool(os.getenv("BTC5M_LIVE_MAKER_PRIVATE_KEY")),
+        # Same wallet as production → default sig-type/funder to the already-VERIFIED
+        # production values unless overridden for the experiment.
+        "signature_type": int(os.getenv("BTC5M_LIVE_MAKER_SIGNATURE_TYPE") or os.getenv("POLYMARKET_SIGNATURE_TYPE") or "0"),
+        "funder": (os.getenv("BTC5M_LIVE_MAKER_FUNDER") or os.getenv("POLYMARKET_FUNDER")
+                   or os.getenv("RELAYER_API_KEY_ADDRESS") or None),
         "max_experiment_capital_usd": float(os.getenv("BTC5M_LIVE_MAKER_MAX_EXPERIMENT_CAPITAL", "100")),
         "cumulative_loss_stop_usd": float(os.getenv("BTC5M_LIVE_MAKER_CUMULATIVE_LOSS_STOP", "100")),
         # Polymarket's min order is ~5 shares, so the realistic per-order floor is
@@ -251,6 +256,13 @@ def risk_check(db: Session, *, notional: float, price: float, best_ask: float | 
 # ---------------------------------------------------------------------------
 # client selection — the hard live gate
 # ---------------------------------------------------------------------------
+def _live_client():
+    """Build the authenticated live client from env (key + optional sig-type/funder)."""
+    cfg = get_config()
+    return clob.LiveClobClient(private_key=os.environ["BTC5M_LIVE_MAKER_PRIVATE_KEY"],
+                               signature_type=cfg["signature_type"], funder=cfg["funder"])
+
+
 def _make_client(db: Session):
     cfg = get_config()
     st = _state(db)
@@ -259,8 +271,30 @@ def _make_client(db: Session):
     if st.mode == "live":
         if not cfg["enabled"] or not cfg["has_key"]:
             return None
-        return clob.LiveClobClient(private_key=os.environ["BTC5M_LIVE_MAKER_PRIVATE_KEY"])
+        return _live_client()
     return clob.ShadowClient()
+
+
+def check_connection(db: Session) -> dict:
+    """READ-ONLY pre-flight: authenticate the wallet against the CLOB and read open
+    orders. Places NO order and cancels NOTHING. Works with just the key (independent
+    of the ENABLED switch) so we can verify auth before ever enabling live."""
+    cfg = get_config()
+    if not cfg["has_key"]:
+        return {"ok": False, "authenticated": False, "error": "no private key configured"}
+    try:
+        client = _live_client()                       # __init__ authenticates (derives API creds)
+        addr = client.address()
+        opens = client.open_orders()
+        return {"ok": True, "authenticated": True, "clob_connection": "ok",
+                "wallet_address": addr, "open_orders_on_exchange": len(opens or []),
+                "signature_type": cfg["signature_type"], "funder": cfg["funder"],
+                "note": "read-only auth check — no order placed, nothing cancelled"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "authenticated": False, "clob_connection": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "hint": "if your Polymarket wallet is an email/Magic proxy, set BTC5M_LIVE_MAKER_SIGNATURE_TYPE=1 "
+                        "and BTC5M_LIVE_MAKER_FUNDER=<proxy address>"}
 
 
 # ---------------------------------------------------------------------------
@@ -271,24 +305,32 @@ def reconcile_open_orders(db: Session, *, client=None) -> dict:
     trading. Cancels both exchange-side orphans and any of our DB orders still marked
     active. Live-mode only needs the exchange sweep; shadow/mock is a DB sweep."""
     cfg = get_config()
-    if client is None and cfg["enabled"] and cfg["has_key"]:
+    # Reconciliation only CANCELS (safe direction), so it may run with just the key,
+    # independent of the ENABLED switch — to sweep orphans before we ever go live.
+    if client is None and cfg["has_key"]:
         try:
-            client = clob.LiveClobClient(private_key=os.environ["BTC5M_LIVE_MAKER_PRIVATE_KEY"])
+            client = _live_client()
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"reconcile client: {exc}", "exchange_cancelled": 0, "db_cancelled": 0}
+    # SHARED-WALLET SAFETY: the production copy-trader uses the same wallet. We cancel
+    # ONLY orders WE created (ids in our DB) — never the wallet's other open orders.
+    our_ids = {o for (o,) in db.execute(select(lm.Btc5mLiveMakerOrder.exchange_order_id)
+               .where(lm.Btc5mLiveMakerOrder.exchange_order_id.isnot(None))).all()}
     exch = 0
     if client is not None and hasattr(client, "open_orders"):
         try:
             for oid in client.open_orders() or []:
-                client.cancel(oid)
-                exch += 1
+                if oid in our_ids:                       # ours only — leave production orders alone
+                    client.cancel(oid)
+                    exch += 1
         except Exception as exc:  # noqa: BLE001
             log(db, "error", {"stage": "reconcile", "error": str(exc)})
     db_cancelled = _cancel_all(db, client=client)
     st = _state(db)
     st.open_exposure_usd = 0.0
     db.commit()
-    return {"ok": True, "exchange_cancelled": exch, "db_cancelled": db_cancelled}
+    return {"ok": True, "exchange_cancelled_ours": exch, "db_cancelled": db_cancelled,
+            "note": "only orders created by this experiment are cancelled — production wallet orders untouched"}
 
 
 # ---------------------------------------------------------------------------

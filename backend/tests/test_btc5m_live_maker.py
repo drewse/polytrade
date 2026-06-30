@@ -249,7 +249,7 @@ def test_reconcile_cancels_orphans(in_memory_db, monkeypatch):
     client.post_limit(token_id="T", side="BUY", price=0.4, size=5)   # an orphan open order on the exchange
     _add_order(db, client_id="orphan", exchange_order_id="mock-1", status="resting")
     r = mk.reconcile_open_orders(db, client=client)
-    assert r["ok"] and r["exchange_cancelled"] >= 1 and r["db_cancelled"] >= 1
+    assert r["ok"] and r["exchange_cancelled_ours"] >= 1 and r["db_cancelled"] >= 1
     o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.client_id == "orphan")).first()
     assert o.status == "cancelled"
 

@@ -1085,6 +1085,13 @@ def btc5m_live_maker_reconcile(db: Session = Depends(get_db)) -> MessageOut:
     return MessageOut(message="btc5m live maker reconcile", detail=_lab_safe(live_maker.reconcile_open_orders, db))
 
 
+@app.post("/api/btc5m/live-maker/check-connection", response_model=MessageOut)
+def btc5m_live_maker_check_connection(db: Session = Depends(get_db)) -> MessageOut:
+    """READ-ONLY: authenticate the wallet against the CLOB + read open orders. Places no
+    order, cancels nothing. For pre-flight validation before enabling live."""
+    return MessageOut(message="btc5m live maker check-connection", detail=_lab_safe(live_maker.check_connection, db))
+
+
 @app.post("/api/btc5m/live-maker/run-cycle", response_model=MessageOut)
 def btc5m_live_maker_run_cycle(db: Session = Depends(get_db)) -> MessageOut:
     """Drive one cycle manually (used for shadow dry-runs). No-op unless armed; live

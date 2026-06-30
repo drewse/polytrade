@@ -206,47 +206,82 @@ class ShadowClient:
         return []
 
 
+def _order_id(resp) -> str | None:
+    if isinstance(resp, dict):
+        return resp.get("orderID") or resp.get("order_id") or resp.get("orderId") or resp.get("id")
+    return getattr(resp, "order_id", None) or getattr(resp, "orderID", None)
+
+
+def _matched(od) -> float:
+    if isinstance(od, dict):
+        return float(od.get("size_matched") or od.get("sizeMatched") or 0)
+    return float(getattr(od, "size_matched", 0) or 0)
+
+
 class LiveClobClient:
-    """The ONLY client that places real orders. Lazy-imports py-clob-client; raises a
-    clear error if the library/credentials are absent. Instantiated by the executor
-    ONLY when enabled + armed in 'live' mode."""
+    """The ONLY client that places real orders. Uses the verified CLOB **v2** SDK
+    (py-clob-client-v2) exactly as production live.py does — the v1 SDK is archived and
+    rejects orders ("invalid order version"). Lazy-imported; instantiated ONLY when
+    enabled + armed in 'live' mode (and, read-only, by the connection check). v2 auth:
+    derive_api_key (existing) / create_api_key (first time) → set_api_creds →
+    assert_level_2_auth. `signature_type`/`funder` support Polymarket proxy wallets
+    (0=EOA, 1=email/Magic proxy, 2=Gnosis-safe)."""
     name = "live"
 
-    def __init__(self, *, private_key: str, host: str = CLOB, chain_id: int = 137):
+    def __init__(self, *, private_key: str, host: str = CLOB, chain_id: int = 137,
+                 signature_type: int | None = None, funder: str | None = None):
         try:
-            from py_clob_client.client import ClobClient  # noqa
+            from py_clob_client_v2 import ClobClient
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"py-clob-client not installed — cannot go live: {exc}")
-        self._ClobClient = ClobClient
-        self._client = ClobClient(host, key=private_key, chain_id=chain_id)
-        self._client.set_api_creds(self._client.create_or_derive_api_creds())
+            raise RuntimeError(f"py-clob-client-v2 not installed — cannot go live: {exc}")
+        kw = {"chain_id": chain_id, "key": private_key}
+        if signature_type is not None:
+            kw["signature_type"] = signature_type
+        if funder:
+            kw["funder"] = funder
+        self._client = ClobClient(host, **kw)
+        try:
+            creds = self._client.derive_api_key()        # existing L2 creds
+        except Exception:  # noqa: BLE001  (none yet -> create on first use)
+            creds = self._client.create_api_key()
+        self._client.set_api_creds(creds)
+        self._client.assert_level_2_auth()               # raises if L2 auth incomplete
+
+    def address(self):
+        try:
+            return self._client.get_address()
+        except Exception:  # noqa: BLE001
+            return None
 
     def post_limit(self, *, token_id, side, price, size):
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY, SELL
+        from py_clob_client_v2 import OrderArgsV2, OrderType, Side
         t0 = time.monotonic()
-        args = OrderArgs(price=float(price), size=float(size),
-                         side=BUY if side == "BUY" else SELL, token_id=str(token_id))
-        signed = self._client.create_order(args)
-        resp = self._client.post_order(signed, OrderType.GTC)
+        order = self._client.create_order(OrderArgsV2(
+            price=float(price), size=float(size),
+            side=Side.BUY if side == "BUY" else Side.SELL, token_id=str(token_id)))
+        resp = self._client.post_order(order, OrderType.GTC)
         lat = (time.monotonic() - t0) * 1000
-        oid = (resp or {}).get("orderID") or (resp or {}).get("order_id")
+        oid = _order_id(resp)
         return {"ok": bool(oid), "order_id": oid, "status": "acked" if oid else "rejected",
-                "latency_ms": lat, "raw": resp, "error": None if oid else str(resp)}
+                "latency_ms": lat, "raw": resp if isinstance(resp, dict) else str(resp),
+                "error": None if oid else str(resp)}
 
     def get_order(self, order_id):
-        o = self._client.get_order(order_id)
-        size = float((o or {}).get("size_matched", 0) or 0)
-        status = (o or {}).get("status", "unknown")
-        return {"ok": True, "status": status, "filled_size": size, "raw": o}
+        od = self._client.get_order(order_id)
+        status = (od or {}).get("status", "unknown") if isinstance(od, dict) else "unknown"
+        return {"ok": True, "status": status, "filled_size": _matched(od), "raw": od if isinstance(od, dict) else None}
 
     def cancel(self, order_id):
         t0 = time.monotonic()
-        resp = self._client.cancel(order_id)
-        return {"ok": True, "cancelled": True, "latency_ms": (time.monotonic() - t0) * 1000, "raw": resp}
+        resp = self._client.cancel_orders([order_id])    # v2: cancel by list (single id)
+        return {"ok": True, "cancelled": True, "latency_ms": (time.monotonic() - t0) * 1000,
+                "raw": resp if isinstance(resp, dict) else str(resp)}
 
     def open_orders(self):
+        """ALL open orders on the wallet (may include the production copy-trader's). The
+        executor only ever CANCELS ids it created — never these wholesale."""
         try:
-            return [o.get("id") or o.get("order_id") for o in (self._client.get_orders() or [])]
+            rows = self._client.get_open_orders() or []
+            return [(_order_id(o) or (o.get("id") if isinstance(o, dict) else None)) for o in rows]
         except Exception:  # noqa: BLE001
             return []
