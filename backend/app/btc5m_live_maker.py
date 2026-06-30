@@ -156,17 +156,24 @@ def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None) -> d
 def disarm(db: Session, reason: str = "manual", *, client=None) -> dict:
     st = _state(db)
     cancelled = _cancel_all(db, client=client)
+    ended_session = None
     if st.session_id:
         sess = db.get(lm.Btc5mLiveMakerSession, st.session_id)
         if sess and sess.status == "active":
             sess.status = "ended"
             sess.ended_at = datetime.utcnow()
             sess.end_reason = reason
+            ended_session = sess.id
     st.armed = False
     st.open_exposure_usd = 0.0
     db.commit()
     log(db, "disarm", {"reason": reason, "cancelled": cancelled}, session_id=st.session_id)
-    return {"ok": True, "armed": False, "reason": reason, "cancelled": cancelled}
+    if ended_session:                                  # auto research summary on session end
+        try:
+            generate_summary(db, ended_session)
+        except Exception as exc:  # noqa: BLE001
+            log(db, "error", {"stage": "summary", "error": str(exc)})
+    return {"ok": True, "armed": False, "reason": reason, "cancelled": cancelled, "session_summary_for": ended_session}
 
 
 def kill(db: Session, *, client=None) -> dict:
@@ -349,13 +356,53 @@ def _settle_positions(db: Session, cfg: dict) -> int:
         payout = (o.filled_shares or 0) if won else 0.0
         o.realized_pnl = round(payout - cost, 4)
         o.won = won
+        o.markout_settlement = round((1.0 if (res["won_yes"]) else 0.0) - (o.fill_price or o.price), 4)
+        o.counterfactual = _counterfactual(o, won)
         o.position_settled = True
         st.session_realized_pnl = round(st.session_realized_pnl + o.realized_pnl, 4)
-        log(db, "settle", {"won": won, "pnl": o.realized_pnl, "cost": round(cost, 4)}, order_client_id=o.client_id)
+        log(db, "settle", {"won": won, "pnl": o.realized_pnl, "cost": round(cost, 4),
+                           "counterfactual": o.counterfactual}, order_client_id=o.client_id)
         n += 1
     if n:
         db.commit()
     return n
+
+
+def _counterfactual(o: lm.Btc5mLiveMakerOrder, won: bool) -> dict:
+    """Would a bid ONE TICK higher (more aggressive) or lower (deeper) have been better?
+    Uses the market's public trade stream to decide whether each price would have filled
+    within our quote window, and what its P&L would have been. won is for OUR side."""
+    tick = 0.01
+    shares = o.size_shares
+    win_val = 1.0 if won else 0.0          # payout per share for OUR side
+    res = {"actual": {"price": o.price, "filled": bool(o.filled_shares), "pnl": o.realized_pnl}}
+    try:
+        if not o.market_window_ts or not o.quote_at:
+            raise ValueError("no window/quote time")
+        trades = clob.market_trades(o.market_id)
+        start = o.quote_at.timestamp()
+        end = start + (o.queue_lifetime_ms or 12000) / 1000.0
+        # our YES bid fills if a trade prints at/through the bid price within the window
+        win_trades = [t for t in trades if start <= t["ts"] <= end + 2]   # +2s slack
+
+        def would_fill(bid_price):
+            # YES bid fills when someone sells YES at <= our price
+            tgt = bid_price if o.outcome == "YES" else (1.0 - bid_price)
+            up = o.outcome != "YES"
+            return any((t["yes_price"] >= tgt) if up else (t["yes_price"] <= tgt) for t in win_trades)
+
+        for label, px in (("one_tick_higher", round(o.price + tick, 3)), ("one_tick_lower", round(o.price - tick, 3))):
+            px = max(0.01, min(0.99, px))
+            f = would_fill(px)
+            res[label] = {"price": px, "would_fill": f,
+                          "pnl": round(shares * win_val - shares * px, 4) if f else 0.0}
+        ranked = [(k, v) for k, v in res.items() if v.get("filled") or v.get("would_fill")]
+        ranked.sort(key=lambda kv: -(kv[1]["pnl"] or 0))
+        res["best_choice"] = ranked[0][0] if ranked else "none_filled"
+        res["actual_was_best"] = (res["best_choice"] == "actual")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
 
 
 def _reconcile(db: Session, client, cfg: dict) -> int:
@@ -398,6 +445,8 @@ def _reconcile(db: Session, client, cfg: dict) -> int:
                 log(db, "markout", {"horizon": "5s", "mid": o.mid_5s, "adverse": o.adverse_5s}, order_client_id=o.client_id)
             if o.mid_30s is None and age >= cfg["markout_30s"]:
                 o.mid_30s = clob.get_book(o.token_id).get("mid")
+                o.adverse_30s = round((o.mid_30s - o.fill_price), 5) if (o.mid_30s is not None and o.fill_price is not None) else None
+                log(db, "markout", {"horizon": "30s", "mid": o.mid_30s, "adverse": o.adverse_30s}, order_client_id=o.client_id)
         # cancel after queue lifetime if not (fully) filled
         if o.status in ("acked", "resting", "partial") and o.quote_at:
             if (now - o.quote_at).total_seconds() >= cfg["queue_lifetime_s"]:
@@ -440,34 +489,49 @@ def _maybe_post(db: Session, client, cfg: dict) -> dict | None:
     busy = {o for (o,) in db.execute(select(lm.Btc5mLiveMakerOrder.market_id)
             .where(lm.Btc5mLiveMakerOrder.status.in_(("acked", "resting", "partial")))).all()}
     detected = datetime.utcnow()
+    now_ts = int(time.time())
+    skipped: list[dict] = []                            # competing candidates we passed over
     for mk in markets:
-        if mk["market_id"] in busy or not mk["token_ids"]:
-            continue
+        if mk["market_id"] in busy:
+            skipped.append({"market_id": mk["market_id"], "reason": "already quoting this market"}); continue
+        if not mk["token_ids"]:
+            skipped.append({"market_id": mk["market_id"], "reason": "no token ids"}); continue
         token = mk["token_ids"][0]                      # YES token; join-best-bid measurement
         bk = clob.get_book(token)
         if not bk["ok"] or bk["best_bid"] is None or bk["best_ask"] is None or bk["best_bid"] >= bk["best_ask"]:
-            continue
+            skipped.append({"market_id": mk["market_id"], "reason": "no two-sided book / crossed"}); continue
         price = round(bk["best_bid"], 3)                # JOIN best bid (first session)
         shares = math.floor(cfg["per_order_usd"] / max(price, 0.02))
         if shares < cfg["min_order_shares"]:            # venue min doesn't fit the per-order cap
-            continue                                     # at this price -> skip, don't reject-loop
+            skipped.append({"market_id": mk["market_id"], "reason": f"min {cfg['min_order_shares']} sh @ {price} > ${cfg['per_order_usd']} cap"}); continue
         notional = round(shares * price, 4)
         ok, reason = risk_check(db, notional=notional, price=price, best_ask=bk["best_ask"])
         if not ok:
             log(db, "reject", {"reason": reason, "market": mk["market_id"], "price": price, "notional": notional})
-            continue
-        return _submit(db, client, mk, token, price, shares, notional, bk, detected, st)
+            skipped.append({"market_id": mk["market_id"], "reason": reason}); continue
+        spread = round(bk["best_ask"] - bk["best_bid"], 4)
+        edge = round((bk["mid"] - price), 4) if bk["mid"] is not None else None
+        decision = {
+            "title": mk.get("question"), "window_ts": mk.get("window_ts"),
+            "secs_to_resolution": (mk["window_ts"] + 300 - now_ts) if mk.get("window_ts") else None,
+            "best_bid": bk["best_bid"], "best_ask": bk["best_ask"], "mid": bk["mid"], "spread": spread,
+            "resting_shares_at_level": bk.get("bid_size"), "estimated_edge": edge,
+            "selection_reason": (f"freshest open BTC-5m window with a two-sided book (spread {spread}, "
+                                 f"edge {edge}); chosen over {len(skipped)} skipped candidate(s)"),
+            "skipped_candidates": skipped[:6],
+        }
+        return _submit(db, client, mk, token, price, shares, notional, bk, detected, st, decision=decision, edge=edge)
     return None
 
 
-def _submit(db, client, mk, token, price, shares, notional, bk, detected, st) -> dict:
+def _submit(db, client, mk, token, price, shares, notional, bk, detected, st, *, decision=None, edge=None) -> dict:
     cid = uuid.uuid4().hex[:16]
     quote_at = datetime.utcnow()
     o = lm.Btc5mLiveMakerOrder(
         session_id=st.session_id, client_id=cid, market_id=mk["market_id"], token_id=token,
         outcome="YES", side="BUY", price=price, size_shares=shares, notional_usd=notional,
         mode=st.mode, status="intended", detected_at=detected, quote_at=quote_at, mid_at_quote=bk["mid"],
-        market_window_ts=mk.get("window_ts"))
+        market_window_ts=mk.get("window_ts"), decision=decision or {}, estimated_edge=edge)
     db.add(o)
     db.commit()
     log(db, "quote", {"market": mk["market_id"], "price": price, "shares": shares, "notional": notional,
@@ -538,6 +602,87 @@ def _safe_rate(bools):
     return sum(bs) / len(bs) if bs else 0.0
 
 
+def generate_summary(db: Session, session_id: int) -> dict:
+    """Auto research summary for a session — aggregates + best/worst quote distances +
+    observed patterns + suggested parameter changes for the next session."""
+    orders = db.scalars(select(lm.Btc5mLiveMakerOrder).where(
+        lm.Btc5mLiveMakerOrder.session_id == session_id, lm.Btc5mLiveMakerOrder.mode != "shadow")).all()
+    m = metrics(db, session_id=session_id)
+    filled = [o for o in orders if o.filled_shares and o.filled_shares > 0]
+    settled = [o for o in filled if o.position_settled]
+
+    # best/worst quote distance (edge = mid − price): bucket by distance, score by settled P&L
+    def bucket(e):
+        if e is None:
+            return "?"
+        return "<0.005" if e < 0.005 else ("0.005-0.01" if e < 0.01 else ("0.01-0.02" if e < 0.02 else ">=0.02"))
+    dist: dict = {}
+    for o in settled:
+        b = bucket(o.estimated_edge)
+        dist.setdefault(b, []).append(o.realized_pnl or 0.0)
+    by_distance = {b: {"n": len(v), "avg_pnl": round(_avg(v) or 0.0, 4)} for b, v in dist.items()}
+    ranked = sorted(by_distance.items(), key=lambda kv: -(kv[1]["avg_pnl"]))
+    best_dist = ranked[0][0] if ranked else None
+    worst_dist = ranked[-1][0] if ranked else None
+
+    # counterfactual: how often would ±1 tick have beaten the actual fill?
+    cf = [o.counterfactual for o in settled if o.counterfactual]
+    higher_better = sum(1 for c in cf if c.get("best_choice") == "one_tick_higher")
+    lower_better = sum(1 for c in cf if c.get("best_choice") == "one_tick_lower")
+    actual_best = sum(1 for c in cf if c.get("actual_was_best"))
+
+    # patterns + suggestions (rule-based; honest about small samples)
+    patterns, suggestions = [], []
+    fr = m["fill_probability"]
+    if fr is not None and fr < 0.05:
+        patterns.append(f"very low fill rate ({fr:.1%})")
+        suggestions.append("raise quote 1 tick (improve_bid) and/or lengthen queue lifetime to lift fills")
+    if (m["avg_adverse_5s"] or 0) < -0.005:
+        patterns.append(f"negative 5s mark-out ({m['avg_adverse_5s']}) — fills are adversely selected")
+        suggestions.append("shorten queue lifetime / quote one tick deeper to reduce adverse fills")
+    if higher_better > max(actual_best, lower_better):
+        suggestions.append(f"one-tick-higher beat actual on {higher_better}/{len(cf)} fills → test improve_bid")
+    elif lower_better > max(actual_best, higher_better):
+        suggestions.append(f"one-tick-lower beat actual on {lower_better}/{len(cf)} fills → test quoting deeper")
+    if (m["avg_realized_spread"] or 0) < 0:
+        suggestions.append("realized spread negative — reduce aggression / widen entry")
+    if not settled:
+        patterns.append("no settled fills yet — collect more before drawing conclusions")
+    if best_dist:
+        patterns.append(f"best quote-distance bucket: {best_dist}; worst: {worst_dist}")
+
+    summary = {
+        "session_id": session_id, "generated_at": datetime.utcnow().isoformat(),
+        "orders_posted": m["real_orders"], "fills": m["fills"], "fill_rate": fr,
+        "avg_queue_lifetime_ms": m["avg_queue_lifetime_ms"],
+        "avg_submit_latency_ms": m["avg_submit_latency_ms"], "avg_ack_latency_ms": m["avg_ack_latency_ms"],
+        "avg_fill_latency_ms": m["avg_fill_latency_ms"], "cancel_success_rate": m["cancel_success_rate"],
+        "avg_realized_spread": m["avg_realized_spread"], "avg_adverse_5s": m["avg_adverse_5s"],
+        "net_pnl_usd": m["net_pnl_usd"], "settled_fills": len(settled),
+        "quote_distance_performance": by_distance, "best_quote_distance": best_dist, "worst_quote_distance": worst_dist,
+        "counterfactual": {"actual_best": actual_best, "one_tick_higher_better": higher_better,
+                           "one_tick_lower_better": lower_better, "n": len(cf)},
+        "patterns": patterns, "suggested_parameter_changes": suggestions,
+        "note": "research dataset for continuous improvement — not a profit report; small samples ⇒ treat as directional",
+    }
+    sess = db.get(lm.Btc5mLiveMakerSession, session_id)
+    if sess:
+        sess.summary = summary
+        sess.fills = m["fills"]
+        sess.realized_pnl = m["net_pnl_usd"]
+        db.commit()
+    return summary
+
+
+def session_summary(db: Session, *, session_id: int | None = None) -> dict:
+    if session_id is None:
+        sess = db.scalar(select(lm.Btc5mLiveMakerSession).order_by(lm.Btc5mLiveMakerSession.id.desc()))
+        session_id = sess.id if sess else None
+    if session_id is None:
+        return {"summary": None, "note": "no sessions yet"}
+    return {"summary": generate_summary(db, session_id)}
+
+
 def status(db: Session) -> dict:
     cfg = get_config()
     st = _state(db)
@@ -574,3 +719,21 @@ def events(db: Session, *, limit: int = 100) -> dict:
     rows = db.scalars(select(lm.Btc5mLiveMakerEvent).order_by(lm.Btc5mLiveMakerEvent.id.desc()).limit(limit)).all()
     return {"events": [{"ts": e.ts.isoformat(), "type": e.type, "session_id": e.session_id,
                         "order_client_id": e.order_client_id, "payload": e.payload} for e in rows]}
+
+
+def orders(db: Session, *, limit: int = 60) -> dict:
+    """Decision-level record for every order — the research dataset."""
+    rows = db.scalars(select(lm.Btc5mLiveMakerOrder).order_by(lm.Btc5mLiveMakerOrder.id.desc()).limit(limit)).all()
+    def row(o):
+        d = o.decision or {}
+        return {"client_id": o.client_id, "market_id": o.market_id, "mode": o.mode, "status": o.status,
+                "title": d.get("title"), "secs_to_resolution": d.get("secs_to_resolution"),
+                "best_bid": d.get("best_bid"), "best_ask": d.get("best_ask"), "mid": o.mid_at_quote,
+                "spread": d.get("spread"), "price": o.price, "resting_shares_at_level": d.get("resting_shares_at_level"),
+                "estimated_edge": o.estimated_edge, "selection_reason": d.get("selection_reason"),
+                "skipped_candidates": d.get("skipped_candidates"),
+                "queue_lifetime_ms": o.queue_lifetime_ms, "filled": bool(o.filled_shares), "fill_price": o.fill_price,
+                "adverse_5s": o.adverse_5s, "adverse_30s": o.adverse_30s, "markout_settlement": o.markout_settlement,
+                "realized_pnl": o.realized_pnl, "won": o.won, "counterfactual": o.counterfactual,
+                "submit_latency_ms": o.submit_latency_ms, "ack_latency_ms": o.ack_latency_ms}
+    return {"orders": [row(o) for o in rows]}

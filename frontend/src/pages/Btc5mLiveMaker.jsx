@@ -68,6 +68,63 @@ export function MakerMetrics({ m }) {
   )
 }
 
+export function SessionSummary({ summary }) {
+  if (!summary) return <Empty>No session summary yet — runs after a session ends.</Empty>
+  const cf = summary.counterfactual || {}
+  return (
+    <div className="panel" data-testid="session-summary">
+      <div className="label">Auto research summary — session {summary.session_id}
+        ({summary.orders_posted ?? 0} orders · {summary.settled_fills ?? 0} settled)</div>
+      <div className="cards">
+        <div className="card"><div className="label">Fill rate</div><div className="value">{summary.fill_rate == null ? '—' : `${(summary.fill_rate * 100).toFixed(0)}%`}</div></div>
+        <div className="card"><div className="label">Avg queue life</div><div className="value">{ms(summary.avg_queue_lifetime_ms)}</div></div>
+        <div className="card"><div className="label">Submit/ack lat</div><div className="value">{ms(summary.avg_submit_latency_ms)}</div><div className="sub">ack {ms(summary.avg_ack_latency_ms)}</div></div>
+        <div className="card"><div className="label">Realized spread</div><div className={`value ${summary.avg_realized_spread > 0 ? 'pos' : ''}`}>{num(summary.avg_realized_spread, 4)}</div></div>
+        <div className="card"><div className="label">Adverse 5s</div><div className={`value ${summary.avg_adverse_5s < 0 ? 'neg' : 'pos'}`}>{num(summary.avg_adverse_5s, 4)}</div></div>
+        <div className="card"><div className="label">Net P&L</div><div className={`value ${summary.net_pnl_usd >= 0 ? 'pos' : 'neg'}`}>{usd(summary.net_pnl_usd)}</div></div>
+      </div>
+      <div className="small" style={{ marginTop: 6 }}>
+        Best quote distance: <b className="pos">{summary.best_quote_distance || '—'}</b> · worst: <b className="neg">{summary.worst_quote_distance || '—'}</b> ·
+        counterfactual — actual best {cf.actual_best ?? 0}, +1 tick better {cf.one_tick_higher_better ?? 0}, −1 tick better {cf.one_tick_lower_better ?? 0} (of {cf.n ?? 0})
+      </div>
+      {summary.patterns?.length > 0 && (
+        <div className="small" data-testid="patterns" style={{ marginTop: 4 }}>📈 Patterns: {summary.patterns.join(' · ')}</div>
+      )}
+      {summary.suggested_parameter_changes?.length > 0 && (
+        <div className="small" data-testid="suggestions" style={{ marginTop: 4 }}>
+          🔧 Suggested next session: <ul style={{ margin: '2px 0 0 16px' }}>{summary.suggested_parameter_changes.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </div>
+      )}
+      <div className="small muted" style={{ marginTop: 4 }}>{summary.note}</div>
+    </div>
+  )
+}
+
+export function OrdersTable({ orders }) {
+  if (!orders?.length) return <Empty>No orders yet.</Empty>
+  return (
+    <div className="table-wrap"><table data-testid="orders-table">
+      <thead><tr><th>Market</th><th className="right">TTR</th><th className="right">Bid/Ask</th><th className="right">Spread</th>
+        <th className="right">Price</th><th className="right">Edge</th><th>Status</th><th className="right">Adv5s</th>
+        <th className="right">P&L</th><th>Better at</th></tr></thead>
+      <tbody>{orders.map((o) => (
+        <tr key={o.client_id} data-testid="order-row" title={o.selection_reason || ''}>
+          <td className="small">{(o.title || o.market_id || '').slice(0, 22)}</td>
+          <td className="right small">{o.secs_to_resolution == null ? '—' : `${o.secs_to_resolution}s`}</td>
+          <td className="right small">{num(o.best_bid, 2)}/{num(o.best_ask, 2)}</td>
+          <td className="right">{num(o.spread, 3)}</td>
+          <td className="right">{num(o.price, 3)}</td>
+          <td className={`right ${o.estimated_edge > 0 ? 'pos' : ''}`}>{num(o.estimated_edge, 3)}</td>
+          <td className={`small ${o.filled ? 'pos' : ''}`}>{o.status}</td>
+          <td className={`right ${o.adverse_5s < 0 ? 'neg' : ''}`}>{num(o.adverse_5s, 3)}</td>
+          <td className={`right ${o.realized_pnl > 0 ? 'pos' : (o.realized_pnl < 0 ? 'neg' : '')}`}>{num(o.realized_pnl, 3)}</td>
+          <td className="small">{o.counterfactual?.best_choice ? o.counterfactual.best_choice.replace(/_/g, ' ') : '—'}</td>
+        </tr>
+      ))}</tbody>
+    </table></div>
+  )
+}
+
 export function EventLog({ events }) {
   if (!events?.length) return <Empty>No events yet.</Empty>
   return (
@@ -88,17 +145,21 @@ export function EventLog({ events }) {
 export default function Btc5mLiveMaker() {
   const [s, setS] = useState(null)
   const [events, setEvents] = useState([])
+  const [orders, setOrders] = useState([])
+  const [summary, setSummary] = useState(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState('')
   const [toast, setToast] = useState(null)
 
   const load = useCallback(async () => {
     try {
-      const [st, ev] = await Promise.all([
+      const [st, ev, od, sm] = await Promise.all([
         api.btc5mLiveMakerStatus().then((r) => r?.detail || r),
         api.btc5mLiveMakerEvents(60).then((r) => r?.detail || r).catch(() => null),
+        api.btc5mLiveMakerOrders(40).then((r) => r?.detail || r).catch(() => null),
+        api.btc5mLiveMakerSummary().then((r) => r?.detail || r).catch(() => null),
       ])
-      setS(st); setEvents(ev?.events || [])
+      setS(st); setEvents(ev?.events || []); setOrders(od?.orders || []); setSummary(sm?.summary || null)
     } catch (e) { setToast(e.message) } finally { setLoading(false) }
   }, [])
   useEffect(() => { load() }, [load])
@@ -134,6 +195,12 @@ export default function Btc5mLiveMaker() {
       <StateBanner s={s} />
       <ExposureCards s={s} />
       <MakerMetrics m={s?.metrics} />
+
+      <h3 style={{ margin: '12px 0 4px' }}>Session research summary</h3>
+      <SessionSummary summary={summary} />
+
+      <h3 style={{ margin: '12px 0 4px' }}>Order decisions (research dataset — hover for selection reason)</h3>
+      <OrdersTable orders={orders} />
 
       <h3 style={{ margin: '12px 0 4px' }}>Event log (replay source of truth)</h3>
       <EventLog events={events} />

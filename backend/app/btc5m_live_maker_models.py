@@ -66,6 +66,7 @@ class Btc5mLiveMakerSession(Base):
     fills: Mapped[int] = mapped_column(Integer, default=0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     fees_paid: Mapped[float] = mapped_column(Float, default=0.0)
+    summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)             # auto research summary
 
 
 class Btc5mLiveMakerOrder(Base):
@@ -113,6 +114,14 @@ class Btc5mLiveMakerOrder(Base):
     mid_30s: Mapped[float | None] = mapped_column(Float, nullable=True)
     realized_spread: Mapped[float | None] = mapped_column(Float, nullable=True)   # mid_at_fill - fill_price
     adverse_5s: Mapped[float | None] = mapped_column(Float, nullable=True)        # signed mark-out vs fill
+    adverse_30s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    markout_settlement: Mapped[float | None] = mapped_column(Float, nullable=True)  # resolution value - fill_price
+    # DECISION-LEVEL analytics — WHY this order happened + counterfactuals (the research
+    # dataset). decision = {title, secs_to_resolution, best_bid, best_ask, spread,
+    # resting_shares, estimated_edge, selection_reason, skipped_candidates}.
+    estimated_edge: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision: Mapped[dict] = mapped_column(JSON, default=dict)
+    counterfactual: Mapped[dict] = mapped_column(JSON, default=dict)              # one tick higher/lower
     fees_usd: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)      # at market resolution
     won: Mapped[bool | None] = mapped_column(Boolean, nullable=True)              # did our side resolve in the money

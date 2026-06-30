@@ -1098,6 +1098,20 @@ def btc5m_live_maker_events(limit: int = 100, db: Session = Depends(get_db)) -> 
                       detail=_lab_safe(lambda d: live_maker.events(d, limit=limit), db))
 
 
+@app.get("/api/btc5m/live-maker/orders", response_model=MessageOut)
+def btc5m_live_maker_orders(limit: int = 60, db: Session = Depends(get_db)) -> MessageOut:
+    """Decision-level analytics for every order (the research dataset)."""
+    return MessageOut(message="btc5m live maker orders",
+                      detail=_lab_safe(lambda d: live_maker.orders(d, limit=limit), db))
+
+
+@app.get("/api/btc5m/live-maker/summary", response_model=MessageOut)
+def btc5m_live_maker_summary(session_id: int = 0, db: Session = Depends(get_db)) -> MessageOut:
+    """Auto research summary for a session (latest if session_id omitted)."""
+    return MessageOut(message="btc5m live maker summary",
+                      detail=_lab_safe(lambda d: live_maker.session_summary(d, session_id=session_id or None), db))
+
+
 # ===========================================================================
 # Research Platform V1 — isolated PAPER-ONLY research on top of the BTC 5M Lab.
 # Never places orders, changes production rankings/eligibility/discovery, or

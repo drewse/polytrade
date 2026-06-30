@@ -176,7 +176,13 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "won": "BOOLEAN",
         "market_window_ts": "INTEGER",
         "position_settled": "BOOLEAN DEFAULT 0",
+        "adverse_30s": "FLOAT",
+        "markout_settlement": "FLOAT",
+        "estimated_edge": "FLOAT",
+        "decision": "JSON",
+        "counterfactual": "JSON",
     },
+    "btc5m_live_maker_sessions": {"summary": "JSON"},
     # BTC passive-maker forward pipeline: market-family / quote-kind tagging added
     # after the paper-quote table shipped (keeps BTC / broad / multi-point separate).
     "btc5m_paper_quotes": {

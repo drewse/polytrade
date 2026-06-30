@@ -262,3 +262,74 @@ def test_status_surfaces_budget_and_lock(in_memory_db, monkeypatch):
     assert eb["max_experiment_capital_usd"] == 100 and eb["remaining_usd"] == 100
     assert eb["cumulative_loss_stop_usd"] == 100
     assert s["locked"] is False and "$100 experiment budget" in s["safety"]
+
+
+# --- decision-level analytics -----------------------------------------------
+def test_decision_context_captured(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    # two markets: the first is unquoteable (crossed), the second is chosen -> skipped recorded
+    import time
+    base = (int(time.time()) // 300) * 300
+    monkeypatch.setattr(clob, "open_btc5m_markets", lambda limit=30: [
+        {"market_id": "BAD", "slug": "s", "question": "bad", "token_ids": ["X"], "window_ts": base},
+        {"market_id": "GOOD", "slug": "s2", "question": "BTC Up or Down?", "token_ids": ["G"], "window_ts": base + 300}])
+    def book(token_id):
+        if token_id == "X":
+            return {"ok": True, "best_bid": 0.5, "best_ask": 0.5, "mid": 0.5, "bid_size": 0, "ts": None, "mono_ns": 0, "error": None}
+        return {"ok": True, "best_bid": 0.40, "best_ask": 0.44, "mid": 0.42, "bid_size": 250, "ts": None, "mono_ns": 0, "error": None}
+    monkeypatch.setattr(clob, "get_book", book)
+    mk.arm(db, mode="live")
+    mk.run_cycle(db, client=clob.MockClobClient())
+    o = db.scalars(select(lmm.Btc5mLiveMakerOrder).where(lmm.Btc5mLiveMakerOrder.market_id == "GOOD")).first()
+    d = o.decision
+    assert d["title"] == "BTC Up or Down?" and d["best_bid"] == 0.40 and d["best_ask"] == 0.44
+    assert d["spread"] == 0.04 and d["resting_shares_at_level"] == 250 and d["secs_to_resolution"] is not None
+    assert o.estimated_edge == round(0.42 - 0.40, 4)            # mid − price
+    assert any(c["market_id"] == "BAD" for c in d["skipped_candidates"])   # competing candidate logged
+
+
+def test_counterfactual_one_tick(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    mk.arm(db, mode="live")
+    import time
+    past = int(time.time()) - 1000
+    o = _add_order(db, client_id="C1", status="filled", filled_shares=6, fill_price=0.40,
+                   notional_usd=2.4, market_window_ts=past, position_settled=False,
+                   quote_at=datetime.utcnow() - timedelta(seconds=1000))
+    monkeypatch.setattr(clob, "get_resolution", lambda ts: {"resolved": True, "won_yes": True})
+    # trade stream: price dipped to 0.39 within the window → a 0.39 bid (one tick lower) would fill
+    monkeypatch.setattr(clob, "market_trades", lambda cid, limit=500: [
+        {"ts": int((datetime.utcnow() - timedelta(seconds=1000)).timestamp()) + 2, "yes_price": 0.39, "size": 50}])
+    mk.run_cycle(db, client=clob.MockClobClient())
+    db.refresh(o)
+    cf = o.counterfactual
+    assert cf and "one_tick_higher" in cf and "one_tick_lower" in cf
+    assert cf["one_tick_lower"]["would_fill"] is True          # 0.39 was traded
+    assert o.markout_settlement is not None
+
+
+# --- auto session summary ---------------------------------------------------
+def test_session_summary_generated_on_disarm(in_memory_db, monkeypatch):
+    db = in_memory_db
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_ENABLED", "true")
+    monkeypatch.setenv("BTC5M_LIVE_MAKER_PRIVATE_KEY", "0xdummy")
+    r = mk.arm(db, mode="live")
+    sid = r["session_id"]
+    # a couple of settled orders with edges + pnl
+    _add_order(db, session_id=sid, client_id="s1", status="filled", filled_shares=6, fill_price=0.40,
+               notional_usd=2.4, estimated_edge=0.02, position_settled=True, realized_pnl=3.6, won=True,
+               submit_latency_ms=30, queue_lifetime_ms=12000, realized_spread=0.02, adverse_5s=0.01)
+    _add_order(db, session_id=sid, client_id="s2", status="cancelled", filled_shares=0, notional_usd=2.4,
+               estimated_edge=0.005)
+    out = mk.disarm(db, reason="manual")
+    assert out["session_summary_for"] == sid
+    summ = mk.session_summary(db, session_id=sid)["summary"]
+    assert summ["orders_posted"] >= 1 and "fill_rate" in summ
+    assert "quote_distance_performance" in summ and "suggested_parameter_changes" in summ
+    assert "patterns" in summ and "counterfactual" in summ
+    # readable via the orders API too
+    assert "orders" in mk.orders(db)

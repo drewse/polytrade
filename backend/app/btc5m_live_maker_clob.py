@@ -22,7 +22,29 @@ import httpx
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 _TIMEOUT = 8.0
+
+
+def market_trades(condition_id: str, *, limit: int = 500) -> list[dict]:
+    """All public trades for a market (data-api), used post-settlement for the one-tick
+    counterfactual. Read-only, fail-soft. Each: {ts, yes_price, size}."""
+    try:
+        with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": "polytrade-research"}) as c:
+            r = c.get(f"{DATA_API}/trades", params={"market": condition_id, "limit": limit})
+            r.raise_for_status()
+            rows = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for t in rows if isinstance(rows, list) else []:
+        try:
+            yp = float(t["price"]) if t.get("outcome", "").lower().startswith("y") or t.get("outcomeIndex") == 0 \
+                else 1.0 - float(t["price"])
+            out.append({"ts": int(t["timestamp"]), "yes_price": yp, "size": float(t.get("size", 0) or 0)})
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
 
 
 def _now():
