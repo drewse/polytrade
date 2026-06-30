@@ -23,6 +23,8 @@ from . import btc5m_drew_finds as drew_finds  # noqa: E402
 from . import btc5m_drew_finds_models  # noqa: F401,E402  (register table for create_all)
 from . import btc5m_longshot_lab as longshot_lab  # noqa: E402
 from . import btc5m_longshot_models  # noqa: F401,E402  (register table for create_all)
+from . import btc5m_live_maker as live_maker  # noqa: E402
+from . import btc5m_live_maker_models  # noqa: F401,E402  (register tables for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -132,6 +134,11 @@ def _startup() -> None:
     # markets — research/paper only, never places orders).
     from . import btc5m_passive_maker_forward_worker
     btc5m_passive_maker_forward_worker.start()
+    # Start the BTC 5M live-maker worker ONLY if BTC5M_LIVE_MAKER_ENABLED=true (default
+    # false => no thread). Even when started it no-ops unless a live session is armed,
+    # and every order passes hard caps + maker-only. This is the only real-money path.
+    from . import btc5m_live_maker_worker
+    btc5m_live_maker_worker.start()
 
 
 @app.get("/api/health")
@@ -1029,6 +1036,54 @@ def btc5m_longshot_run(db: Session = Depends(get_db)) -> MessageOut:
     """Test whether buying the CHEAP side (favorite-longshot / value making) is +EV in
     our own data — calibration + mid/maker/taker × entry-threshold grid. Research only."""
     return MessageOut(message="btc5m longshot run", detail=_lab_safe(longshot_lab.run, db))
+
+
+# --- BTC 5M LIVE MAKER trial (capped, maker-only, default-off) ----------------
+# The ONLY real-money path. No order is sent unless BTC5M_LIVE_MAKER_ENABLED=true AND
+# a session is armed in 'live' mode AND every cap passes. Shadow mode reads the real
+# book but sends nothing.
+@app.get("/api/btc5m/live-maker/status", response_model=MessageOut)
+def btc5m_live_maker_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m live maker status", detail=_lab_safe(live_maker.status, db))
+
+
+@app.post("/api/btc5m/live-maker/arm", response_model=MessageOut)
+def btc5m_live_maker_arm(mode: str = "shadow", ttl_min: float = 20.0,
+                         db: Session = Depends(get_db)) -> MessageOut:
+    """Arm a session. mode='shadow' reads the real book but sends NO orders; mode='live'
+    is refused unless BTC5M_LIVE_MAKER_ENABLED=true and a key is configured."""
+    return MessageOut(message="btc5m live maker arm",
+                      detail=_lab_safe(lambda d: live_maker.arm(d, mode=mode, ttl_min=ttl_min), db))
+
+
+@app.post("/api/btc5m/live-maker/disarm", response_model=MessageOut)
+def btc5m_live_maker_disarm(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m live maker disarm",
+                      detail=_lab_safe(lambda d: live_maker.disarm(d, reason="manual"), db))
+
+
+@app.post("/api/btc5m/live-maker/kill", response_model=MessageOut)
+def btc5m_live_maker_kill(db: Session = Depends(get_db)) -> MessageOut:
+    """EMERGENCY: cancel all open orders + disarm + latch the kill flag."""
+    return MessageOut(message="btc5m live maker KILL", detail=_lab_safe(live_maker.kill, db))
+
+
+@app.post("/api/btc5m/live-maker/reset-kill", response_model=MessageOut)
+def btc5m_live_maker_reset_kill(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m live maker reset-kill", detail=_lab_safe(live_maker.reset_kill, db))
+
+
+@app.post("/api/btc5m/live-maker/run-cycle", response_model=MessageOut)
+def btc5m_live_maker_run_cycle(db: Session = Depends(get_db)) -> MessageOut:
+    """Drive one cycle manually (used for shadow dry-runs). No-op unless armed; live
+    orders only if ENABLED + armed(live) + caps pass."""
+    return MessageOut(message="btc5m live maker cycle", detail=_lab_safe(live_maker.run_cycle, db))
+
+
+@app.get("/api/btc5m/live-maker/events", response_model=MessageOut)
+def btc5m_live_maker_events(limit: int = 100, db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m live maker events",
+                      detail=_lab_safe(lambda d: live_maker.events(d, limit=limit), db))
 
 
 # ===========================================================================

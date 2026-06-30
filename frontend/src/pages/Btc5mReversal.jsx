@@ -12,12 +12,13 @@ import Btc5mExecutionLab from './Btc5mExecutionLab.jsx'
 import Btc5mPassiveMakerPaper from './Btc5mPassiveMakerPaper.jsx'
 import Btc5mDrewFinds from './Btc5mDrewFinds.jsx'
 import Btc5mLongshotLab from './Btc5mLongshotLab.jsx'
+import Btc5mLiveMaker from './Btc5mLiveMaker.jsx'
 
 const num = (n, d = 2) => (n == null ? '—' : Number(n).toFixed(d))
 const pct = (n, d = 1) => (n == null ? '—' : `${(Number(n) * 100).toFixed(d)}%`)
 
 const SECTIONS = [
-  'Overview', 'DREW FINDS', 'Longshot Lab', 'Strategy Lab', 'Alpha Research', 'Alpha Discovery', 'Execution Research', 'Passive Maker Paper', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
+  'Overview', 'DREW FINDS', 'Longshot Lab', 'Live Maker', 'Strategy Lab', 'Alpha Research', 'Alpha Discovery', 'Execution Research', 'Passive Maker Paper', 'Micro-Test (Live)', 'Research Platform', 'Market Intelligence', 'Paper Challengers', 'Dataset', 'Wallet IQ', 'Wallet Profiles', 'Wallet Clusters',
   'Consensus Graph', 'Feature Importance', 'Shadow Strategy',
   'Model Performance', 'Leaderboard', 'Research Notes',
 ]
@@ -239,6 +240,7 @@ export default function Btc5mReversal() {
         {tab === 'Overview' && <Dashboard d={dash} />}
         {tab === 'DREW FINDS' && <Btc5mDrewFinds />}
         {tab === 'Longshot Lab' && <Btc5mLongshotLab />}
+        {tab === 'Live Maker' && <Btc5mLiveMaker />}
         {tab === 'Strategy Lab' && <Btc5mStrategyLab />}
         {tab === 'Alpha Research' && <Btc5mAlphaResearch />}
         {tab === 'Alpha Discovery' && <Btc5mAlphaDiscovery />}

@@ -201,6 +201,14 @@ export const api = {
   // Longshot/Value Lab — cheap-side mispricing test (research only)
   btc5mLongshotStatus: () => request('/api/btc5m/longshot/status'),
   btc5mLongshotRun: () => request('/api/btc5m/longshot/run', { method: 'POST' }),
+  // LIVE MAKER trial — capped, maker-only, default-off (real money only when armed live)
+  btc5mLiveMakerStatus: () => request('/api/btc5m/live-maker/status'),
+  btc5mLiveMakerArm: (mode = 'shadow', ttlMin = 20) => request(`/api/btc5m/live-maker/arm?mode=${mode}&ttl_min=${ttlMin}`, { method: 'POST' }),
+  btc5mLiveMakerDisarm: () => request('/api/btc5m/live-maker/disarm', { method: 'POST' }),
+  btc5mLiveMakerKill: () => request('/api/btc5m/live-maker/kill', { method: 'POST' }),
+  btc5mLiveMakerResetKill: () => request('/api/btc5m/live-maker/reset-kill', { method: 'POST' }),
+  btc5mLiveMakerRunCycle: () => request('/api/btc5m/live-maker/run-cycle', { method: 'POST' }),
+  btc5mLiveMakerEvents: (limit = 80) => request(`/api/btc5m/live-maker/events?limit=${limit}`),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),
