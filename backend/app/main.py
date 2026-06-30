@@ -21,6 +21,8 @@ from . import btc5m_passive_maker_forward as passive_maker_forward  # noqa: E402
 from . import btc5m_passive_maker_models  # noqa: F401,E402  (register paper tables for create_all)
 from . import btc5m_drew_finds as drew_finds  # noqa: E402
 from . import btc5m_drew_finds_models  # noqa: F401,E402  (register table for create_all)
+from . import btc5m_longshot_lab as longshot_lab  # noqa: E402
+from . import btc5m_longshot_models  # noqa: F401,E402  (register table for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -1014,6 +1016,19 @@ def btc5m_drew_finds_run(db: Session = Depends(get_db)) -> MessageOut:
     """Reverse-engineer the target wallets + find similar BTC-5m traders from public
     Polymarket APIs. Read-only research — never places orders."""
     return MessageOut(message="btc5m drew finds run", detail=_lab_safe(drew_finds.run, db))
+
+
+# --- BTC 5M Longshot/Value Lab (cheap-side mispricing test; research only) -----
+@app.get("/api/btc5m/longshot/status", response_model=MessageOut)
+def btc5m_longshot_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m longshot lab", detail=_lab_safe(longshot_lab.status, db))
+
+
+@app.post("/api/btc5m/longshot/run", response_model=MessageOut)
+def btc5m_longshot_run(db: Session = Depends(get_db)) -> MessageOut:
+    """Test whether buying the CHEAP side (favorite-longshot / value making) is +EV in
+    our own data — calibration + mid/maker/taker × entry-threshold grid. Research only."""
+    return MessageOut(message="btc5m longshot run", detail=_lab_safe(longshot_lab.run, db))
 
 
 # ===========================================================================

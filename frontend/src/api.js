@@ -198,6 +198,9 @@ export const api = {
   // DREW FINDS — reverse-engineered wallets + similar BTC-5m traders (read-only)
   btc5mDrewFindsStatus: () => request('/api/btc5m/drew-finds/status'),
   btc5mDrewFindsRun: () => request('/api/btc5m/drew-finds/run', { method: 'POST' }),
+  // Longshot/Value Lab — cheap-side mispricing test (research only)
+  btc5mLongshotStatus: () => request('/api/btc5m/longshot/status'),
+  btc5mLongshotRun: () => request('/api/btc5m/longshot/run', { method: 'POST' }),
   // Research Platform V1 — isolated paper research
   researchDashboard: () => request('/api/research/dashboard'),
   researchCycle: (limitMarkets = 120) => request(`/api/research/cycle?limit_markets=${limitMarkets}`, { method: 'POST' }),
