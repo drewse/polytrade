@@ -1049,13 +1049,17 @@ def btc5m_live_maker_status(db: Session = Depends(get_db)) -> MessageOut:
 
 @app.post("/api/btc5m/live-maker/arm", response_model=MessageOut)
 def btc5m_live_maker_arm(mode: str = "shadow", ttl_min: float = 20.0, max_orders: int = 0,
+                         queue_lifetime_s: float | None = None,
                          db: Session = Depends(get_db)) -> MessageOut:
     """Arm a session. mode='shadow' reads the real book but sends NO orders; mode='live'
     is refused unless BTC5M_LIVE_MAKER_ENABLED=true and a key is configured. max_orders>0
     caps the session to that many orders (smoke test = 1) and auto-disarms once they
-    reach a terminal state."""
+    reach a terminal state. queue_lifetime_s overrides how long each quote rests before
+    cancel (the fill-probability lever) for this session only; null uses the env default."""
     return MessageOut(message="btc5m live maker arm",
-                      detail=_lab_safe(lambda d: live_maker.arm(d, mode=mode, ttl_min=ttl_min, max_orders=max_orders), db))
+                      detail=_lab_safe(lambda d: live_maker.arm(
+                          d, mode=mode, ttl_min=ttl_min, max_orders=max_orders,
+                          queue_lifetime_s=queue_lifetime_s), db))
 
 
 @app.post("/api/btc5m/live-maker/disarm", response_model=MessageOut)

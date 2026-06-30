@@ -124,7 +124,8 @@ def reset_lock(db: Session) -> dict:
     return {"ok": True, "locked": False}
 
 
-def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None, max_orders: int = 0) -> dict:
+def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None, max_orders: int = 0,
+        queue_lifetime_s: float | None = None) -> dict:
     cfg = get_config()
     st = _state(db)
     if st.locked:
@@ -140,9 +141,15 @@ def arm(db: Session, *, mode: str = "shadow", ttl_min: float | None = None, max_
         recon = reconcile_open_orders(db)
         log(db, "reconcile", {"context": "pre-arm", **recon})
     ttl = ttl_min if ttl_min is not None else cfg["session_ttl_min"]
-    sess = lm.Btc5mLiveMakerSession(mode=mode, max_orders=max_orders, caps={k: cfg[k] for k in (
+    caps = {k: cfg[k] for k in (
         "per_order_usd", "max_concurrent", "max_exposure_usd", "max_experiment_capital_usd",
-        "cumulative_loss_stop_usd", "session_loss_limit_usd", "queue_lifetime_s", "min_order_shares")}, status="active")
+        "cumulative_loss_stop_usd", "session_loss_limit_usd", "queue_lifetime_s", "min_order_shares")}
+    # Per-session override of how long each maker quote rests before we cancel it. This is
+    # the primary lever on fill probability (longer rest → more fills, more adverse selection)
+    # and lets us vary it without a Railway env redeploy. Still maker-only, all caps unchanged.
+    if queue_lifetime_s is not None:
+        caps["queue_lifetime_s"] = float(queue_lifetime_s)
+    sess = lm.Btc5mLiveMakerSession(mode=mode, max_orders=max_orders, caps=caps, status="active")
     db.add(sess)
     db.commit()
     st.armed = True
@@ -466,6 +473,12 @@ def _reconcile(db: Session, client, cfg: dict) -> int:
         (lm.Btc5mLiveMakerOrder.status == "filled") & (lm.Btc5mLiveMakerOrder.mid_30s.is_(None))))).all()
     now = datetime.utcnow()
     st = _state(db)
+    # honour the active session's per-session queue-lifetime override (falls back to env cfg)
+    queue_lifetime_s = cfg["queue_lifetime_s"]
+    if st.session_id:
+        sess = db.get(lm.Btc5mLiveMakerSession, st.session_id)
+        if sess and isinstance(sess.caps, dict):
+            queue_lifetime_s = sess.caps.get("queue_lifetime_s", queue_lifetime_s)
     for o in actives:
         # poll fills (real/mock only — shadow has no exchange order)
         if o.status in ("acked", "resting", "partial") and o.exchange_order_id:
@@ -501,7 +514,7 @@ def _reconcile(db: Session, client, cfg: dict) -> int:
                 log(db, "markout", {"horizon": "30s", "mid": o.mid_30s, "adverse": o.adverse_30s}, order_client_id=o.client_id)
         # cancel after queue lifetime if not (fully) filled
         if o.status in ("acked", "resting", "partial") and o.quote_at:
-            if (now - o.quote_at).total_seconds() >= cfg["queue_lifetime_s"]:
+            if (now - o.quote_at).total_seconds() >= queue_lifetime_s:
                 _cancel_order(db, client, o, st)
                 n += 1
     db.commit()
