@@ -19,6 +19,8 @@ from . import btc5m_maker_validation as maker_validation  # noqa: E402
 from . import btc5m_passive_maker as passive_maker  # noqa: E402
 from . import btc5m_passive_maker_forward as passive_maker_forward  # noqa: E402
 from . import btc5m_passive_maker_models  # noqa: F401,E402  (register paper tables for create_all)
+from . import btc5m_drew_finds as drew_finds  # noqa: E402
+from . import btc5m_drew_finds_models  # noqa: F401,E402  (register table for create_all)
 from .db import get_db, init_db
 from .models import (
     Backtest,
@@ -999,6 +1001,19 @@ def btc5m_passive_maker_forward_run_once(db: Session = Depends(get_db)) -> Messa
     unless BTC_PASSIVE_MAKER_FORWARD_ENABLED=true. Places NO orders."""
     return MessageOut(message="btc5m passive-maker forward run-once",
                       detail=_lab_safe(passive_maker_forward.run_forward_cycle, db))
+
+
+# --- DREW FINDS — reverse-engineer wallets + find similar BTC-5m traders ------
+@app.get("/api/btc5m/drew-finds/status", response_model=MessageOut)
+def btc5m_drew_finds_status(db: Session = Depends(get_db)) -> MessageOut:
+    return MessageOut(message="btc5m drew finds", detail=_lab_safe(drew_finds.status, db))
+
+
+@app.post("/api/btc5m/drew-finds/run", response_model=MessageOut)
+def btc5m_drew_finds_run(db: Session = Depends(get_db)) -> MessageOut:
+    """Reverse-engineer the target wallets + find similar BTC-5m traders from public
+    Polymarket APIs. Read-only research — never places orders."""
+    return MessageOut(message="btc5m drew finds run", detail=_lab_safe(drew_finds.run, db))
 
 
 # ===========================================================================
